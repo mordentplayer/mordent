@@ -4,7 +4,7 @@ mod fairplay;
 mod stream;
 mod wrapper;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 fn main() {
     if let Err(e) = run() {
@@ -178,73 +178,82 @@ fn cmd_decrypt(cfg: &config::Config, id: &str, out: &str) -> Result<()> {
     decode_stats(out)
 }
 
-/// Probe + decode a file, printing codec/rate/samples. Returns decode time.
+/// Decode a decrypted fragmented file by feeding ALAC packets directly to
+/// symphonia (bypassing its mp4 demuxer). Prints codec/rate/frames stats.
 fn decode_stats(path: &str) -> Result<()> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
+    use symphonia::core::audio::Channels;
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::formats::Packet;
+    use std::io::{BufReader, Read, Seek, SeekFrom};
 
-    let file = std::fs::File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension("m4a");
-    let probed = symphonia::default::get_probe().format(
-        &hint,
-        mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
-    )?;
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        .ok_or_else(|| anyhow::anyhow!("no audio track"))?;
-    let params = track.codec_params.clone();
+    let mut f = BufReader::new(std::fs::File::open(path)?);
+
+    // init: ftyp + moov
+    let mut init_raw = Vec::new();
+    for _ in 0..2 {
+        let (h, payload) = fairplay::read_box_pub(&mut f)?;
+        init_raw.extend_from_slice(&h.assemble_pub(&payload));
+    }
+    let alac = fairplay::find_alac_cookie(&init_raw)
+        .ok_or_else(|| anyhow!("no ALAC cookie in init"))?;
+    // the raw 24-byte ALACSpecificConfig, as the decoder's extradata
+    let extra = fairplay::alac_extra_data(&init_raw);
     println!(
-        "codec: {:?}, sample_rate: {:?}, channels: {:?}, duration: {:?}",
-        params.codec, params.sample_rate, params.channels, params.time_base
+        "codec: alac, sample_rate: {}, channels: {}, bit_depth: {}, frame_len: {}",
+        alac.sample_rate, alac.channels, alac.bit_depth, alac.frame_len
     );
-    let mut decoder = symphonia::default::get_codecs().make(&params, &DecoderOptions::default())?;
-    let mut samples_total = 0u64;
+
+    let channels = if alac.channels == 1 {
+        Channels::FRONT_LEFT
+    } else {
+        Channels::FRONT_LEFT | Channels::FRONT_RIGHT
+    };
+    let mut params = CodecParameters::new();
+    params
+        .for_codec(symphonia::core::codecs::CODEC_TYPE_ALAC)
+        .with_sample_rate(alac.sample_rate)
+        .with_channels(channels)
+        .with_max_frames_per_packet(alac.frame_len as u64);
+    if let Some(x) = extra {
+        params.with_extra_data(x);
+    }
+    let mut decoder = symphonia::default::get_codecs().make(&params, &Default::default())?;
+
+    let mut frames_total = 0u64;
+    let mut packets_total = 0u64;
     let t0 = std::time::Instant::now();
-    let mut buf: Option<SampleBuffer<f32>> = None;
     loop {
-        match format.next_packet() {
-            Ok(pkt) => match decoder.decode(&pkt) {
-                Ok(decoded) => {
-                    let spec = *decoded.spec();
-                    let cap = (decoded.frames().max(1) as usize) * spec.channels.count();
-                    samples_total += decoded.frames() as u64;
-                    let sb = buf.get_or_insert_with(|| SampleBuffer::<f32>::new(cap as u64, spec));
-                    if sb.capacity() < cap {
-                        *sb = SampleBuffer::<f32>::new(cap as u64, spec);
+        match fairplay::read_fragment(&mut f) {
+            Ok(Some(frag)) => {
+                let mut ts = frag.base_time;
+                for (i, sample) in frag.samples.iter().enumerate() {
+                    let dur = (*frag.durations.get(i).unwrap_or(&0)).max(1) as u64;
+                    let pkt = Packet::new_from_boxed_slice(
+                        1,
+                        ts,
+                        dur,
+                        sample.clone().into_boxed_slice(),
+                    );
+                    ts += dur;
+                    match decoder.decode(&pkt) {
+                        Ok(decoded) => frames_total += decoded.frames() as u64,
+                        Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+                        Err(e) => return Err(e.into()),
                     }
-                    sb.copy_interleaved_ref(decoded);
+                    packets_total += 1;
                 }
-                Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-                Err(e) => return Err(e.into()),
-            },
-            Err(symphonia::core::errors::Error::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break
             }
-            Err(symphonia::core::errors::Error::ResetRequired) => break,
-            Err(e) => return Err(e.into()),
+            Ok(None) => break,
+            Err(e) => return Err(e),
         }
     }
     let dt = t0.elapsed();
     println!(
-        "decoded {} frames in {:.1?} (rate: {:.1}x realtime)",
-        samples_total,
+        "decoded {} frames / {} packets in {:.1?} (rate: {:.1}x realtime)",
+        frames_total,
+        packets_total,
         dt,
-        samples_total as f64
-            / params.sample_rate.unwrap_or(44100) as f64
-            / dt.as_secs_f64()
+        frames_total as f64 / alac.sample_rate as f64 / dt.as_secs_f64()
     );
     Ok(())
 }
@@ -266,10 +275,11 @@ fn usage() {
     eprintln!(
         "amc — Apple Music client (dev CLI)\n\n\
          commands:\n\
-         \x20 token            print the cached web bearer token\n\
-         \x20 search <term>    search catalog\n\
-         \x20 album <id|url>   list album tracks\n\
-         \x20 wrapper          wrapper-lite status\n\
-         \x20 decrypt <songId> [out]  stream + FairPlay-decrypt a track, verify decode\n"
+         \x20 token             print the cached web bearer token\n\
+         \x20 search <term>     search catalog\n\
+         \x20 album <id|url>    list album tracks\n\
+         \x20 wrapper           wrapper-lite status\n\
+         \x20 decrypt <songId> [out]  stream + FairPlay-decrypt a track to file\n\
+         \x20 decode <file>     decode a decrypted fragmented file (verify)\n"
     );
 }

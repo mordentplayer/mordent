@@ -281,7 +281,9 @@ fn sanitize_stsd(
                 }
             }
             let mut out = Vec::with_capacity(body.len() + 8);
-            out.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+            // `body` already starts with the 4cc type, so the box total is
+            // size(4) + body.len(); the size field must equal out.len().
+            out.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
             out.extend_from_slice(&body);
             clear_entry = Some(out);
         } else if clear_entry.is_none() {
@@ -334,6 +336,256 @@ fn extract_tenc(sinf: &BoxView) -> Option<TrackDecryptInfo> {
         skip_byte_block: skip,
         default_iv_size: iv_size,
     })
+}
+
+// ---- ALAC cookie + fragment packet reading (decrypted side) ----
+
+#[derive(Debug, Clone, Copy)]
+pub struct AlacParams {
+    pub frame_len: u32,
+    pub bit_depth: u8,
+    pub channels: u8,
+    pub sample_rate: u32,
+}
+
+/// Parse the 24-byte ALASpecificBox ('alac' cookie) payload.
+pub fn parse_alac_cookie(payload: &[u8]) -> Option<AlacParams> {
+    if payload.len() < 24 {
+        return None;
+    }
+    Some(AlacParams {
+        frame_len: u32::from_be_bytes(payload[0..4].try_into().ok()?),
+        bit_depth: payload[5],
+        channels: payload[9],
+        sample_rate: u32::from_be_bytes(payload[20..24].try_into().ok()?),
+    })
+}
+
+/// Parse ALAC parameters from the cookie inside a sanitized init.
+pub fn find_alac_cookie(init: &[u8]) -> Option<AlacParams> {
+    let cfg = find_alac_cookie_box(init)?;
+    parse_alac_cookie(&cfg)
+}
+
+/// The raw 24-byte ALACSpecificConfig box payload for the decoder extradata.
+pub fn alac_extra_data(init: &[u8]) -> Option<Box<[u8]>> {
+    let alac = find_alac_cookie_box(init)?;
+    Some(alac.into_boxed_slice())
+}
+
+/// Locate the ALAC cookie inside a sanitized init: moov→trak→mdia→minf→
+/// stbl→stsd→(sample entry)→alac.
+fn find_alac_cookie_box(init: &[u8]) -> Option<Vec<u8>> {
+    fn find<'a>(buf: &'a [u8], kind: &str) -> Option<BoxView<'a>> {
+        boxes_in(buf).into_iter().find(|b| b.kind == kind)
+    }
+    let top = boxes_in(init);
+    let kinds: Vec<String> = top.iter().map(|b| b.kind.clone()).collect();
+    let moov = find(init, "moov")?;
+    let trak = find(payload(&moov), "trak");
+    let mdia = trak.as_ref().and_then(|t| find(payload(t), "mdia"));
+    let minf = mdia.as_ref().and_then(|m| find(payload(m), "minf"));
+    let stbl = minf.as_ref().and_then(|m| find(payload(m), "stbl"));
+    let stsd = stbl.as_ref().and_then(|s| find(payload(s), "stsd"));
+    let stsd = match stsd {
+        Some(s) => s,
+        None => {
+            eprintln!("[cookie-debug] top={kinds:?} trak={:?}", trak.as_ref().map(|t| t.kind.clone()));
+            return None;
+        }
+    };
+    let entries = boxes_in(&payload(&stsd)[8..]);
+    for e in &entries {
+        for c in boxes_in(payload_of_entry(e)) {
+            if c.kind == "alac" {
+                // 'alac' box = size + type + 4 bytes version/flags + 24-byte config
+                let p = payload(&c);
+                if p.len() >= 28 {
+                    return Some(p[4..].to_vec());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One decoded-fragment worth of samples.
+pub struct FragmentSamples {
+    pub samples: Vec<Vec<u8>>,
+    pub base_time: u64,
+    pub durations: Vec<u32>,
+}
+
+/// Read the next fragment (moof+mdat) from a *decrypted* fragmented file,
+/// returning per-sample packets + timings.
+pub fn read_fragment(r: &mut impl std::io::Read) -> Result<Option<FragmentSamples>> {
+    let mut moof_raw: Option<Vec<u8>> = None;
+    let mdat: Vec<u8>;
+    loop {
+        let (h, payload) = match read_box_pub(r) {
+            Ok(x) => x,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let kind = kind_str(&h.kind);
+        match kind.as_str() {
+            "mdat" => {
+                mdat = payload;
+                break;
+            }
+            "moof" => moof_raw = Some(h.assemble_pub(&payload)),
+            "mfra" => return Ok(None),
+            _ => {}
+        }
+    }
+    let moof_raw = moof_raw.ok_or_else(|| anyhow!("mdat without moof"))?;
+    let moof_children = boxes_in(&moof_raw[8..]);
+    let traf = moof_children
+        .iter()
+        .find(|b| b.kind == "traf")
+        .ok_or_else(|| anyhow!("moof without traf"))?;
+
+    // tfhd defaults
+    let mut default_size = None;
+    for b in walk_children(payload(traf)) {
+        if b.kind == "tfhd" {
+            let flags = u32::from_be_bytes([b.raw[8], b.raw[9], b.raw[10], b.raw[11]]);
+            let (p, _v) = full_payload(&b)?;
+            let g = |i: usize| -> Option<u32> {
+                p.get(i..i + 4).and_then(|s| s.try_into().ok()).map(u32::from_be_bytes)
+            };
+            let mut i = 0usize;
+            i += 4; // track id
+            if flags & 0x1 != 0 {
+                i += 8;
+            }
+            if flags & 0x2 != 0 {
+                i += 4;
+            }
+            if flags & 0x8 != 0 {
+                i += 4;
+            }
+            if flags & 0x10 != 0 {
+                default_size = g(i);
+                if default_size.is_none() {
+                    bail!("tfhd flags {flags:#x} but payload too short ({})", p.len());
+                }
+            }
+        }
+    }
+
+    // tfdt base time
+    let mut base_time = 0u64;
+    for b in walk_children(payload(traf)) {
+        if b.kind == "tfdt" {
+            let (p, version) = full_payload(&b)?;
+            base_time = if version == 1 {
+                u64::from_be_bytes(p[0..8].try_into()?)
+            } else {
+                u32::from_be_bytes(p[0..4].try_into()?) as u64
+            };
+        }
+    }
+
+    // trun: sizes + durations
+    let mut sizes: Vec<u32> = Vec::new();
+    let mut durations: Vec<u32> = Vec::new();
+    let mut data_offset: i64 = 0;
+    for b in walk_children(payload(traf)) {
+        if b.kind != "trun" {
+            continue;
+        }
+        let (p, _v) = full_payload(&b)?;
+        let flags = u32::from_be_bytes([b.raw[8], b.raw[9], b.raw[10], b.raw[11]]);
+        let count = u32::from_be_bytes(p[0..4].try_into()?) as usize;
+        let mut i = 4usize;
+        if flags & 0x1 != 0 {
+            data_offset = i32::from_be_bytes(p[i..i + 4].try_into()?) as i64;
+            i += 4;
+        }
+        if flags & 0x4 != 0 {
+            i += 4;
+        }
+        for _ in 0..count {
+            if flags & 0x100 != 0 {
+                durations.push(u32::from_be_bytes(p[i..i + 4].try_into()?));
+                i += 4;
+            } else {
+                durations.push(0);
+            }
+            if flags & 0x200 != 0 {
+                sizes.push(u32::from_be_bytes(p[i..i + 4].try_into()?));
+                i += 4;
+            } else {
+                sizes.push(default_size.unwrap_or(0));
+            }
+            if flags & 0x400 != 0 {
+                i += 4;
+            }
+            if flags & 0x800 != 0 {
+                i += 4;
+            }
+        }
+    }
+    if sizes.iter().any(|&s| s == 0) {
+        bail!("fragment trun has no sizes");
+    }
+
+    let first = (data_offset - (moof_raw.len() as i64 + 8)) as usize;
+    let mdat_payload = &mdat[..];
+    let mut pos = first;
+    let mut samples = Vec::with_capacity(sizes.len());
+    for &size in &sizes {
+        samples.push(mdat_payload[pos..pos + size as usize].to_vec());
+        pos += size as usize;
+    }
+    Ok(Some(FragmentSamples {
+        samples,
+        base_time,
+        durations,
+    }))
+}
+
+// public thin wrappers over the private box helpers
+pub struct PubBoxHead {
+    pub kind: [u8; 4],
+}
+
+impl PubBoxHead {
+    pub fn assemble_pub(&self, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(payload.len() + 8);
+        v.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+        v.extend_from_slice(&self.kind);
+        v.extend_from_slice(payload);
+        v
+    }
+}
+
+pub fn read_box_pub(r: &mut impl std::io::Read) -> std::io::Result<(PubBoxHead, Vec<u8>)> {
+    let mut b8 = [0u8; 8];
+    r.read_exact(&mut b8)?;
+    let mut size = u32::from_be_bytes([b8[0], b8[1], b8[2], b8[3]]) as usize;
+    let mut hdr = 8usize;
+    if size == 1 {
+        let mut b16 = [0u8; 8];
+        r.read_exact(&mut b16)?;
+        size = u64::from_be_bytes(b16) as usize;
+        hdr = 16;
+    }
+    if size < hdr || size > 1 << 30 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "absurd box size",
+        ));
+    }
+    let mut payload = vec![0u8; size - hdr];
+    r.read_exact(&mut payload)?;
+    Ok((
+        PubBoxHead {
+            kind: [b8[4], b8[5], b8[6], b8[7]],
+        },
+        payload,
+    ))
 }
 
 fn build_box<'a>(kind: &str, children: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
