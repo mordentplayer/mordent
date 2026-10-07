@@ -271,7 +271,7 @@ impl ProgressiveSource {
         let url = url.to_string();
         std::thread::Builder::new().name("amc-fetch".into()).spawn(move || {
             let run = || -> Result<()> {
-                let mut resp = agent.get(&url).call().with_context(|| format!("GET {url}"))?;
+                let resp = agent.get(&url).call().with_context(|| format!("GET {url}"))?;
                 let mut buf = [0u8; 64 * 1024];
                 let mut r = resp.into_reader();
                 loop {

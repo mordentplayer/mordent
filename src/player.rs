@@ -1,131 +1,120 @@
-//! Playback: symphonia decode → rodio output, plus a decode-only fallback
-//! for machines without an audio device.
+//! Playback: ALAC packet feed → symphonia decode → rodio output, with a
+//! decode-only fallback for machines without an audio device.
 
+use crate::fairplay;
 use anyhow::{anyhow, Result};
-use std::time::Duration;
+use std::io::Read;
+use std::sync::Arc;
 
-/// A seekable-ish media stream decodable by symphonia.
-pub struct SymphoniaSource {
-    format: Box<dyn symphonia::core::formats::FormatReader>,
+/// Decodes a *decrypted, fragmented* MP4 stream (e.g. the live output of
+/// [`crate::stream::ProgressiveSource`]) by feeding raw ALAC packets to
+/// symphonia. Blocks on reads when the download frontier catches up — that
+/// pacing is what streams audio in lockstep with the fetch worker.
+pub struct PacketSource {
+    reader: Box<dyn Read + Send + 'static>,
     decoder: Box<dyn symphonia::core::codecs::Decoder>,
-    track_id: u32,
-    buf: symphonia::core::audio::SampleBuffer<f32>,
-    spec: symphonia::core::audio::SignalSpec,
+    /// f32 interleaved samples pending output.
+    pending: Vec<f32>,
     pos: usize,
-    sample_rate: u32,
-    channels: usize,
-    finished: bool,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub frames_decoded: u64,
 }
 
-impl SymphoniaSource {
-    pub fn new(media: Box<dyn symphonia::core::io::MediaSource>) -> Result<Self> {
-        use symphonia::core::formats::FormatOptions;
-        use symphonia::core::io::MediaSourceStream;
-        use symphonia::core::meta::MetadataOptions;
-        use symphonia::core::probe::Hint;
-
-        let mss = MediaSourceStream::new(media, Default::default());
-        let mut hint = Hint::new();
-        hint.with_extension("m4a");
-        let probed = symphonia::default::get_probe().format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )?;
-        let mut format = probed.format;
-        let track = format
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-            .ok_or_else(|| anyhow!("no audio track"))?;
-        let track_id = track.id;
-        let params = track.codec_params.clone();
-        let decoder = symphonia::default::get_codecs().make(
-            &params,
-            &symphonia::core::codecs::DecoderOptions::default(),
-        )?;
-        let sample_rate = params.sample_rate.unwrap_or(44_100);
-        let channels = params.channels.map(|c| c.count()).unwrap_or(2);
+impl PacketSource {
+    pub fn new(mut reader: Box<dyn Read + Send>) -> Result<Self> {
+        // init: ftyp + moov
+        let mut init_raw = Vec::new();
+        for _ in 0..2 {
+            let (h, payload) = fairplay::read_box_pub(&mut reader)?;
+            init_raw.extend_from_slice(&h.assemble_pub(&payload));
+        }
+        let alac = fairplay::find_alac_cookie(&init_raw)
+            .ok_or_else(|| anyhow!("no ALAC cookie in stream init"))?;
+        let channels = if alac.channels == 1 {
+            symphonia::core::audio::Channels::FRONT_LEFT
+        } else {
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT
+        };
+        let mut params = symphonia::core::codecs::CodecParameters::new();
+        params
+            .for_codec(symphonia::core::codecs::CODEC_TYPE_ALAC)
+            .with_sample_rate(alac.sample_rate)
+            .with_channels(channels)
+            .with_max_frames_per_packet(alac.frame_len as u64);
+        if let Some(x) = fairplay::alac_extra_data(&init_raw) {
+            params.with_extra_data(x);
+        }
+        let decoder = symphonia::default::get_codecs().make(&params, &Default::default())?;
         Ok(Self {
-            format,
+            reader: Box::new(reader),
             decoder,
-            track_id,
-            buf: symphonia::core::audio::SampleBuffer::<f32>::new(8192, Default::default()),
-            spec: Default::default(),
+            pending: Vec::with_capacity(alac.frame_len as usize * 2),
             pos: 0,
-            sample_rate,
-            channels,
-            finished: false,
+            sample_rate: alac.sample_rate,
+            channels: alac.channels as usize,
+            frames_decoded: 0,
         })
+    }
+
+    fn decode_more(&mut self) -> bool {
+        use symphonia::core::formats::Packet;
+        loop {
+            let frag = match fairplay::read_fragment(&mut self.reader) {
+                Ok(Some(f)) => f,
+                Ok(None) => return false, // clean EOF
+                Err(_) => return false,   // treat stream errors as end
+            };
+            let mut ts = frag.base_time;
+            for (i, sample) in frag.samples.iter().enumerate() {
+                let dur = (*frag.durations.get(i).unwrap_or(&0)).max(1) as u64;
+                let pkt =
+                    Packet::new_from_boxed_slice(1, ts, dur, sample.clone().into_boxed_slice());
+                ts += dur;
+                match self.decoder.decode(&pkt) {
+                    Ok(decoded) => {
+                        let frames = decoded.frames().max(1);
+                        let spec = *decoded.spec();
+                        let cap = frames as usize * spec.channels.count();
+                        let mut buf =
+                            symphonia::core::audio::SampleBuffer::<f32>::new(cap as u64, spec);
+                        buf.copy_interleaved_ref(decoded);
+                        self.pending.extend_from_slice(buf.samples());
+                        self.frames_decoded += frames as u64;
+                    }
+                    Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+                    Err(_) => return false,
+                }
+            }
+            return true;
+        }
     }
 }
 
-impl Iterator for SymphoniaSource {
+impl Iterator for PacketSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
-        if self.pos < self.buf.samples().len() {
-            let s = self.buf.samples()[self.pos];
-            self.pos += 1;
-            return Some(s);
-        }
-        if self.finished {
-            return None;
-        }
-        loop {
-            match self.format.next_packet() {
-                Ok(pkt) if pkt.track_id() != self.track_id => continue,
-                Ok(pkt) => match self.decoder.decode(&pkt) {
-                    Ok(decoded) => {
-                        let spec = *decoded.spec();
-                        let cap = (decoded.frames().max(1) as usize) * spec.channels.count();
-                        if self.buf.capacity() < cap {
-                            self.buf = symphonia::core::audio::SampleBuffer::<f32>::new(
-                                cap as u64,
-                                spec,
-                            );
-                        } else {
-                            self.buf = symphonia::core::audio::SampleBuffer::<f32>::new(
-                                self.buf.capacity(),
-                                spec,
-                            );
-                        }
-                        self.buf.copy_interleaved_ref(decoded);
-                        self.spec = spec;
-                        self.pos = 0;
-                        if self.buf.samples().is_empty() {
-                            continue;
-                        }
-                        let s = self.buf.samples()[0];
-                        self.pos = 1;
-                        return Some(s);
-                    }
-                    Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-                    Err(_) => {
-                        self.finished = true;
-                        return None;
-                    }
-                },
-                Err(symphonia::core::errors::Error::IoError(ref e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    self.finished = true;
-                    return None;
-                }
-                Err(symphonia::core::errors::Error::ResetRequired) | Err(_) => {
-                    self.finished = true;
-                    return None;
-                }
+        if self.pos >= self.pending.len() {
+            self.pending.clear();
+            self.pos = 0;
+            if !self.decode_more() {
+                return None;
+            }
+            if self.pos >= self.pending.len() {
+                return None;
             }
         }
+        let s = self.pending[self.pos];
+        self.pos += 1;
+        Some(s)
     }
 }
 
-impl rodio::Source for SymphoniaSource {
+impl rodio::Source for PacketSource {
     fn current_frame_len(&self) -> Option<usize> {
-        let remaining = self.buf.samples().len().saturating_sub(self.pos);
-        Some(remaining.div_ceil(self.channels.max(1)))
+        Some((self.pending.len() - self.pos).div_ceil(self.channels.max(1)))
     }
 
     fn channels(&self) -> u16 {
@@ -136,17 +125,23 @@ impl rodio::Source for SymphoniaSource {
         self.sample_rate
     }
 
-    fn total_duration(&self) -> Option<Duration> {
+    fn total_duration(&self) -> Option<std::time::Duration> {
         None
     }
 }
 
 /// Owns the audio output. Falls back to decode-only mode (progress to
 /// stdout) when no device is available — e.g. a headless VPS.
+/// Cheaply cloneable handle for UI + worker threads.
+#[derive(Clone)]
 pub struct Player {
+    inner: Arc<Inner>,
+    pub decode_only: bool,
+}
+
+struct Inner {
     stream: Option<rodio::OutputStream>,
     sink: Option<rodio::Sink>,
-    pub decode_only: bool,
 }
 
 impl Player {
@@ -155,31 +150,67 @@ impl Player {
             Ok((stream, handle)) => {
                 let sink = rodio::Sink::try_new(&handle).ok();
                 Self {
-                    stream: Some(stream),
-                    sink,
+                    inner: Arc::new(Inner {
+                        stream: Some(stream),
+                        sink,
+                    }),
                     decode_only: false,
                 }
             }
             Err(_) => Self {
-                stream: None,
-                sink: None,
+                inner: Arc::new(Inner {
+                    stream: None,
+                    sink: None,
+                }),
                 decode_only: true,
             },
         }
     }
 
     pub fn has_output(&self) -> bool {
-        self.sink.is_some()
+        self.inner.sink.is_some()
     }
 
     pub fn sink(&self) -> Option<&rodio::Sink> {
-        self.sink.as_ref()
+        self.inner.sink.as_ref()
     }
 
     /// Append a decoded source to the queue.
-    pub fn enqueue(&self, src: SymphoniaSource) {
-        if let Some(sink) = &self.sink {
+    pub fn enqueue(&self, src: PacketSource) {
+        if let Some(sink) = &self.inner.sink {
             sink.append(src);
         }
+    }
+
+    pub fn toggle_pause(&self) {
+        if let Some(sink) = &self.inner.sink {
+            if sink.is_paused() {
+                sink.play();
+            } else {
+                sink.pause();
+            }
+        }
+    }
+
+    pub fn volume(&self, v: f32) {
+        if let Some(sink) = &self.inner.sink {
+            sink.set_volume(v.clamp(0.0, 1.0));
+        }
+    }
+
+    /// Elapsed time of the current source, if playing.
+    pub fn position(&self) -> Option<std::time::Duration> {
+        self.inner.sink.as_ref().map(|s| s.get_pos())
+    }
+
+    /// Drop the current source (skip to next queued one).
+    pub fn skip(&self) {
+        if let Some(sink) = &self.inner.sink {
+            sink.skip_one();
+        }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.inner.sink.as_ref().map(|s| s.empty()).unwrap_or(true)
     }
 }

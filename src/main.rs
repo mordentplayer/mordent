@@ -1,5 +1,7 @@
 mod api;
 mod config;
+mod player;
+mod ui;
 mod fairplay;
 mod stream;
 mod wrapper;
@@ -49,6 +51,27 @@ fn run() -> Result<()> {
         "decode" => {
             let path = rest.first().ok_or_else(|| anyhow::anyhow!("usage: amc decode <file>"))?;
             decode_stats(path)?;
+        }
+        "ui" => {
+            ui::launch(cfg)?;
+        }
+        "play" => {
+            let term = if rest.is_empty() {
+                bail!("usage: amc play <term>");
+            } else {
+                rest.join(" ")
+            };
+            cmd_play(&cfg, &term)?;
+        }
+        "lyrics" => {
+            let id = rest.first().ok_or_else(|| anyhow::anyhow!("usage: amc lyrics <songId>"))?;
+            let w = wrapper::Wrapper::new(&cfg.wrapper_url);
+            let syllable = rest.iter().any(|a| a == "--syllable");
+            let data = w.lyrics(id, syllable)?;
+            match data.get("lyrics").and_then(|l| l.as_str()) {
+                Some(l) => println!("{l}"),
+                None => println!("{data}"),
+            }
         }
         _ => {
             usage();
@@ -144,6 +167,67 @@ fn cmd_wrapper(cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
+fn cmd_play(cfg: &config::Config, term: &str) -> Result<()> {
+    use std::io::Write;
+
+    let api = api::Api::new(cfg.clone())?;
+    let track = api
+        .search(term, 1)?
+        .tracks
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no results for {term:?}"))?;
+    println!("▶ {} — {} [{}]", track.name, track.artist, track.id);
+
+    let w = wrapper::Wrapper::new(&cfg.wrapper_url);
+    let logged_in = w.regions().map(|r| !r.is_empty()).unwrap_or(false);
+    let agent = ureq::AgentBuilder::new().build();
+    let cache = config::cache_path(cfg, &format!("tracks/{}.m4a", track.id))?;
+
+    let t0 = std::time::Instant::now();
+    let prog = if logged_in {
+        let plan = stream::plan_for_track(&w, &agent, &track.id)?;
+        let resolver = stream::KeyResolver::new(&w, &track.id);
+        println!("  mode: full ALAC stream via wrapper");
+        stream::ProgressiveSource::start_fairplay(plan, &resolver, cache, agent)?
+    } else {
+        let url = api.preview_url(&track.id)?;
+        println!("  mode: 90s preview (wrapper not logged in)");
+        stream::ProgressiveSource::start_plain(&url, cache, agent)?
+    };
+    println!("  stream header in {:.1?}", t0.elapsed());
+
+    let player = player::Player::new();
+    let mut src = player::PacketSource::new(Box::new(prog))?;
+
+    if player.decode_only {
+        // headless: decode and report time-to-music
+        let (rate, ch) = (src.sample_rate, src.channels.max(1));
+        let one_sec = rate as usize * ch;
+        let first: u64 = src.by_ref().take(one_sec).count() as u64;
+        let ttm = t0.elapsed();
+        println!("  ♪ time to first second of audio: {:.2?} ({} Hz, {} ch)", ttm, rate, ch);
+        // drain the rest
+        let rest_frames = src.by_ref().count() as u64;
+        let total = first + rest_frames;
+        println!(
+            "  decoded {} frames ({}s of audio) in {:.1?} — {:.1}x realtime",
+            total / ch as u64,
+            total / ch as u64 / rate as u64,
+            t0.elapsed(),
+            total as f64 / rate as f64 / t0.elapsed().as_secs_f64()
+        );
+        let _ = std::io::stdout().flush();
+    } else {
+        player.enqueue(src);
+        if let Some(sink) = player.sink() {
+            sink.set_volume(0.8);
+            sink.sleep_until_end();
+        }
+    }
+    Ok(())
+}
+
 fn cmd_decrypt(cfg: &config::Config, id: &str, out: &str) -> Result<()> {
     let w = wrapper::Wrapper::new(&cfg.wrapper_url);
     let agent = ureq::AgentBuilder::new().build();
@@ -184,7 +268,7 @@ fn decode_stats(path: &str) -> Result<()> {
     use symphonia::core::audio::Channels;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::formats::Packet;
-    use std::io::{BufReader, Read, Seek, SeekFrom};
+    use std::io::BufReader;
 
     let mut f = BufReader::new(std::fs::File::open(path)?);
 

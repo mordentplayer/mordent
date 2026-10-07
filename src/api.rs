@@ -59,6 +59,8 @@ struct RawAttrs {
     disc_number: u32,
     artwork: Option<RawArtwork>,
     audio_traits: Vec<String>,
+    #[serde(default)]
+    previews: Vec<RawPreview>,
     track_count: u32,
     release_date: String,
     genre_names: Vec<String>,
@@ -66,6 +68,11 @@ struct RawAttrs {
 
 #[derive(Deserialize, Default)]
 struct RawArtwork {
+    url: String,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPreview {
     url: String,
 }
 
@@ -244,6 +251,24 @@ impl Api {
                 })
                 .collect(),
         })
+    }
+
+    /// 90-second unencrypted preview URL for a track (anonymous playback).
+    pub fn preview_url(&self, id: &str) -> Result<String> {
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/catalog/{}/songs/{id}?l=en-US",
+            self.cfg.storefront
+        );
+        let raw = self.get_json_retry(&url)?;
+        raw.get("data")
+            .and_then(|d| d.get(0))
+            .and_then(|r| r.get("attributes"))
+            .and_then(|a| a.get("previews"))
+            .and_then(|p| p.get(0))
+            .and_then(|p| p.get("url"))
+            .and_then(|u| u.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("no preview for {id}"))
     }
 
     /// Tracks of a catalog album, in disc/track order.
