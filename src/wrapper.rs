@@ -77,14 +77,14 @@ impl Wrapper {
             .unwrap_or_default())
     }
 
-    /// Raw m3u8 manifest for a track (adam id). Accommodates both raw-text
-    /// and JSON-embedded responses.
-    pub fn m3u8(&self, adam_id: &str) -> Result<String> {
+    /// Playback manifest URL for a track (adam id). wrapper-lite returns the
+    /// hosted m3u8 URL rather than manifest text.
+    pub fn m3u8_url(&self, adam_id: &str) -> Result<String> {
         let data = self.get("/m3u8", &[("adamId", adam_id)])?;
-        if let Some(s) = data.as_str() {
-            return Ok(s.to_string());
-        }
-        anyhow::bail!("unexpected /m3u8 data shape: {data}")
+        data.get("m3u8")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("unexpected /m3u8 data shape: {data}"))
     }
 
     /// Decryption key bytes for an `skd://` URI of a track.

@@ -9,6 +9,9 @@ ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+temari = "0.3"
+parking_lot = "0.12"
+symphonia = { version = "0.5", default-features = false, features = ["aac", "alac", "isomp4", "mpa", "pcm"] }
 
 [profile.release]
 lto = "thin"
