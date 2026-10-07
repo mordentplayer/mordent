@@ -1,0 +1,102 @@
+use anyhow::{Context, Result};
+use std::time::Duration;
+
+/// Client for the wrapper-lite single-port HTTP API.
+///
+/// All endpoints answer `{"code":0,"msg":"SUCCESS","data":...}`; non-zero
+/// `code` is an error carrying `msg`.
+#[derive(Clone)]
+pub struct Wrapper {
+    base: String,
+    agent: ureq::Agent,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Envelope {
+    code: i64,
+    msg: String,
+    #[serde(default = "serde_json::Value::default")]
+    data: serde_json::Value,
+}
+
+impl Wrapper {
+    pub fn new(base: &str) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(3))
+            .timeout(Duration::from_secs(30))
+            .build();
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            agent,
+        }
+    }
+
+    fn get(&self, path: &str, queries: &[(&str, &str)]) -> Result<serde_json::Value> {
+        let url = format!("{}{}", self.base, path);
+        let mut req = self.agent.get(&url);
+        for (k, v) in queries {
+            req = req.query(k, v);
+        }
+        let env: Envelope = req
+            .call()
+            .with_context(|| format!("wrapper GET {path}"))?
+            .into_json()
+            .with_context(|| format!("wrapper GET {path} body"))?;
+        if env.code != 0 {
+            anyhow::bail!("wrapper {path} failed (code {}): {}", env.code, env.msg);
+        }
+        Ok(env.data)
+    }
+
+    pub fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let url = format!("{}{}", self.base, path);
+        let env: Envelope = self
+            .agent
+            .post(&url)
+            .send_json(body)
+            .with_context(|| format!("wrapper POST {path}"))?
+            .into_json()
+            .with_context(|| format!("wrapper POST {path} body"))?;
+        if env.code != 0 {
+            anyhow::bail!("wrapper POST {path} failed (code {}): {}", env.code, env.msg);
+        }
+        Ok(env.data)
+    }
+
+    /// Storefront codes this wrapper can serve (empty = not logged in).
+    pub fn regions(&self) -> Result<Vec<String>> {
+        let data = self.get("/status", &[])?;
+        Ok(data
+            .get("regions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Raw m3u8 manifest for a track (adam id). Accommodates both raw-text
+    /// and JSON-embedded responses.
+    pub fn m3u8(&self, adam_id: &str) -> Result<String> {
+        let data = self.get("/m3u8", &[("adamId", adam_id)])?;
+        if let Some(s) = data.as_str() {
+            return Ok(s.to_string());
+        }
+        anyhow::bail!("unexpected /m3u8 data shape: {data}")
+    }
+
+    /// Decryption key bytes for an `skd://` URI of a track.
+    pub fn key(&self, adam_id: &str, uri: &str) -> Result<serde_json::Value> {
+        self.get("/key", &[("adamId", adam_id), ("uri", uri)])
+    }
+
+    /// Time-synced lyrics; `syllable` selects word-by-word timing.
+    pub fn lyrics(&self, adam_id: &str, syllable: bool) -> Result<serde_json::Value> {
+        self.get(
+            "/lyrics",
+            &[("adamId", adam_id), ("syllable", if syllable { "1" } else { "0" })],
+        )
+    }
+}

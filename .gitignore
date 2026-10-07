@@ -1,0 +1,6 @@
+/target
+wrapper/build/
+wrapper/android-ndk-r23b/
+wrapper/rootfs/data/
+wrapper/ndk.zip
+wrapper/
