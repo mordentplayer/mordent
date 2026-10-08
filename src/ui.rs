@@ -18,7 +18,7 @@ use crate::mpris;
 use crate::player::{PacketSource, Player};
 use crate::report;
 use crate::theme::Theme;
-use crate::{stream, wrapper};
+use crate::stream;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -622,18 +622,7 @@ impl App {
         let t = track;
         let _ = std::thread::Builder::new().name("play-worker".into()).spawn(move || {
             let res = (|| -> anyhow::Result<()> {
-                let w = wrapper::Wrapper::new(&cfg.wrapper_url);
-                let logged_in = w.regions().map(|r| !r.is_empty()).unwrap_or(false);
-                let agent = ureq::AgentBuilder::new().build();
-                let cache = crate::config::cache_path(&cfg, &format!("tracks/{}.m4a", t.id))?;
-                let prog = if logged_in {
-                    let plan = stream::plan_for_track(&w, &agent, &t.id)?;
-                    let resolver = stream::KeyResolver::new(&w, &t.id);
-                    stream::ProgressiveSource::start_fairplay(plan, &resolver, cache, agent)?
-                } else {
-                    let url = Api::new(cfg.clone())?.preview_url(&t.id)?;
-                    stream::ProgressiveSource::start_plain(&url, cache, agent)?
-                };
+                let (prog, _mode) = stream::open_track(&cfg, &t.id)?;
                 let cancel = prog.cancel_flag();
                 let mut src = PacketSource::with_cancel(Box::new(prog), cancel)?;
                 // Seek = restart the stream and discard output before the

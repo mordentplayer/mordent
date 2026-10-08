@@ -2,12 +2,14 @@
 //! progressive download with in-line FairPlay `cbcs` decryption (or plain
 //! passthrough for unencrypted previews) into a disk-backed seekable source.
 
+use crate::acache;
+use crate::config::Config;
 use crate::fairplay;
 use crate::wrapper::Wrapper;
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -79,24 +81,50 @@ fn attr(line: &str, name: &str) -> Option<String> {
         .map(|(_, v)| v.trim().trim_matches('"').to_string())
 }
 
+/// Manifest texts + the URLs they came from — the material the audio cache
+/// stores, and what `MediaPlan` is reduced from.
+pub struct Manifests {
+    pub master_url: String,
+    /// Master manifest text, when the wrapper URL was a master.
+    pub master: Option<String>,
+    pub media_url: String,
+    pub media: String,
+}
+
+/// Reduce fetched manifests to a [`MediaPlan`].
+pub fn plan_of(m: &Manifests) -> Result<MediaPlan> {
+    parse_media_manifest(&m.media, &m.media_url)
+}
+
 /// Fetch the manifest for a track and reduce it to a [`MediaPlan`].
 pub fn plan_for_track(wrapper: &Wrapper, agent: &ureq::Agent, adam_id: &str) -> Result<MediaPlan> {
+    plan_of(&fetch_manifests(wrapper, agent, adam_id)?)
+}
+
+/// Fetch master + variant manifests from the CDN (via the wrapper URL).
+pub fn fetch_manifests(wrapper: &Wrapper, agent: &ureq::Agent, adam_id: &str) -> Result<Manifests> {
     let manifest_url = wrapper.m3u8_url(adam_id)?;
     let text = fetch_text(agent, &manifest_url)?;
-    let media_url = if text.contains("#EXT-X-STREAM-INF") {
-        pick_variant(&text, &manifest_url)?
-    } else {
-        manifest_url.clone()
-    };
-    if media_url == manifest_url && text.contains("#EXT-X-STREAM-INF") {
+    if !text.contains("#EXT-X-STREAM-INF") {
+        // The wrapper URL was already a media manifest.
+        return Ok(Manifests {
+            master_url: manifest_url.clone(),
+            master: None,
+            media_url: manifest_url,
+            media: text,
+        });
+    }
+    let media_url = pick_variant(&text, &manifest_url)?;
+    if media_url == manifest_url {
         bail!("variant resolution failed");
     }
-    let media_text = if text.contains("#EXT-X-STREAM-INF") {
-        fetch_text(agent, &media_url)?
-    } else {
-        text
-    };
-    parse_media_manifest(&media_text, &media_url)
+    let media = fetch_text(agent, &media_url)?;
+    Ok(Manifests {
+        master_url: manifest_url,
+        master: Some(text),
+        media_url,
+        media,
+    })
 }
 
 fn fetch_text(agent: &ureq::Agent, url: &str) -> Result<String> {
@@ -152,6 +180,9 @@ pub struct KeyResolver<'a> {
     wrapper: &'a Wrapper,
     adam_id: String,
     cache: Mutex<HashMap<String, Arc<temari::rounds::Template>>>,
+    /// Audio-cache track dir; license responses are stored/loaded here
+    /// keyed by key URI when set.
+    disk: Option<PathBuf>,
 }
 
 impl<'a> KeyResolver<'a> {
@@ -160,19 +191,47 @@ impl<'a> KeyResolver<'a> {
             wrapper,
             adam_id: adam_id.to_string(),
             cache: Mutex::new(HashMap::new()),
+            disk: None,
         }
+    }
+
+    /// Like [`KeyResolver::new`] but persists license responses in the
+    /// audio-cache track dir (best-effort, never fails playback).
+    pub fn with_cache(wrapper: &'a Wrapper, adam_id: &str, dir: Option<PathBuf>) -> Self {
+        Self { disk: dir, ..Self::new(wrapper, adam_id) }
+    }
+
+    fn disk_json(&self, uri: &str) -> Option<String> {
+        let dir = self.disk.as_ref()?;
+        let raw = std::fs::read_to_string(acache::key_path(dir, uri)).ok()?;
+        let s = raw.trim().to_string();
+        (!s.is_empty()).then_some(s)
     }
 
     pub fn template(&self, uri: &str) -> Result<Arc<temari::rounds::Template>> {
         if let Some(t) = self.cache.lock().get(uri) {
             return Ok(t.clone());
         }
-        let adam = if uri == PREFETCH_URI { "0" } else { &self.adam_id };
-        let data = self.wrapper.key(adam, uri)?;
-        let json = serde_json::to_string(&data).context("serializing key data")?;
-        let tmpl = temari::template::template_from_json(&json)
-            .map_err(|e| anyhow!("template from key json: {e}"))?;
-        let t = Arc::new(tmpl);
+        let make = |json: &str| -> Result<Arc<temari::rounds::Template>> {
+            let tmpl = temari::template::template_from_json(json.trim())
+                .map_err(|e| anyhow!("template from key json: {e}"))?;
+            Ok(Arc::new(tmpl))
+        };
+        // disk (cache hit) first; a corrupt cached license falls back to the
+        // wrapper below rather than failing playback.
+        let cached = self.disk_json(uri).and_then(|j| make(&j).ok());
+        let t = match cached {
+            Some(t) => t,
+            None => {
+                let adam = if uri == PREFETCH_URI { "0" } else { &self.adam_id };
+                let data = self.wrapper.key(adam, uri)?;
+                let json = serde_json::to_string(&data).context("serializing key data")?;
+                if let Some(dir) = &self.disk {
+                    acache::store_key(dir, uri, &json);
+                }
+                make(&json)?
+            }
+        };
         self.cache.lock().insert(uri.to_string(), t.clone());
         Ok(t)
     }
@@ -308,12 +367,124 @@ impl ProgressiveSource {
         Ok(src)
     }
 
+    /// Shared box-pump: reads fMP4 boxes from `r` (network or the audio
+    /// cache), appends DECRYPTED output to the playback buffer and tees raw
+    /// ENCRYPTED bytes into `tee` when present. Returns on clean EOF (which
+    /// commits the cache entry); a canceled download returns Ok without
+    /// committing — an uncommitted entry simply misses next time.
+    #[allow(clippy::too_many_arguments)]
+    fn pump(
+        r: &mut dyn Read,
+        keys: &[Option<String>],
+        first_key: Option<&str>,
+        templates: &[(String, Arc<temari::rounds::Template>)],
+        sh: &Arc<Mutex<Shared>>,
+        cv: &Condvar,
+        cancel: &std::sync::atomic::AtomicBool,
+        tee: &mut Option<Tee>,
+    ) -> Result<()> {
+        // init: ftyp + moov
+        let mut init_raw = Vec::new();
+        let mut saw_moov = false;
+        for _ in 0..2 {
+            let (h, payload, hdr) = read_box(r)?;
+            if let Some(t) = tee {
+                t.write(&hdr, &payload);
+            }
+            let kind = kind_of(&h.kind);
+            if kind != "ftyp" && kind != "moov" {
+                bail!("unexpected init box {kind}");
+            }
+            saw_moov |= kind == "moov";
+            init_raw.extend_from_slice(&hdr);
+            init_raw.extend_from_slice(&payload);
+        }
+        if !saw_moov {
+            bail!("no moov in init");
+        }
+        let init = fairplay::parse_init(&init_raw)?;
+        let info = init
+            .tracks
+            .values()
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow!("no encrypted track in init"))?;
+        Self::append(sh, cv, &init.bytes)?;
+
+        let mut frag_idx = 0usize;
+        let mut cur_tmpl: Option<Arc<temari::rounds::Template>> = first_key
+            .and_then(|k| templates.iter().find(|(u, _)| u == k))
+            .map(|(_, t)| t.clone());
+
+        loop {
+            // read top-level boxes: moof then mdat form one fragment
+            let mut pending_moof: Option<Vec<u8>> = None;
+            let mdat;
+            loop {
+                let (h, payload, hdr) = match read_box(r) {
+                    Ok(x) => x,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // clean end of stream → the cached entry is complete
+                        if let Some(t) = tee {
+                            t.commit();
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                if let Some(t) = tee {
+                    t.write(&hdr, &payload);
+                }
+                match kind_of(&h.kind).as_str() {
+                    "mdat" => {
+                        mdat = h.assemble(&payload);
+                        break;
+                    }
+                    "moof" => pending_moof = Some(h.assemble(&payload)),
+                    "prft" | "emsg" | "free" | "skip" => {}
+                    other => {
+                        // trailing mfra etc — copy verbatim
+                        if pending_moof.is_some() {
+                            bail!("unexpected box {other} mid-fragment");
+                        }
+                        Self::append(sh, cv, &h.assemble(&payload))?;
+                    }
+                }
+            }
+            let moof_buf = match pending_moof {
+                Some(m) => m,
+                None => bail!("mdat without moof"),
+            };
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+            let key_uri = keys.get(frag_idx).cloned().flatten();
+            if let Some(uri) = key_uri {
+                cur_tmpl = templates
+                    .iter()
+                    .find(|(u, _)| *u == uri)
+                    .map(|(_, t)| t.clone());
+            }
+            let tmpl = cur_tmpl
+                .as_ref()
+                .ok_or_else(|| anyhow!("encrypted fragment with no key"))?;
+            let clear =
+                fairplay::decrypt_fragment(&moof_buf, &mdat, &info, tmpl.as_ref())
+                    .with_context(|| format!("fragment {frag_idx}"))?;
+            Self::append(sh, cv, &clear)?;
+            frag_idx += 1;
+        }
+    }
+
     /// FairPlay stream: single-file download with in-line cbcs decryption.
+    /// With `audio` set, the raw (ENCRYPTED) response bytes are teed into
+    /// the audio cache — never the decrypted output.
     pub fn start_fairplay(
         plan: MediaPlan,
         resolver: &KeyResolver,
         cache_file: PathBuf,
         agent: ureq::Agent,
+        audio: Option<acache::Populate>,
     ) -> Result<Self> {
         let sh = Self::shared(&cache_file)?;
         let cv = Arc::new(Condvar::new());
@@ -322,9 +493,6 @@ impl ProgressiveSource {
         let wcv = cv.clone();
         let wcancel = Arc::clone(&cancel);
 
-        // pre-resolve the first key's template off-thread is unnecessary;
-        // worker resolves lazily per key change.
-        let adam_urls = plan.file_url.clone();
         // The resolver borrows the wrapper; the worker thread needs 'static.
         // Templates are Arc'd and cloned out up front for every distinct key.
         let mut templates: Vec<(String, Arc<temari::rounds::Template>)> = Vec::new();
@@ -336,97 +504,33 @@ impl ProgressiveSource {
             }
         }
         let default_key = plan.keys.iter().flatten().next().cloned();
+        let media_url = plan.file_url.clone();
+        let keys = plan.keys.clone();
+        let mut tee = match audio {
+            Some(p) => match Tee::new(p, &media_url, &unique_keys(&keys)) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    acache::once_warn("audio cache open", e);
+                    None
+                }
+            },
+            None => None,
+        };
 
         std::thread::Builder::new().name("amc-fetch".into()).spawn(move || {
-            let run = || -> Result<()> {
-                let resp = agent.get(&adam_urls).call().context("GET media file")?;
+            let mut run = || -> Result<()> {
+                let resp = agent.get(&media_url).call().context("GET media file")?;
                 let mut r = BufReader::new(resp.into_reader());
-
-                // init: ftyp + moov
-                let mut init_raw = Vec::new();
-                let mut saw_moov = false;
-                for _ in 0..2 {
-                    let (h, payload) = read_box(&mut r)?;
-                    let kind = kind_of(&h.kind);
-                    if kind != "ftyp" && kind != "moov" {
-                        bail!("unexpected init box {kind}");
-                    }
-                    saw_moov |= kind == "moov";
-                    init_raw.extend_from_slice(&h.assemble(&payload));
-                }
-                if !saw_moov {
-                    bail!("no moov in init");
-                }
-                let init = fairplay::parse_init(&init_raw)?;
-                let info = init
-                    .tracks
-                    .values()
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| anyhow!("no encrypted track in init"))?;
-                Self::append(&wsh, &wcv, &init.bytes)?;
-
-                let mut frag_idx = 0usize;
-                let mut cur_tmpl: Option<Arc<temari::rounds::Template>> = None;
-                if let Some(k) = plan.keys.first().and_then(|k| k.as_ref()).or(default_key.as_ref()) {
-                    cur_tmpl = templates
-                        .iter()
-                        .find(|(u, _)| u == k)
-                        .map(|(_, t)| t.clone());
-                }
-
-                loop {
-                    // read top-level boxes: moof then mdat form one fragment
-                    let mut pending_moof: Option<Vec<u8>> = None;
-                    let mdat;
-                    loop {
-                        let (h, payload) = match read_box(&mut r) {
-                            Ok(x) => x,
-                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                // clean end
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e.into()),
-                        };
-                        match kind_of(&h.kind).as_str() {
-                            "mdat" => {
-                                mdat = h.assemble(&payload);
-                                break;
-                            }
-                            "moof" => pending_moof = Some(h.assemble(&payload)),
-                            "prft" | "emsg" | "free" | "skip" => {}
-                            other => {
-                                // trailing mfra etc — copy verbatim
-                                if pending_moof.is_some() {
-                                    bail!("unexpected box {other} mid-fragment");
-                                }
-                                Self::append(&wsh, &wcv, &h.assemble(&payload))?;
-                            }
-                        }
-                    }
-                    let moof_buf = match pending_moof {
-                        Some(m) => m,
-                        None => bail!("mdat without moof"),
-                    };
-                    if wcancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    let key_uri = plan.keys.get(frag_idx).cloned().flatten();
-                    if let Some(uri) = key_uri {
-                        cur_tmpl = templates
-                            .iter()
-                            .find(|(u, _)| *u == uri)
-                            .map(|(_, t)| t.clone());
-                    }
-                    let tmpl = cur_tmpl
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("encrypted fragment with no key"))?;
-                    let clear =
-                        fairplay::decrypt_fragment(&moof_buf, &mdat, &info, tmpl.as_ref())
-                            .with_context(|| format!("fragment {frag_idx}"))?;
-                    Self::append(&wsh, &wcv, &clear)?;
-                    frag_idx += 1;
-                }
+                Self::pump(
+                    &mut r,
+                    &keys,
+                    default_key.as_deref(),
+                    &templates,
+                    &wsh,
+                    &wcv,
+                    &wcancel,
+                    &mut tee,
+                )
             };
             Self::finish(&wsh, &wcv, run().err().map(|e| format!("{e:#}")));
         })?;
@@ -435,24 +539,251 @@ impl ProgressiveSource {
             sh,
             cv,
             pos: Mutex::new(0),
-            cancel: Arc::clone(&cancel),
+            cancel,
         };
         // wait for the container header so probing can start
         src.wait_available(1)?;
         Ok(src)
     }
+
+    /// FairPlay playback entirely from the audio cache: boxes come from the
+    /// stored ENCRYPTED media file, keys from the stored license responses —
+    /// zero network (no wrapper, no CDN). Decrypts at consumption speed,
+    /// exactly like the network path.
+    pub fn start_fairplay_cached(
+        entry: &acache::TrackEntry,
+        cache_file: PathBuf,
+    ) -> Result<Self> {
+        let plan = parse_media_manifest(&entry.variant, &entry.media_url)?;
+        let mut templates: Vec<(String, Arc<temari::rounds::Template>)> = Vec::new();
+        for uri in plan.keys.iter().flatten() {
+            if templates.iter().any(|(u, _)| u == uri) {
+                continue;
+            }
+            let json = entry
+                .keys
+                .get(uri)
+                .ok_or_else(|| anyhow!("cached license for {uri} missing"))?;
+            let tmpl = temari::template::template_from_json(json.trim())
+                .map_err(|e| anyhow!("template from cached key json: {e}"))?;
+            templates.push((uri.clone(), Arc::new(tmpl)));
+        }
+        let default_key = plan.keys.iter().flatten().next().cloned();
+        let keys = plan.keys;
+        let sh = Self::shared(&cache_file)?;
+        let cv = Arc::new(Condvar::new());
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wsh = sh.clone();
+        let wcv = cv.clone();
+        let wcancel = Arc::clone(&cancel);
+        let media = entry.media.clone();
+        let dir = entry.dir.clone();
+
+        std::thread::Builder::new().name("amc-cache".into()).spawn(move || {
+            let run = || -> Result<()> {
+                let f = std::fs::File::open(&media)?;
+                let mut r = BufReader::new(f);
+                Self::pump(
+                    &mut r,
+                    &keys,
+                    default_key.as_deref(),
+                    &templates,
+                    &wsh,
+                    &wcv,
+                    &wcancel,
+                    &mut None,
+                )
+            };
+            match run() {
+                Ok(()) => Self::finish(&wsh, &wcv, None),
+                Err(e) => {
+                    // corrupt cached material: drop the completeness marker
+                    // so the next play attempt refetches from the network
+                    acache::once_warn("cached playback", &e);
+                    let _ = std::fs::remove_file(dir.join("meta.json"));
+                    Self::finish(&wsh, &wcv, Some(format!("{e:#}")));
+                }
+            }
+        })?;
+
+        let src = Self {
+            sh,
+            cv,
+            pos: Mutex::new(0),
+            cancel,
+        };
+        src.wait_available(1)?;
+        Ok(src)
+    }
 }
 
-fn read_box(r: &mut impl std::io::Read) -> std::io::Result<(BoxHead, Vec<u8>)> {
+/// Destination for the encrypted-byte tee (audio cache `media.bin`).
+struct Tee {
+    file: std::io::BufWriter<std::fs::File>,
+    dir: PathBuf,
+    meta: acache::Meta,
+    dead: bool,
+}
+
+impl Tee {
+    fn new(p: acache::Populate, media_url: &str, keys: &[String]) -> Result<Self> {
+        std::fs::create_dir_all(&p.dir)?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(p.dir.join("media.bin"))?;
+        Ok(Self {
+            file: std::io::BufWriter::with_capacity(256 * 1024, file),
+            dir: p.dir,
+            meta: acache::Meta {
+                last_played: p.last_played,
+                size_bytes: 0,
+                media_url: media_url.to_string(),
+                keys: keys.to_vec(),
+            },
+            dead: false,
+        })
+    }
+
+    /// `hdr` + `payload` are the exact bytes as served (8- or 16-byte box
+    /// header preserved) — the cached file is byte-identical to the CDN
+    /// response.
+    fn write(&mut self, hdr: &[u8], payload: &[u8]) {
+        if self.dead {
+            return;
+        }
+        let r = self.file.write_all(hdr).and_then(|_| self.file.write_all(payload));
+        match r {
+            Ok(()) => self.meta.size_bytes += (hdr.len() + payload.len()) as u64,
+            Err(e) => {
+                self.dead = true;
+                acache::once_warn("audio cache write", e);
+            }
+        }
+    }
+
+    /// Completeness marker — only on clean EOF of the full download.
+    fn commit(&mut self) {
+        if self.dead {
+            return;
+        }
+        let r = self
+            .file
+            .flush()
+            .map_err(anyhow::Error::from)
+            .and_then(|()| acache::commit_meta(&self.dir, &self.meta));
+        if let Err(e) = r {
+            acache::once_warn("audio cache commit", e);
+        }
+    }
+}
+
+fn unique_keys(keys: &[Option<String>]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for k in keys.iter().flatten() {
+        if !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
+    out
+}
+
+// ---- high-level: open a playable source with the audio cache in the loop ----
+
+/// How the returned source is fed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceMode {
+    /// Served from the audio cache — zero network (no wrapper, no CDN).
+    Cached,
+    /// Wrapper-planned CDN stream (populating the cache when enabled).
+    Stream,
+    /// Unencrypted preview passthrough (wrapper unavailable / not logged in).
+    Preview,
+}
+
+impl std::fmt::Display for SourceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceMode::Cached => write!(f, "cache (offline)"),
+            SourceMode::Stream => write!(f, "CDN stream"),
+            SourceMode::Preview => write!(f, "preview"),
+        }
+    }
+}
+
+/// Acquire a playable source for `adam_id`:
+/// 1. complete audio-cache entry → decrypt locally, zero network;
+/// 2. otherwise wrapper plan + CDN fetch, populating the cache;
+/// 3. wrapper unreachable / not logged in → uncached preview fallback.
+/// Cache I/O problems never fail the call — they degrade to the network
+/// path (logged once per process).
+pub fn open_track(cfg: &Config, adam_id: &str) -> Result<(ProgressiveSource, SourceMode)> {
+    let started = std::time::Instant::now();
+    let r = open_track_inner(cfg, adam_id);
+    if let Ok((_, mode)) = &r {
+        eprintln!("[play] source: {mode} (ready in {:.1?})", started.elapsed());
+    }
+    r
+}
+
+fn open_track_inner(cfg: &Config, adam_id: &str) -> Result<(ProgressiveSource, SourceMode)> {
+    let agent = ureq::AgentBuilder::new().build();
+    let playback_file = crate::config::cache_path(cfg, &format!("tracks/{adam_id}.m4a"))?;
+    let audio = acache::AudioCache::new(cfg);
+    let now = crate::config::unix_now();
+
+    if audio.enabled() {
+        // evict once per play attempt, before any fetch; the track about to
+        // play is exempt so an in-flight download can't be evicted
+        audio.prune(adam_id);
+        if let Some(entry) = audio.lookup(adam_id) {
+            match ProgressiveSource::start_fairplay_cached(&entry, playback_file.clone()) {
+                Ok(src) => {
+                    // every play refreshes recency (full cache hit included)
+                    audio.touch(adam_id, now);
+                    return Ok((src, SourceMode::Cached));
+                }
+                Err(e) => {
+                    audio.invalidate(adam_id);
+                    acache::once_warn("cached playback start", e);
+                }
+            }
+        }
+    }
+    let populate = audio.populate_target(adam_id, now);
+
+    let w = Wrapper::new(&cfg.wrapper_url);
+    if w.regions().map(|r| !r.is_empty()).unwrap_or(false) {
+        let m = fetch_manifests(&w, &agent, adam_id)?;
+        if let Some(p) = &populate {
+            acache::store_manifests(&p.dir, m.master.as_deref(), &m.media);
+        }
+        let plan = plan_of(&m)?;
+        let resolver =
+            KeyResolver::with_cache(&w, adam_id, populate.as_ref().map(|p| p.dir.clone()));
+        let src = ProgressiveSource::start_fairplay(plan, &resolver, playback_file, agent, populate)?;
+        return Ok((src, SourceMode::Stream));
+    }
+    let url = crate::api::Api::new(cfg.clone())?.preview_url(adam_id)?;
+    let src = ProgressiveSource::start_plain(&url, playback_file, agent)?;
+    Ok((src, SourceMode::Preview))
+}
+
+/// Read one top-level box: `(head, payload, exact header bytes as read)`
+/// — the header is kept so callers can tee byte-identical raw data.
+fn read_box(r: &mut dyn std::io::Read) -> std::io::Result<(BoxHead, Vec<u8>, Vec<u8>)> {
     let mut b8 = [0u8; 8];
     r.read_exact(&mut b8)?;
     let mut size = u32::from_be_bytes([b8[0], b8[1], b8[2], b8[3]]) as usize;
     let mut hdr = 8usize;
+    let mut head = b8.to_vec();
     if size == 1 {
         let mut b16 = [0u8; 8];
         r.read_exact(&mut b16)?;
         size = u64::from_be_bytes(b16) as usize;
         hdr = 16;
+        head.extend_from_slice(&b16);
     }
     if size < hdr {
         return Err(std::io::Error::new(
@@ -467,6 +798,7 @@ fn read_box(r: &mut impl std::io::Read) -> std::io::Result<(BoxHead, Vec<u8>)> {
             kind: [b8[4], b8[5], b8[6], b8[7]],
         },
         payload,
+        head,
     ))
 }
 

@@ -1,8 +1,9 @@
-use crate::config::{cache_path, fresh, Config};
+use crate::config::{cache_path, fnv128, fresh, unix_now, Config};
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -436,18 +437,84 @@ impl Api {
         resp.into_json().with_context(|| format!("body of {url}"))
     }
 
-    /// GET with a single transparent 401-retry after bearer refresh.
+    /// GET with a single transparent 401-retry after bearer refresh, fronted
+    /// by the metadata disk cache: fresh TTL → serve cached; network failure
+    /// with ANY cached copy → serve stale (offline browsing).
     fn get_json_retry(&self, url: &str) -> Result<serde_json::Value> {
-        match self.get_json(url) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                if is_unauthorized(&e) {
-                    self.refresh_bearer()?;
-                    self.get_json(url)
-                } else {
-                    Err(e)
-                }
+        if let Some(v) = self.meta_lookup(url) {
+            return Ok(v);
+        }
+        let mut err = match self.get_json(url) {
+            Ok(v) => {
+                self.meta_store(url, &v);
+                return Ok(v);
             }
+            Err(e) => e,
+        };
+        if is_unauthorized(&err) {
+            match self.refresh_bearer().and_then(|_| self.get_json(url)) {
+                Ok(v) => {
+                    self.meta_store(url, &v);
+                    return Ok(v);
+                }
+                Err(e) => err = e,
+            }
+        }
+        // network failed — any cached copy beats an error for browsing
+        if let Some(v) = self.meta_stale(url) {
+            return Ok(v);
+        }
+        Err(err)
+    }
+
+    // ---- metadata disk cache ({cache_dir}/meta) ----
+    //
+    // Key = FNV-1a-128 of (URL + storefront); the file is the raw response
+    // JSON prefixed with a one-line JSON header `{"stored":…,"ttl":…}`.
+    // Raw JSON is cached (serde structs untouched). Failures are silent and
+    // never fail the request.
+
+    fn meta_path(&self, url: &str) -> Option<PathBuf> {
+        let key = fnv128(format!("{url}\x1f{}", self.cfg.storefront).as_bytes());
+        cache_path(&self.cfg, &format!("meta/{key}.cache")).ok()
+    }
+
+    /// Fresh TTL hit.
+    fn meta_lookup(&self, url: &str) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(self.meta_path(url)?).ok()?;
+        let (head, body) = raw.split_once('\n')?;
+        let head: serde_json::Value = serde_json::from_str(head).ok()?;
+        let stored = head.get("stored")?.as_u64()?;
+        let ttl = head.get("ttl")?.as_u64()?;
+        if !meta_fresh(stored, unix_now(), ttl) {
+            return None;
+        }
+        serde_json::from_str(body).ok()
+    }
+
+    /// Any cached copy, regardless of age (network-failure fallback).
+    fn meta_stale(&self, url: &str) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(self.meta_path(url)?).ok()?;
+        let (_, body) = raw.split_once('\n')?;
+        serde_json::from_str(body).ok()
+    }
+
+    fn meta_store(&self, url: &str, v: &serde_json::Value) {
+        let Some(p) = self.meta_path(url) else { return };
+        let body = match serde_json::to_vec(v) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let mut raw = format!(
+            "{{\"stored\":{},\"ttl\":{}}}\n",
+            unix_now(),
+            meta_ttl(url)
+        )
+        .into_bytes();
+        raw.extend_from_slice(&body);
+        let tmp = p.with_extension("tmp");
+        if std::fs::write(&tmp, &raw).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
         }
     }
 
@@ -924,6 +991,54 @@ struct JsPlayBody<'a> {
 
 // ---- helpers ----
 
+/// Metadata-cache freshness windows: catalog data barely changes, library
+/// data changes with every add/play.
+const META_TTL_CATALOG: u64 = 7 * 24 * 3600;
+const META_TTL_LIBRARY: u64 = 3600;
+
+/// TTL for an amp-api URL: library endpoints (`/v1/me/`) 1h, catalog 7d.
+fn meta_ttl(url: &str) -> u64 {
+    if url.contains("/v1/me/") {
+        META_TTL_LIBRARY
+    } else {
+        META_TTL_CATALOG
+    }
+}
+
+/// Pure freshness decision (clock injected as `now` for tests).
+fn meta_fresh(stored: u64, now: u64, ttl: u64) -> bool {
+    now.saturating_sub(stored) < ttl
+}
+
+/// Startup sweep: delete metadata cache entries older than their TTL
+/// (best-effort; the audio cache is budget-managed separately).
+pub fn clean_meta_cache(cfg: &Config) {
+    let dir = cfg.cache_dir.join("meta");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = unix_now();
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() || !e.file_name().to_string_lossy().ends_with(".cache") {
+            continue;
+        }
+        let expired = std::fs::read_to_string(e.path())
+            .ok()
+            .and_then(|raw| raw.split_once('\n').map(|(h, _)| h.to_string()))
+            .and_then(|h| serde_json::from_str::<serde_json::Value>(&h).ok())
+            .map(|v| {
+                let stored = v.get("stored").and_then(|s| s.as_u64()).unwrap_or(0);
+                let ttl = v.get("ttl").and_then(|t| t.as_u64()).unwrap_or(0);
+                !meta_fresh(stored, now, ttl)
+            })
+            .unwrap_or(true); // unparsable junk → drop
+        if expired {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn from_value<T: DeserializeOwned>(v: serde_json::Value) -> Result<T> {
     serde_json::from_value(v).map_err(Into::into)
 }
@@ -1100,6 +1215,82 @@ pub fn id_from_arg(arg: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_ttl_splits_catalog_from_library() {
+        assert_eq!(meta_ttl("https://amp-api.music.apple.com/v1/catalog/us/search?term=x"), META_TTL_CATALOG);
+        assert_eq!(meta_ttl("https://amp-api.music.apple.com/v1/catalog/us/artists/5"), META_TTL_CATALOG);
+        assert_eq!(meta_ttl("https://amp-api.music.apple.com/v1/me/library/songs?limit=100"), META_TTL_LIBRARY);
+        assert_eq!(meta_ttl("https://amp-api.music.apple.com/v1/me/library/search?term=x"), META_TTL_LIBRARY);
+    }
+
+    #[test]
+    fn meta_fresh_ttl_decision() {
+        let ttl = 3600;
+        assert!(meta_fresh(1_000, 1_000, ttl)); // just stored
+        assert!(meta_fresh(1_000, 1_000 + ttl - 1, ttl)); // inside window
+        assert!(!meta_fresh(1_000, 1_000 + ttl, ttl)); // boundary: stale
+        assert!(!meta_fresh(1_000, 2_000 + ttl, ttl));
+        // clock never regresses a decision
+        assert!(meta_fresh(2_000, 1_000, ttl)); // stored "in the future" is fresh
+        assert_eq!(meta_ttl(""), META_TTL_CATALOG); // default is catalog
+    }
+
+    #[test]
+    fn meta_hash_is_stable_hex_and_input_sensitive() {
+        let a = fnv128(b"https://amp-api.music.apple.com/v1/catalog/us/search?term=daft+punk\x1fus");
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, fnv128(b"https://amp-api.music.apple.com/v1/catalog/us/search?term=daft+punk\x1fus"));
+        assert_ne!(a, fnv128(b"https://amp-api.music.apple.com/v1/catalog/us/search?term=daft+punk\x1fgb"));
+        assert_ne!(a, fnv128(b"https://amp-api.music.apple.com/v1/catalog/us/search?term=daft+punkz\x1fus"));
+    }
+
+    #[test]
+    fn meta_roundtrip_through_disk() {
+        let dir = std::env::temp_dir().join(format!("amc-meta-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            cache_dir: dir.clone(),
+            ..Config::default()
+        };
+        let api = Api::new(cfg).unwrap();
+        let url = "https://amp-api.music.apple.com/v1/catalog/us/search?term=roundtrip";
+        let v = serde_json::json!({ "results": { "songs": { "data": [1, 2, 3] } } });
+
+        assert!(api.meta_lookup(url).is_none());
+        api.meta_store(url, &v);
+        // fresh → identical value from disk
+        assert_eq!(api.meta_lookup(url).as_ref(), Some(&v));
+        // stale → lookup declines but the stale fallback still serves it
+        let p = api.meta_path(url).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let (head, body) = raw.split_once('\n').unwrap();
+        let old = format!("{{\"stored\":0,\"ttl\":{}}}\n{body}", META_TTL_CATALOG);
+        std::fs::write(&p, old).unwrap();
+        assert!(api.meta_lookup(url).is_none());
+        assert_eq!(api.meta_stale(url).as_ref(), Some(&v));
+        // store overwrites (header refresh)
+        api.meta_store(url, &v);
+        assert_eq!(api.meta_lookup(url).as_ref(), Some(&v));
+
+        // startup sweep drops expired entries, keeps fresh ones
+        let fresh_url = "https://amp-api.music.apple.com/v1/catalog/us/search?term=fresh";
+        api.meta_store(fresh_url, &v);
+        let fp = api.meta_path(fresh_url).unwrap();
+        // expire `url` again after the overwrite (stored=0 < any ttl)
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let (_, body) = raw.split_once('\n').unwrap();
+        std::fs::write(&p, format!("{{\"stored\":0,\"ttl\":{}}}\n{body}", META_TTL_CATALOG)).unwrap();
+        let cfg = Config {
+            cache_dir: dir.clone(),
+            ..Config::default()
+        };
+        clean_meta_cache(&cfg);
+        assert!(!p.exists(), "expired entry swept");
+        assert!(fp.exists(), "fresh entry kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Load a recorded, trimmed API response. Offline: fixtures only.
     fn fixture(name: &str) -> serde_json::Value {
