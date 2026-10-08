@@ -545,13 +545,25 @@ impl Api {
         }
     }
 
-    /// Tracks of a library playlist.
+    /// Tracks of a library playlist (first page only, up to 300).
     pub fn playlist_tracks(&self, id: &str) -> Result<Vec<Track>> {
+        self.playlist_tracks_page(id, 300, 0).map(|(t, _)| t)
+    }
+
+    /// One page of a library playlist's tracks. Returns the tracks plus the
+    /// offset for the next page (None = end), mirroring `library_songs`.
+    pub fn playlist_tracks_page(
+        &self,
+        id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<Track>, Option<u32>)> {
         let url = format!(
-            "https://amp-api.music.apple.com/v1/me/library/playlists/{id}/tracks?limit=300&l=en-US"
+            "https://amp-api.music.apple.com/v1/me/library/playlists/{id}/tracks?limit={limit}&offset={offset}&l=en-US"
         );
         let raw: RawGroup = from_value(self.get_json_retry(&url)?)?;
-        Ok(raw.data.iter().map(|r| r.to_track()).collect())
+        let tracks = raw.data.iter().map(|r| r.to_track()).collect();
+        Ok((tracks, raw.next.as_deref().and_then(parse_next_offset)))
     }
 
     /// Fetch a single catalog song by adamId.
@@ -928,6 +940,25 @@ mod tests {
         assert!(lists[1].artwork.is_none());
 
         assert_eq!(raw.next.as_deref().and_then(parse_next_offset), Some(2));
+    }
+
+    #[test]
+    fn playlist_tracks_fixture_parses_and_paginates() {
+        let raw: RawGroup = decoded("playlist_tracks.json");
+        let tracks: Vec<Track> = raw.data.iter().map(|r| r.to_track()).collect();
+        assert_eq!(tracks.len(), 3);
+        // library ids resolve to the catalog id carried in playParams.
+        assert_eq!(tracks[0].id, "69719099");
+        assert_eq!(tracks[0].name, "One More Time");
+        assert_eq!(tracks[0].artist, "Daft Punk");
+        assert_eq!(tracks[0].album, "Discovery");
+        assert_eq!(tracks[0].duration_ms, 224693);
+        assert!(tracks[0].lossless);
+        assert!(!tracks[1].lossless);
+        assert!(tracks[0].artwork.is_some());
+        // missing artwork must not fail decoding.
+        assert!(tracks[1].artwork.is_none());
+        assert_eq!(raw.next.as_deref().and_then(parse_next_offset), Some(3));
     }
 
     #[test]

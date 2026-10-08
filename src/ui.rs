@@ -1,5 +1,8 @@
-//! Dense egui UI: search / albums / library tabs, album detail modal,
-//! explicit queue, upgraded player bar.
+//! Dense egui UI: search / albums / library / favorites / playlists tabs,
+//! album & playlist detail modals, explicit queue, upgraded player bar.
+//!
+//! Favorites are a set of track ids persisted in state.toml; the favorites
+//! view names them from an in-memory id→Track map filled as tracks are seen.
 //!
 //! Playback model: clicking a row plays it NOW (replacing current; the stale
 //! async source is dropped, which also cancels its download). `+` appends to
@@ -9,13 +12,13 @@
 //! In decode-only mode (no audio device) a fake playback clock simulates the
 //! running track so queue/auto-advance behaves like a real player.
 
-use crate::api::{AlbumHit, Api, SearchResults, Track};
+use crate::api::{AlbumHit, Api, LibraryPlaylist, SearchResults, Track};
 use crate::config::Config;
 use crate::player::{PacketSource, Player};
 use crate::{stream, wrapper};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xfa, 0x4d, 0x6a);
@@ -34,6 +37,15 @@ enum Msg {
         tracks: Vec<Track>,
     },
     Error(String),
+    /// One page of the user's library playlists (appended), next offset.
+    Playlists(Vec<LibraryPlaylist>, Option<u32>),
+    /// Tracks of a library playlist: first page (replaces) or a later page
+    /// (appended when the modal already holds tracks).
+    PlaylistTracks {
+        id: String,
+        tracks: Vec<Track>,
+        next: Option<u32>,
+    },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -41,6 +53,8 @@ enum View {
     Search,
     Albums,
     Library,
+    Favorites,
+    Playlists,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -62,12 +76,26 @@ struct AlbumModal {
     tracks: Option<Vec<Track>>,
 }
 
+/// Open playlist detail modal. `tracks` is None until the first page lands;
+/// later pages are appended and tracked by `next`.
+struct PlaylistModal {
+    playlist: LibraryPlaylist,
+    tracks: Option<Vec<Track>>,
+    next: Option<u32>,
+    loading_more: bool,
+}
+
 /// Clicks gathered during widget rendering, applied after borrow ends.
 enum CentralAction {
     Play(Track),
     Enqueue(Track),
     OpenAlbum(AlbumHit),
     QueueAlbum(AlbumHit),
+    OpenPlaylist(LibraryPlaylist),
+    /// Toggle favorite state of a known track.
+    ToggleFav(Track),
+    /// Remove a favorite we only know by id (metadata never seen).
+    Unfav(String),
 }
 
 struct SelftestState {
@@ -82,6 +110,8 @@ struct UiState {
     volume: Option<f32>,
     last_view: Option<String>,
     repeat: Option<String>,
+    /// Favorited track ids, sorted for a stable file (in memory it is a set).
+    favorites: Option<Vec<String>>,
 }
 
 fn state_path() -> std::path::PathBuf {
@@ -128,6 +158,25 @@ pub struct App {
     library: Option<Vec<Track>>,
     library_loading: bool,
     library_next: Option<u32>,
+    /// Favorited track ids (persisted; sorted on save).
+    favorites: HashSet<String>,
+    /// id → Track seen so far, for the favorites view.
+    ///
+    /// LIMITATION: only ids are persisted in state.toml, so a favorite whose
+    /// track has not been observed in this session (search / album / playlist
+    /// / queue / now-playing) has no name/artist to render and shows as a bare
+    /// id. We deliberately do not re-fetch metadata for such entries.
+    fav_tracks: HashMap<String, Track>,
+    /// Pending debounced state.toml write (favorite toggles).
+    state_dirty: Option<std::time::Instant>,
+    /// User library playlists (paginated).
+    playlists: Option<Vec<LibraryPlaylist>>,
+    playlists_loading: bool,
+    playlists_next: Option<u32>,
+    playlist_modal: Option<PlaylistModal>,
+    /// AMC_DEMO_PLAYLIST=<n>: open the n-th playlist once the list loads
+    /// (headless screenshot hook, alongside AMC_DEMO_VIEW).
+    demo_playlist: Option<usize>,
     queue: VecDeque<Track>,
     now: Option<Track>,
     /// Bumped on every play request; async sources carry the generation so
@@ -188,6 +237,16 @@ impl App {
             library: None,
             library_loading: false,
             library_next: None,
+            favorites: state.favorites.clone().unwrap_or_default().into_iter().collect(),
+            fav_tracks: HashMap::new(),
+            state_dirty: None,
+            playlists: None,
+            playlists_loading: false,
+            playlists_next: None,
+            playlist_modal: None,
+            demo_playlist: std::env::var("AMC_DEMO_PLAYLIST")
+                .ok()
+                .and_then(|s| s.parse().ok()),
             queue: VecDeque::new(),
             now: None,
             generation: 0,
@@ -224,13 +283,19 @@ impl App {
         match state.last_view.as_deref() {
             Some("albums") => app.view = View::Albums,
             Some("library") => app.switch_view(View::Library),
+            Some("favorites") => app.switch_view(View::Favorites),
+            Some("playlists") => app.switch_view(View::Playlists),
             _ => {}
         }
         if app.selftest.is_some() {
-            eprintln!("[selftest] armed");
+            // The auto-advance stage asserts queue promotion; a persisted
+            // repeat-one would restart the same track instead, so pin the
+            // input the deterministic test depends on.
+            app.repeat = Repeat::Off;
+            eprintln!("[selftest] armed (repeat forced off)");
         }
         // headless verification hooks: AMC_DEMO_TERM=<query> auto-searches,
-        // AMC_DEMO_VIEW=library|albums opens that view
+        // AMC_DEMO_VIEW=library|albums|favorites|playlists opens that view
         if let Ok(term) = std::env::var("AMC_DEMO_TERM") {
             app.search = term;
             app.spawn_search();
@@ -238,6 +303,8 @@ impl App {
         match std::env::var("AMC_DEMO_VIEW").as_deref() {
             Ok("library") => app.switch_view(View::Library),
             Ok("albums") => app.view = View::Albums,
+            Ok("favorites") => app.switch_view(View::Favorites),
+            Ok("playlists") => app.switch_view(View::Playlists),
             _ => {}
         }
         app
@@ -289,11 +356,65 @@ impl App {
         });
     }
 
+    fn spawn_playlists(&mut self, offset: u32) {
+        self.playlists_loading = true;
+        let tx = self.tx.clone();
+        let cfg = self.cfg.clone();
+        std::thread::spawn(move || {
+            match Api::new(cfg).and_then(|api| api.library_playlists(50, offset)) {
+                Ok((lists, next)) => {
+                    let _ = tx.send(Msg::Playlists(lists, next));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_playlist_tracks(&mut self, id: String, offset: u32) {
+        if let Some(m) = &mut self.playlist_modal {
+            if m.playlist.id == id {
+                m.loading_more = offset > 0;
+            }
+        }
+        let tx = self.tx.clone();
+        let cfg = self.cfg.clone();
+        std::thread::spawn(move || {
+            match Api::new(cfg).and_then(|api| api.playlist_tracks_page(&id, 100, offset)) {
+                Ok((tracks, next)) => {
+                    let _ = tx.send(Msg::PlaylistTracks { id, tracks, next });
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn open_playlist(&mut self, p: LibraryPlaylist) {
+        let id = p.id.clone();
+        self.playlist_modal = Some(PlaylistModal {
+            playlist: p,
+            tracks: None,
+            next: None,
+            loading_more: false,
+        });
+        self.spawn_playlist_tracks(id, 0);
+    }
+
+    fn close_playlist_modal(&mut self) {
+        self.playlist_modal = None;
+    }
+
     fn switch_view(&mut self, v: View) {
         self.view = v;
         self.save_ui_state();
         if v == View::Library && self.library.is_none() && !self.library_loading {
             self.spawn_library(0);
+        }
+        if v == View::Playlists && self.playlists.is_none() && !self.playlists_loading {
+            self.spawn_playlists(0);
         }
     }
 
@@ -359,7 +480,65 @@ impl App {
     }
 
     fn play_now(&mut self, track: Track) {
+        self.remember_tracks(std::slice::from_ref(&track));
         self.play_now_at(track, std::time::Duration::ZERO, true);
+    }
+
+    // ---- favorites ----
+
+    /// Keep the metadata of already-favorited tracks so the favorites view can
+    /// render names (only ids are persisted — see `fav_tracks`).
+    fn remember_tracks(&mut self, tracks: &[Track]) {
+        if self.favorites.is_empty() {
+            return;
+        }
+        for t in tracks {
+            if self.favorites.contains(&t.id) {
+                self.fav_tracks.insert(t.id.clone(), t.clone());
+            }
+        }
+    }
+
+    /// Toggle a favorite instantly (optimistic); the state file is written on
+    /// a ≤1 s debounce by `update`.
+    fn toggle_favorite(&mut self, track: &Track) {
+        if self.favorites.remove(&track.id) {
+            self.fav_tracks.remove(&track.id);
+        } else {
+            self.favorites.insert(track.id.clone());
+            self.fav_tracks.insert(track.id.clone(), track.clone());
+        }
+        self.state_dirty = Some(std::time::Instant::now());
+    }
+
+    /// Drop a favorite known only by id (no metadata to store).
+    fn remove_favorite(&mut self, id: &str) {
+        if self.favorites.remove(id) {
+            self.fav_tracks.remove(id);
+            self.state_dirty = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Favorites view rows: resolvable tracks (name/artist known) sorted by
+    /// name, then the ids we have never seen the metadata for.
+    fn favorites_entries(&self) -> (Vec<Track>, Vec<String>) {
+        let mut ids: Vec<&String> = self.favorites.iter().collect();
+        ids.sort();
+        let mut known = Vec::new();
+        let mut unknown = Vec::new();
+        for id in ids {
+            match self.fav_tracks.get(id) {
+                Some(t) => known.push(t.clone()),
+                None => unknown.push(id.clone()),
+            }
+        }
+        known.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        (known, unknown)
     }
 
     fn push_history(&mut self, t: Track) {
@@ -370,6 +549,7 @@ impl App {
     }
 
     fn enqueue(&mut self, track: Track) {
+        self.remember_tracks(std::slice::from_ref(&track));
         self.queue.push_back(track);
     }
 
@@ -604,7 +784,11 @@ impl App {
         }
     }
 
-    fn save_ui_state(&self) {
+    /// Write the whole UI state (favorites included). Also cancels any pending
+    /// debounced write.
+    fn save_ui_state(&mut self) {
+        let mut favs: Vec<String> = self.favorites.iter().cloned().collect();
+        favs.sort();
         save_state(&UiState {
                 volume: Some(self.volume),
                 last_view: Some(
@@ -612,6 +796,8 @@ impl App {
                         View::Search => "search",
                         View::Albums => "albums",
                         View::Library => "library",
+                        View::Favorites => "favorites",
+                        View::Playlists => "playlists",
                     }
                     .to_string(),
                 ),
@@ -623,8 +809,10 @@ impl App {
                     }
                     .to_string(),
                 ),
+                favorites: Some(favs),
             },
         );
+        self.state_dirty = None;
     }
 
     // ---- keyboard ----
@@ -639,6 +827,8 @@ impl App {
                     self.cheatsheet = false;
                 } else if self.album_modal.is_some() {
                     self.close_album_modal();
+                } else if self.playlist_modal.is_some() {
+                    self.close_playlist_modal();
                 } else if self.show_queue {
                     self.show_queue = false;
                 }
@@ -691,6 +881,12 @@ impl App {
                 if i.key_pressed(egui::Key::Num3) {
                     self.switch_view(View::Library);
                 }
+                if i.key_pressed(egui::Key::Num4) {
+                    self.switch_view(View::Favorites);
+                }
+                if i.key_pressed(egui::Key::Num5) {
+                    self.switch_view(View::Playlists);
+                }
                 if i.key_pressed(egui::Key::Q) {
                     std::process::exit(0);
                 }
@@ -708,13 +904,39 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Results(r) => {
+                    self.remember_tracks(&r.tracks);
                     self.results = Some(*r);
                     self.searching = false;
                 }
                 Msg::Library(songs, next) => {
+                    self.remember_tracks(&songs);
                     self.library.get_or_insert_with(Vec::new).extend(songs);
                     self.library_next = next;
                     self.library_loading = false;
+                }
+                Msg::Playlists(lists, next) => {
+                    self.playlists.get_or_insert_with(Vec::new).extend(lists);
+                    self.playlists_next = next;
+                    self.playlists_loading = false;
+                    if let Some(n) = self.demo_playlist.take() {
+                        if let Some(p) = self.playlists.as_ref().and_then(|v| v.get(n)).cloned() {
+                            self.open_playlist(p);
+                        }
+                    }
+                }
+                Msg::PlaylistTracks { id, tracks, next } => {
+                    self.remember_tracks(&tracks);
+                    if let Some(m) = &mut self.playlist_modal {
+                        if m.playlist.id == id {
+                            if m.loading_more {
+                                m.tracks.get_or_insert_with(Vec::new).extend(tracks);
+                            } else {
+                                m.tracks = Some(tracks);
+                            }
+                            m.next = next;
+                            m.loading_more = false;
+                        }
+                    }
                 }
                 Msg::Source(g, src) => {
                     if g == self.generation {
@@ -745,6 +967,7 @@ impl App {
                         matches!(&self.album_job, Some(AlbumJob::Queue { id: w }) if w.as_str() == id.as_str());
                     if modal_want {
                         self.album_job = None;
+                        self.remember_tracks(&tracks);
                         if let Some(m) = &mut self.album_modal {
                             if m.album.id == id {
                                 m.tracks = Some(tracks);
@@ -753,6 +976,7 @@ impl App {
                     } else if queue_want {
                         self.album_job = None;
                         self.album_busy = None;
+                        self.remember_tracks(&tracks);
                         self.queue.extend(tracks);
                     }
                 }
@@ -763,6 +987,10 @@ impl App {
                     self.album_job = None;
                     self.album_busy = None;
                     self.library_loading = false;
+                    self.playlists_loading = false;
+                    if let Some(m) = &mut self.playlist_modal {
+                        m.loading_more = false;
+                    }
                 }
             }
         }
@@ -877,6 +1105,13 @@ impl eframe::App for App {
         self.poll_messages();
         self.selftest_step();
 
+        // ---- debounced state.toml write (favorite toggles) ----
+        if let Some(t) = self.state_dirty {
+            if t.elapsed() >= std::time::Duration::from_millis(1000) {
+                self.save_ui_state();
+            }
+        }
+
         // ---- sleep timer ----
         if let Some((t0, d)) = self.sleep_at {
             if t0.elapsed() >= d {
@@ -934,6 +1169,18 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.switch_view(View::Library);
+                }
+                if ui
+                    .selectable_label(self.view == View::Favorites, "Favorites")
+                    .clicked()
+                {
+                    self.switch_view(View::Favorites);
+                }
+                if ui
+                    .selectable_label(self.view == View::Playlists, "Playlists")
+                    .clicked()
+                {
+                    self.switch_view(View::Playlists);
                 }
                 ui.separator();
                 let resp = ui.add(
@@ -999,12 +1246,17 @@ impl eframe::App for App {
                 View::Search => self.search_central(ui, &mut act),
                 View::Albums => self.albums_central(ui, &mut act),
                 View::Library => self.library_central(ui, &mut act),
+                View::Favorites => self.favorites_central(ui, &mut act),
+                View::Playlists => self.playlists_central(ui, &mut act),
             }
             match act {
                 Some(CentralAction::Play(t)) => self.play_now(t),
                 Some(CentralAction::Enqueue(t)) => self.enqueue(t),
                 Some(CentralAction::OpenAlbum(a)) => self.open_album(a),
                 Some(CentralAction::QueueAlbum(a)) => self.queue_album(a),
+                Some(CentralAction::OpenPlaylist(p)) => self.open_playlist(p),
+                Some(CentralAction::ToggleFav(t)) => self.toggle_favorite(&t),
+                Some(CentralAction::Unfav(id)) => self.remove_favorite(&id),
                 None => {}
             }
         });
@@ -1012,6 +1264,9 @@ impl eframe::App for App {
         // ---- overlays ----
         if self.album_modal.is_some() {
             self.album_modal_ui(ctx);
+        }
+        if self.playlist_modal.is_some() {
+            self.playlist_modal_ui(ctx);
         }
         if self.cheatsheet {
             self.cheatsheet_ui(ctx);
@@ -1133,62 +1388,187 @@ impl App {
     fn track_grid(&self, ui: &mut egui::Ui, rows: &[Track], act: &mut Option<CentralAction>) {
         ui.add_space(2.0);
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("rows")
-                .num_columns(7)
-                .spacing([10.0, 2.0])
-                .min_col_width(0.0)
-                .show(ui, |ui| {
-                    for (i, t) in rows.iter().enumerate() {
-                        let playing = self.now.as_ref().is_some_and(|n| n.id == t.id);
-                        let mark = if playing {
-                            "▶".to_string()
+            self.track_rows_grid(ui, rows, act);
+        });
+    }
+
+    /// The track rows themselves; callers own the surrounding ScrollArea so
+    /// extra sections can share one scroll region.
+    fn track_rows_grid(&self, ui: &mut egui::Ui, rows: &[Track], act: &mut Option<CentralAction>) {
+        egui::Grid::new("rows")
+            .num_columns(7)
+            .spacing([10.0, 2.0])
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                for (i, t) in rows.iter().enumerate() {
+                    let playing = self.now.as_ref().is_some_and(|n| n.id == t.id);
+                    let mark = if playing {
+                        "▶".to_string()
+                    } else {
+                        format!("{:>2}", i + 1)
+                    };
+                    ui.monospace(mark);
+                    let name = egui::RichText::new(&t.name).size(13.0).strong();
+                    if cell(ui, 280.0, 18.0, name, true).clicked() {
+                        *act = Some(CentralAction::Play(t.clone()));
+                    }
+                    cell(
+                        ui,
+                        250.0,
+                        18.0,
+                        egui::RichText::new(&t.artist).weak().size(12.0),
+                        false,
+                    );
+                    cell(
+                        ui,
+                        230.0,
+                        18.0,
+                        egui::RichText::new(if t.album.is_empty() {
+                            ""
                         } else {
-                            format!("{:>2}", i + 1)
-                        };
-                        ui.monospace(mark);
-                        let name = egui::RichText::new(&t.name).size(13.0).strong();
-                        if cell(ui, 280.0, 18.0, name, true).clicked() {
-                            *act = Some(CentralAction::Play(t.clone()));
+                            &t.album
+                        })
+                        .weak()
+                        .size(11.0),
+                        false,
+                    );
+                    if hand(ui.small_button("+")).clicked() {
+                        *act = Some(CentralAction::Enqueue(t.clone()));
+                    }
+                    if fav_button(ui, self.favorites.contains(&t.id)).clicked() {
+                        *act = Some(CentralAction::ToggleFav(t.clone()));
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.monospace(fmt_ms(t.duration_ms));
+                            if t.lossless {
+                                ui.colored_label(
+                                    LOSSLESS,
+                                    egui::RichText::new("lossless").size(10.0),
+                                );
+                            }
+                        },
+                    );
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Favorited tracks: rows we can name (seen this session) first, then the
+    /// ids we only know from state.toml (no metadata — see `fav_tracks`).
+    fn favorites_central(&self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
+        if self.favorites.is_empty() {
+            self.empty_state(
+                ui,
+                "no favorites yet — click ♡ on any track row".to_string(),
+                false,
+            );
+            return;
+        }
+        let (known, unknown) = self.favorites_entries();
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            if !known.is_empty() {
+                self.track_rows_grid(ui, &known, act);
+            }
+            if !unknown.is_empty() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.weak(format!(
+                    "{} favorite(s) not seen this session — play or search them once to resolve a name",
+                    unknown.len()
+                ));
+                ui.add_space(2.0);
+                egui::Grid::new("fav_unknown")
+                    .num_columns(3)
+                    .spacing([10.0, 2.0])
+                    .min_col_width(0.0)
+                    .show(ui, |ui| {
+                        for id in &unknown {
+                            ui.monospace("?");
+                            ui.weak(egui::RichText::new(id).size(12.0).monospace());
+                            if fav_button(ui, true).clicked() {
+                                *act = Some(CentralAction::Unfav(id.clone()));
+                            }
+                            ui.end_row();
                         }
-                        cell(
-                            ui,
-                            250.0,
-                            18.0,
-                            egui::RichText::new(&t.artist).weak().size(12.0),
-                            false,
-                        );
-                        cell(
-                            ui,
-                            230.0,
-                            18.0,
-                            egui::RichText::new(if t.album.is_empty() {
-                                ""
-                            } else {
-                                &t.album
-                            })
-                            .weak()
-                            .size(11.0),
-                            false,
-                        );
-                        if hand(ui.small_button("+")).clicked() {
-                            *act = Some(CentralAction::Enqueue(t.clone()));
-                        }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.monospace(fmt_ms(t.duration_ms));
-                                if t.lossless {
-                                    ui.colored_label(
-                                        LOSSLESS,
-                                        egui::RichText::new("lossless").size(10.0),
-                                    );
+                    });
+            }
+        });
+    }
+
+    /// User library playlists (text rows; a small swatch from the artwork's
+    /// background colour stands in for the cover — no image loading).
+    fn playlists_central(&mut self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
+        let loading = self.playlists_loading;
+        match self.playlists.as_ref() {
+            None => self.empty_state(ui, "loading playlists…".to_string(), loading),
+            Some(v) if v.is_empty() => {
+                if loading {
+                    self.empty_state(ui, "loading playlists…".to_string(), true);
+                } else {
+                    self.empty_state(
+                        ui,
+                        "no library playlists (or no media-user-token set)".to_string(),
+                        false,
+                    );
+                }
+            }
+            Some(v) => {
+                ui.add_space(2.0);
+                let weak = ui.visuals().weak_text_color();
+                let mut load_more = false;
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    egui::Grid::new("playlists")
+                        .num_columns(5)
+                        .spacing([10.0, 2.0])
+                        .min_col_width(0.0)
+                        .show(ui, |ui| {
+                            for p in v {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(14.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
+                                let col = p
+                                    .artwork
+                                    .as_ref()
+                                    .and_then(|a| a.bg_color.as_deref())
+                                    .and_then(hex_color)
+                                    .unwrap_or(weak);
+                                ui.painter().rect_filled(rect, 2.0, col);
+                                let name = egui::RichText::new(&p.name).size(13.0).strong();
+                                if cell(ui, 300.0, 20.0, name, true).clicked() {
+                                    *act = Some(CentralAction::OpenPlaylist(p.clone()));
                                 }
-                            },
-                        );
-                        ui.end_row();
+                                ui.weak(format!("{} tracks", p.track_count));
+                                cell(
+                                    ui,
+                                    380.0,
+                                    20.0,
+                                    egui::RichText::new(&p.description).weak().size(11.0),
+                                    false,
+                                );
+                                ui.monospace("›");
+                                ui.end_row();
+                            }
+                        });
+                    // keep the pager inside the scroll region so it stays
+                    // reachable when the list fills the panel
+                    if self.playlists_next.is_some() && !loading {
+                        ui.add_space(4.0);
+                        if hand(ui.small_button("load more")).clicked() {
+                            load_more = true;
+                        }
                     }
                 });
-        });
+                if load_more {
+                    if let Some(next) = self.playlists_next {
+                        self.spawn_playlists(next);
+                    }
+                }
+            }
+        }
     }
 
     fn empty_state(&self, ui: &mut egui::Ui, msg: String, busy: bool) {
@@ -1361,10 +1741,14 @@ impl App {
                 }
                 let mut remove: Option<usize> = None;
                 let mut mv: Option<(usize, isize)> = None;
+                let mut fav: Option<Track> = None;
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     for (i, t) in self.queue.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.monospace(format!("{:>2}", i + 1));
+                            if fav_button(ui, self.favorites.contains(&t.id)).clicked() {
+                                fav = Some(t.clone());
+                            }
                             ui.add_sized(
                                 [130.0, 16.0],
                                 egui::Label::new(egui::RichText::new(&t.name).size(12.0))
@@ -1383,6 +1767,9 @@ impl App {
                         });
                     }
                 });
+                if let Some(t) = fav {
+                    self.toggle_favorite(&t);
+                }
                 if let Some((i, d)) = mv {
                     self.queue_move(i, d);
                 }
@@ -1486,6 +1873,9 @@ impl App {
                                         if hand(ui.small_button("+")).clicked() {
                                             act = Some(CentralAction::Enqueue(t.clone()));
                                         }
+                                        if fav_button(ui, self.favorites.contains(&t.id)).clicked() {
+                                            act = Some(CentralAction::ToggleFav(t.clone()));
+                                        }
                                         ui.end_row();
                                     }
                                 });
@@ -1510,6 +1900,146 @@ impl App {
         }
     }
 
+    fn playlist_modal_ui(&mut self, ctx: &egui::Context) {
+        let resp = egui::Modal::new(egui::Id::new("playlist_modal"))
+            .backdrop_color(egui::Color32::from_black_alpha(150))
+            .show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(620.0, 460.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| self.playlist_modal_body(ui),
+                );
+            });
+        if resp.should_close() {
+            self.close_playlist_modal();
+        }
+    }
+
+    fn playlist_modal_body(&mut self, ui: &mut egui::Ui) {
+        let Some(m) = &mut self.playlist_modal else { return };
+        let mut close = false;
+        let mut act: Option<CentralAction> = None;
+        let mut play_all: Option<Vec<Track>> = None;
+        let mut queue_all: Option<Vec<Track>> = None;
+        let mut load_more = false;
+        {
+            let pl = &m.playlist;
+            ui.horizontal(|ui| {
+                ui.strong(egui::RichText::new(&pl.name).size(18.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if hand(ui.small_button("×")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+            let mut sub = format!("{} tracks", pl.track_count);
+            if !pl.description.is_empty() {
+                sub.push_str(" · ");
+                sub.push_str(&pl.description);
+            }
+            ui.add_sized(
+                [600.0, 16.0],
+                egui::Label::new(egui::RichText::new(sub).weak().size(12.0)).truncate(),
+            );
+            match m.tracks.as_deref() {
+                None => {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("loading tracks…");
+                    });
+                }
+                Some(tracks) => {
+                    let total_min = tracks.iter().map(|t| t.duration_ms).sum::<u64>() / 60_000;
+                    ui.weak(format!("{total_min} min"));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if hand(ui.button("Play")).clicked() {
+                            play_all = Some(tracks.to_vec());
+                        }
+                        if hand(ui.button("Queue All")).clicked() {
+                            queue_all = Some(tracks.to_vec());
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("playlist_tracks")
+                                .num_columns(4)
+                                .spacing([10.0, 2.0])
+                                .min_col_width(0.0)
+                                .show(ui, |ui| {
+                                    for t in tracks {
+                                        ui.monospace(format!("{:>2}", t.track_no));
+                                        let name = egui::RichText::new(&t.name).size(13.0);
+                                        if cell(ui, 400.0, 18.0, name, true).clicked() {
+                                            act = Some(CentralAction::Play(t.clone()));
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.monospace(fmt_ms(t.duration_ms));
+                                                if t.lossless {
+                                                    ui.colored_label(
+                                                        LOSSLESS,
+                                                        egui::RichText::new("lossless").size(10.0),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                        if hand(ui.small_button("+")).clicked() {
+                                            act = Some(CentralAction::Enqueue(t.clone()));
+                                        }
+                                        if fav_button(ui, self.favorites.contains(&t.id)).clicked() {
+                                            act = Some(CentralAction::ToggleFav(t.clone()));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    if m.next.is_some() || m.loading_more {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if m.loading_more {
+                                ui.spinner();
+                                ui.weak("loading…");
+                            } else if hand(ui.small_button("load more")).clicked() {
+                                load_more = true;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(tracks) = play_all {
+            self.play_album_tracks(tracks);
+            close = true;
+        }
+        if let Some(tracks) = queue_all {
+            self.queue.extend(tracks);
+        }
+        match act {
+            Some(CentralAction::Play(t)) => self.play_now(t),
+            Some(CentralAction::Enqueue(t)) => self.enqueue(t),
+            Some(CentralAction::ToggleFav(t)) => self.toggle_favorite(&t),
+            _ => {}
+        }
+        if load_more {
+            let (id, next) = match &self.playlist_modal {
+                Some(m) => (m.playlist.id.clone(), m.next),
+                None => (String::new(), None),
+            };
+            if let Some(next) = next {
+                self.spawn_playlist_tracks(id, next);
+            }
+        }
+        if close {
+            self.close_playlist_modal();
+        }
+    }
+
     fn cheatsheet_ui(&mut self, ctx: &egui::Context) {
         let resp = egui::Modal::new(egui::Id::new("cheatsheet"))
             .backdrop_color(egui::Color32::from_black_alpha(120))
@@ -1529,6 +2059,8 @@ impl App {
                             ("Q", "toggle queue panel"),
                             ("/ or ctrl+F", "focus search"),
                             ("ctrl+1 / 2 / 3", "search / albums / library"),
+                            ("ctrl+4 / 5", "favorites / playlists"),
+                            ("♥ / ♡", "toggle favorite on a row"),
                             ("esc", "close modal / panel"),
                             ("?", "this cheatsheet"),
                             ("click progress bar", "seek"),
@@ -1611,6 +2143,29 @@ fn cell(
 
 fn hand(r: egui::Response) -> egui::Response {
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Small ♥/♡ favorite toggle (both glyphs are covered by egui's bundled emoji
+/// fonts and the DejaVu fallback).
+fn fav_button(ui: &mut egui::Ui, fav: bool) -> egui::Response {
+    let (txt, col) = if fav {
+        ("♥", ACCENT)
+    } else {
+        ("♡", ui.visuals().weak_text_color())
+    };
+    hand(ui.small_button(egui::RichText::new(txt).size(13.0).color(col)))
+}
+
+/// `RRGGBB` (optionally `#`-prefixed) → colour, for artwork palette swatches.
+fn hex_color(hex: &str) -> Option<egui::Color32> {
+    let h = hex.trim_start_matches('#');
+    if h.len() < 6 || !h.is_char_boundary(6) {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
 }
 
 /// Click-to-seek progress bar; reports the clicked fraction (0..1) via `act`.

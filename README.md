@@ -71,16 +71,22 @@ amc decode <file>         # verify a decrypted file decodes
 
 ## UI (`amc ui`)
 
-Three tabs — **Search**, **Albums**, **Library**. Clicking a track plays it
-immediately (replacing the current track and cancelling its download); `+`
-appends to the queue. The Albums tab lists the albums of the current/last
-search; clicking one opens an album detail page (per-track play/enqueue,
-**Play** = play from the top and queue the rest, **Queue All**, esc/outside
-click closes).
+Five tabs — **Search**, **Albums**, **Library**, **Favorites**, **Playlists**.
+Clicking a track plays it immediately (replacing the current track and
+cancelling its download); `+` appends to the queue; the `♡`/`♥` button toggles
+a favorite (instant, persisted). The Albums tab lists the albums of the
+current/last search; clicking one opens an album detail page (per-track
+play/enqueue, **Play** = play from the top and queue the rest, **Queue All**,
+esc/outside click closes). The Playlists tab lists your library playlists
+(name, track count, description; click one for its tracks with per-track
+play/enqueue, **Play**/**Queue All** and a **load more** button when the list
+paginates). The Favorites tab lists favorited tracks — click to play, `+` to
+queue; a favorite whose metadata has not been seen in the session (only its id
+is persisted) shows as a bare id until the track is played or searched.
 
-The queue panel (right side) has per-row ▲▼ reordering, ✕ remove, clear, and
-a shuffle toggle that restores the original order when switched off. The
-player bar shows elapsed/remaining time, a click-to-seek progress bar, ⏮
+The queue panel (right side) has per-row favorites, ▲▼ reordering, ✕ remove,
+clear, and a shuffle toggle that restores the original order when switched off.
+The player bar shows elapsed/remaining time, a click-to-seek progress bar, ⏮
 (restarts after 3 s, else previous track), shuffle, repeat off/all/one, and a
 compact volume slider. The window title mirrors the playing track. Errors
 surface as a dismissible toast, empty states are explicit, and the pointer
@@ -97,6 +103,7 @@ turns into a hand over clickable rows.
 | `Q` | toggle queue panel |
 | `/` or `ctrl+F` | focus search |
 | `ctrl+1` / `2` / `3` | switch to Search / Albums / Library |
+| `ctrl+4` / `5` | switch to Favorites / Playlists |
 | `esc` | close modal / panel |
 | `?` | shortcut cheatsheet overlay |
 | click progress bar | seek |
@@ -104,8 +111,9 @@ turns into a hand over clickable rows.
 `AMC_SELFTEST=1 amc ui` runs a deterministic headless state-machine test
 (play-now replaces current, queue ordering, ▲▼ reorder, shuffle
 restore, auto-advance) and prints `RESULT: PASS/FAIL`.
-`AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums` pre-seed the UI for
-headless screenshots.
+`AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums|favorites|playlists`
+pre-seed the UI for headless screenshots; `AMC_DEMO_PLAYLIST=<n>` additionally
+opens the n-th library playlist (0-based) once the list loads.
 
 ## Measured (VPS, download-throttled Apple CDN)
 
@@ -121,7 +129,8 @@ headless screenshots.
 
 Working: search, your library (songs/albums/search), ALAC/lossless streaming playback, previews fallback,
 lyrics endpoint, decrypt-to-file, dense search-first UI with albums tab +
-album detail modal, queue with reorder/shuffle, seekable player bar with
-shuffle/repeat, keyboard shortcuts.
+album detail modal, library playlists tab with playlist detail modal, persisted
+track favorites with a favorites tab, queue with reorder/shuffle, seekable
+player bar with shuffle/repeat, keyboard shortcuts.
 Next: animated word-synced lyrics
 view, media keys, wrapper auto-spawn from the app.
