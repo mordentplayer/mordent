@@ -57,6 +57,7 @@ cargo build --release
    wrapper_url = "http://127.0.0.1:12340"
    media_user_token = ""                  # optional: library features
    report_plays = true                    # report plays to Apple (Recently Played)
+   cache_size_gb = 10                     # audio-cache budget; 0 disables
    ```
 
 ## Usage

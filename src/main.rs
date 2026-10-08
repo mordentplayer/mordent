@@ -263,8 +263,7 @@ fn cmd_play(cfg: &config::Config, term: &str) -> Result<()> {
     println!("▶ {} — {} [{}]", track.name, track.artist, track.id);
 
     let t0 = std::time::Instant::now();
-    let (prog, mode) = stream::open_track(cfg, &track.id)?;
-    println!("  source: {mode} (ready in {:.1?})", t0.elapsed());
+    let (prog, _mode) = stream::open_track(cfg, &track.id)?;
 
     let player = player::Player::new();
     let mut src = player::PacketSource::new(Box::new(prog))?;
