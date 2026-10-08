@@ -107,6 +107,23 @@ restore, auto-advance) and prints `RESULT: PASS/FAIL`.
 `AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums` pre-seed the UI for
 headless screenshots.
 
+## Media keys / MPRIS
+
+`amc ui` registers `org.mpris.MediaPlayer2.amc` on the session bus: it shows
+up in the GNOME/KDE media bar and lock screen with cover, title/artist and
+working controls (play/pause, next/prev, seek, stop, shuffle, repeat,
+volume). No session bus → MPRIS silently stays off; the app is unchanged.
+
+```sh
+playerctl --player=amc status
+playerctl --player=amc metadata
+playerctl --player=amc play-pause        # media keys: playerctl -a play-pause
+playerctl --player=amc next              # also: previous, stop, position 1:23
+playerctl --player=amc volume 0.5
+playerctl --player=amc loop Track        # None / Track / Playlist
+playerctl --player=amc shuffle On
+```
+
 ## Measured (VPS, download-throttled Apple CDN)
 
 | Metric | Value |

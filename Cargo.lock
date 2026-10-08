@@ -173,6 +173,7 @@ dependencies = [
  "temari",
  "toml",
  "ureq",
+ "zbus",
 ]
 
 [[package]]
