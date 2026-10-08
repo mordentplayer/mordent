@@ -21,8 +21,10 @@ use crate::theme::Theme;
 use crate::{stream, wrapper};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
+
+use crate::queuemodel::{Advance, Queue, RemoveEffect, Repeat};
 
 enum Msg {
     Results(Box<SearchResults>),
@@ -55,13 +57,6 @@ enum View {
     Library,
     Favorites,
     Playlists,
-}
-
-#[derive(PartialEq, Clone, Copy, Debug)]
-enum Repeat {
-    Off,
-    All,
-    One,
 }
 
 /// Why an album is being fetched: to open the detail modal or to enqueue.
@@ -100,7 +95,8 @@ enum CentralAction {
 
 struct SelftestState {
     stage: u8,
-    expect: [String; 2],
+    /// stage1 / stage2 / stage4 audible targets (now-playing names).
+    expect: [String; 3],
     started: std::time::Instant,
 }
 
@@ -177,7 +173,8 @@ pub struct App {
     /// AMC_DEMO_PLAYLIST=<n>: open the n-th playlist once the list loads
     /// (headless screenshot hook, alongside AMC_DEMO_VIEW).
     demo_playlist: Option<usize>,
-    queue: VecDeque<Track>,
+    /// Non-consuming queue + pointer to the current entry (see queuemodel).
+    queue: Queue,
     now: Option<Track>,
     /// Bumped on every play request; async sources carry the generation so
     /// stale ones are dropped instead of appended.
@@ -199,12 +196,8 @@ pub struct App {
     play_offset: std::time::Duration,
     /// Re-pause the sink when a seek restart lands.
     resume_paused: bool,
-    /// Tracks finished or replaced (for ⏮), newest last.
-    history: VecDeque<Track>,
     repeat: Repeat,
     shuffle: bool,
-    /// Queue order before shuffle was enabled.
-    shuffle_saved: Option<VecDeque<Track>>,
     /// Album being fetched, and what to do with its tracks.
     album_job: Option<AlbumJob>,
     /// Album id whose `+` is pending (shows "adding…").
@@ -286,7 +279,7 @@ impl App {
             demo_playlist: std::env::var("AMC_DEMO_PLAYLIST")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            queue: VecDeque::new(),
+            queue: Queue::default(),
             now: None,
             generation: 0,
             preparing: false,
@@ -297,14 +290,12 @@ impl App {
             fake_pause_at: None,
             play_offset: std::time::Duration::ZERO,
             resume_paused: false,
-            history: VecDeque::new(),
             repeat: match state.repeat.as_deref() {
                 Some("all") => Repeat::All,
                 Some("one") => Repeat::One,
                 _ => Repeat::Off,
             },
             shuffle: false,
-            shuffle_saved: None,
             album_job: None,
             album_busy: None,
             album_modal: None,
@@ -592,16 +583,10 @@ impl App {
     }
 
     /// Play a track immediately at `offset`: cancels whatever is
-    /// current/preparing by bumping the generation.
-    fn play_now_at(&mut self, track: Track, offset: std::time::Duration, record: bool) {
+    /// current/preparing by bumping the generation. Queue/pointer changes are
+    /// the caller's job; this only owns audio, `now` and the START report.
+    fn play_now_at(&mut self, track: Track, offset: std::time::Duration) {
         eprintln!("[play] {} — {}", track.name, track.artist);
-        if record {
-            if let Some(old) = self.now.take() {
-                self.push_history(old);
-            }
-        } else {
-            self.now = None;
-        }
         self.preparing = true;
         self.now = Some(track.clone());
         self.play_offset = offset;
@@ -656,10 +641,12 @@ impl App {
 
     fn play_now(&mut self, track: Track) {
         self.remember_tracks(std::slice::from_ref(&track));
-        // click-replacing the current track closes its segment (reason 5)
+        // click-replacing the current track closes its segment (reason 5);
+        // the outgoing current stays listed in the queue (pointer moves on)
         let pos = self.report_pos_ms();
         self.report_end(PlayEvent::END_REPLACED, pos);
-        self.play_now_at(track, std::time::Duration::ZERO, true);
+        self.queue.insert_after_current(vec![track.clone()]);
+        self.play_now_at(track, std::time::Duration::ZERO);
     }
 
     // ---- favorites ----
@@ -719,26 +706,35 @@ impl App {
         (known, unknown)
     }
 
-    fn push_history(&mut self, t: Track) {
-        self.history.push_back(t);
-        while self.history.len() > 100 {
-            self.history.pop_front();
+    /// `+` (single row, album `+`, Queue All): always appends at the end, in
+    /// order. Auto-starts the first newly-added track only when the player is
+    /// empty — never started (pointer None) or finished on the last entry —
+    /// otherwise the append leaves playback untouched.
+    fn enqueue_tracks(&mut self, new: Vec<Track>) {
+        if new.is_empty() {
+            return;
+        }
+        self.remember_tracks(&new);
+        let idle_finished = self.now.is_none();
+        if let Some(idx) = self.queue.append(new, idle_finished) {
+            let t = self.queue.tracks[idx].clone();
+            self.play_now_at(t, std::time::Duration::ZERO);
         }
     }
 
-    fn enqueue(&mut self, track: Track) {
-        self.remember_tracks(std::slice::from_ref(&track));
-        self.queue.push_back(track);
-    }
-
-    /// Play album tracks: first plays now, the rest are appended to the
-    /// queue in order.
+    /// Album modal "Play": the whole album is inserted right after the
+    /// current entry and the pointer jumps to its first track; the rest of
+    /// the album is up-next.
     fn play_album_tracks(&mut self, tracks: Vec<Track>) {
-        let mut it = tracks.into_iter();
-        if let Some(first) = it.next() {
-            self.queue.extend(it);
-            self.play_now(first);
+        if tracks.is_empty() {
+            return;
         }
+        self.remember_tracks(&tracks);
+        let pos = self.report_pos_ms();
+        self.report_end(PlayEvent::END_REPLACED, pos);
+        let first = tracks[0].clone();
+        self.queue.insert_after_current(tracks);
+        self.play_now_at(first, std::time::Duration::ZERO);
     }
 
     fn spawn_album_fetch(&mut self, id: String, name: String) {
@@ -783,7 +779,8 @@ impl App {
         self.album_job = None;
     }
 
-    /// Swap queue row `i` with its neighbour (`delta` -1 = up, +1 = down).
+    /// Swap queue row `i` with its neighbour (`delta` -1 = up, +1 = down);
+    /// the pointer follows the row / compensates for crossings (queuemodel).
     fn queue_move(&mut self, i: usize, delta: isize) {
         let Some(j) = (i as isize).checked_add(delta) else {
             return;
@@ -791,43 +788,19 @@ impl App {
         if j < 0 || j as usize >= self.queue.len() {
             return;
         }
-        self.queue.swap(i, j as usize);
+        self.queue.move_row(i, j as usize);
     }
 
     /// Move queue row `from` to final index `to` (drag-and-drop drop handler).
-    /// Reuses the same neighbour-swap primitive as `queue_move`.
     fn queue_move_to(&mut self, from: usize, to: usize) {
-        move_row_to(&mut self.queue, from, to);
+        self.queue.move_row(from, to);
     }
 
+    /// Shuffle keeps the played region + current intact and reorders only the
+    /// up-next region; toggling off restores the saved order (queuemodel).
     fn toggle_shuffle(&mut self) {
         self.shuffle = !self.shuffle;
-        if self.shuffle {
-            self.shuffle_saved = Some(self.queue.drain(..).collect());
-            let mut v: Vec<Track> = self
-                .shuffle_saved
-                .as_ref()
-                .expect("just saved")
-                .iter()
-                .cloned()
-                .collect();
-            let mut seed = std::time::Instant::now().elapsed().as_nanos() as u64 | 1;
-            let mut rnd = move || {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                seed
-            };
-            for i in (1..v.len()).rev() {
-                let j = (rnd() % (i as u64 + 1)) as usize;
-                v.swap(i, j);
-            }
-            self.queue = v.into();
-        } else if let Some(saved) = self.shuffle_saved.take() {
-            // restore the pre-shuffle order minus anything since removed
-            let keep: HashSet<String> = self.queue.iter().map(|t| t.id.clone()).collect();
-            self.queue = saved.into_iter().filter(|t| keep.contains(&t.id)).collect();
-        }
+        self.queue.toggle_shuffle();
     }
 
     /// Elapsed time of the current track (fake clock in decode-only mode).
@@ -883,68 +856,79 @@ impl App {
         }
     }
 
-    /// Skip to the next queued track (manual).
+    /// Skip to the next queue entry (manual ⏭ / N / MPRIS Next): pointer+1
+    /// and play. At the end of the list this is a deliberate no-op — the
+    /// current track keeps playing (manual skips never wrap, whatever the
+    /// repeat mode).
     fn skip_current(&mut self) {
         if self.now.is_none() {
             return;
         }
+        let Some(next) = self.queue.peek_next() else {
+            return;
+        };
         let pos = self.report_pos_ms();
         self.report_end(PlayEvent::END_SKIPPED_FORWARDS, pos);
         self.player.skip();
-        self.advance(true);
+        self.queue.play_at(next);
+        let t = self.queue.tracks[next].clone();
+        self.play_now_at(t, std::time::Duration::ZERO);
     }
 
-    /// Advance to the next track; `manual` = user-initiated (⏭ / N), which
-    /// ignores repeat-one/repeat-all wrapping.
-    fn advance(&mut self, manual: bool) {
-        let Some(finished) = self.now.take() else {
+    /// Natural end of the current track: move the pointer (repeat-one
+    /// replays, repeat-all wraps) and play that entry; with no next entry,
+    /// stop cleanly — the pointer stays on the finished entry so the session
+    /// stays listed, and a later `+` resumes from the new append.
+    fn advance(&mut self) {
+        let Some(finished) = self.now.clone() else {
             return;
         };
-        // natural end (auto-advance / queue exhausted): END 7 at the full
-        // duration. Manual skips already reported END 2 in skip_current.
-        if !manual {
-            self.report_end_for(&finished, PlayEvent::END_NATURAL, finished.duration_ms);
+        // END 7 at the full duration. Manual skips report END 2 in
+        // skip_current instead.
+        self.report_end_for(&finished, PlayEvent::END_NATURAL, finished.duration_ms);
+        let next = match self.queue.advance(self.repeat) {
+            Advance::Replay => self.queue.current_index(),
+            Advance::Next(i) => Some(i),
+            Advance::Stop => None,
+        };
+        if let Some(i) = next {
+            let t = self.queue.tracks[i].clone();
+            self.play_now_at(t, std::time::Duration::ZERO);
+        } else {
+            self.stop_playback();
         }
-        if !manual && self.repeat == Repeat::One {
-            self.push_history(finished.clone());
-            self.play_now_at(finished, std::time::Duration::ZERO, false);
-            return;
-        }
-        if let Some(next) = self.queue.pop_front() {
-            self.push_history(finished);
-            self.play_now_at(next, std::time::Duration::ZERO, true);
-            return;
-        }
-        if !manual && self.repeat == Repeat::All {
-            // replay the session history in order
-            let hist: Vec<Track> = self.history.drain(..).collect();
-            if let Some(first) = hist.first() {
-                let first = first.clone();
-                self.queue.extend(hist.into_iter().skip(1));
-                self.play_now_at(first, std::time::Duration::ZERO, true);
-                return;
-            }
-        }
-        // stop
-        self.push_history(finished);
+    }
+
+    /// Drop the current track and stop audibly without reporting (the caller
+    /// has already closed the segment); queue and pointer are left alone.
+    fn stop_playback(&mut self) {
+        self.now = None;
         self.generation += 1; // invalidate any in-flight source
         self.preparing = false;
         self.fake_play = None;
         self.fake_pause_at = None;
         self.play_offset = std::time::Duration::ZERO;
+        self.player.sink().map(|s| s.clear());
     }
 
-    /// ⏮: restart current if >3s elapsed, else previous track.
+    /// ⏮: restart current if >3s elapsed, else the previous entry (pointer-1);
+    /// on the first entry, restart it.
     fn prev_track(&mut self) {
         if self.now.is_some() && self.playback_position().as_secs_f64() > 3.0 {
             self.seek_to(std::time::Duration::ZERO);
-        } else if let Some(t) = self.history.pop_back() {
-            let pos = self.report_pos_ms();
-            self.report_end(PlayEvent::END_SKIPPED_BACKWARDS, pos);
-            self.play_now_at(t, std::time::Duration::ZERO, false);
-        } else if self.now.is_some() {
-            self.seek_to(std::time::Duration::ZERO);
+            return;
         }
+        let Some(prev) = self.queue.peek_prev() else {
+            if self.now.is_some() {
+                self.seek_to(std::time::Duration::ZERO);
+            }
+            return;
+        };
+        let pos = self.report_pos_ms();
+        self.report_end(PlayEvent::END_SKIPPED_BACKWARDS, pos);
+        self.queue.play_at(prev);
+        let t = self.queue.tracks[prev].clone();
+        self.play_now_at(t, std::time::Duration::ZERO);
     }
 
     /// Click-to-seek / ±5s. Sink mode restarts the stream at the offset;
@@ -972,11 +956,8 @@ impl App {
             }
             self.play_offset = target;
         } else if self.now.is_some() {
-            self.play_now_at(
-                self.now.clone().expect("checked above"),
-                target,
-                false, // don't push the restarted track onto history
-            );
+            let t = self.now.clone().expect("checked above");
+            self.play_now_at(t, target);
         }
     }
 
@@ -1011,14 +992,7 @@ impl App {
         let pos = self.report_pos_ms();
         self.report_end(PlayEvent::END_SUSPENDED, pos);
         self.queue.clear();
-        self.shuffle_saved = None;
-        self.generation += 1;
-        self.preparing = false;
-        self.now = None;
-        self.fake_play = None;
-        self.fake_pause_at = None;
-        self.play_offset = std::time::Duration::ZERO;
-        self.player.sink().map(|s| s.clear());
+        self.stop_playback();
     }
 
     /// Drain remote MPRIS commands and dispatch them onto the same code
@@ -1133,9 +1107,10 @@ impl App {
                 Repeat::All => mpris::LoopStatus::Playlist,
             },
             has_track: self.now.is_some(),
-            can_next: self.now.is_some() && (!self.queue.is_empty() || self.repeat != Repeat::Off),
-            can_prev: self.now.is_some()
-                && (!self.history.is_empty() || position.as_secs_f64() > 3.0),
+            // pure pointer bounds — repeat-all doesn't fake a next entry and
+            // the >3 s restart isn't a "go previous"
+            can_next: self.queue.peek_next().is_some(),
+            can_prev: self.queue.peek_prev().is_some(),
             seek_epoch: self.seek_epoch,
         });
     }
@@ -1343,7 +1318,7 @@ impl App {
                         self.album_job = None;
                         self.album_busy = None;
                         self.remember_tracks(&tracks);
-                        self.queue.extend(tracks);
+                        self.enqueue_tracks(tracks);
                     }
                 }
                 Msg::Error(e) => {
@@ -1365,68 +1340,125 @@ impl App {
     // ---- deterministic selftest (AMC_SELFTEST=1) ----
 
     fn selftest_step(&mut self) {
+        // stage 0 — synchronous queue-model invariants (pointer non-
+        // consumption, +/auto-start rules, reorder/drag/shuffle bookkeeping,
+        // prev/next, ✕ handling). No audio needed; decode-only safe.
         if self
             .selftest
             .as_ref()
-            .is_some_and(|st| st.stage == 0 && self.results.as_ref().is_some_and(|r| r.tracks.len() >= 3))
+            .is_some_and(|st| st.stage == 0 && self.results.as_ref().is_some_and(|r| r.tracks.len() >= 5))
         {
-            let (n0, _n1, n2) = {
-                let tracks = &self.results.as_ref().expect("checked").tracks;
-                (
-                    tracks[0].name.clone(),
-                    tracks[1].name.clone(),
-                    tracks[2].name.clone(),
-                )
-            };
-            let (id0, id1) = {
-                let tracks = &self.results.as_ref().expect("checked").tracks;
-                (tracks[0].id.clone(), tracks[1].id.clone())
-            };
-            self.queue = self
+            let seed: Vec<Track> = self
                 .results
                 .as_ref()
                 .expect("checked")
                 .tracks
                 .iter()
-                .take(2)
+                .take(5)
                 .cloned()
                 .collect();
-            // reorder assertion: same method the ↑↓ buttons call
+            let (n0, n1, n2, n4) = (
+                seed[0].name.clone(),
+                seed[1].name.clone(),
+                seed[2].name.clone(),
+                seed[4].name.clone(),
+            );
+            let (id0, id1) = (seed[0].id.clone(), seed[1].id.clone());
+            let now_is = |app: &Self, want: &str| {
+                app.now.as_ref().map(|t| t.name.as_str()) == Some(want)
+            };
+            let front_is =
+                |q: &Queue, id: &str| q.tracks.first().map(|t| t.id.as_str()) == Some(id);
+            let get_is = |q: &Queue, i: usize, id: &str| {
+                q.tracks.get(i).map(|t| t.id.as_str()) == Some(id)
+            };
+
+            // (1) "play now" from idle: pointer lands on the track
+            self.play_now(seed[0].clone());
+            let ok_start =
+                now_is(self, &n0) && self.queue.len() == 1 && self.queue.pos == Some(0);
+
+            // (2) `+` while playing: append at the end, never jump
+            self.enqueue_tracks(vec![seed[1].clone(), seed[2].clone()]);
+            let ok_plus = self.queue.len() == 3
+                && self.queue.pos == Some(0)
+                && get_is(&self.queue, 1, &id1)
+                && now_is(self, &n0);
+
+            // (3) reorder / drag / shuffle keep the pointer on the current row
             self.queue_move(1, -1);
-            let ok_up = self.queue.front().map(|t| t.id.as_str()) == Some(id1.as_str());
+            let ok_up = front_is(&self.queue, &id1) && self.queue.pos == Some(1);
             self.queue_move(0, 1);
-            let ok_down = self.queue.get(1).map(|t| t.id.as_str()) == Some(id1.as_str());
+            let ok_down = get_is(&self.queue, 1, &id1) && self.queue.pos == Some(0);
             // drag-and-drop path: the exact method the drop handler calls
-            self.queue_move_to(0, 1);
-            let ok_drag_down = self.queue.front().map(|t| t.id.as_str()) == Some(id1.as_str());
-            self.queue_move_to(1, 0);
-            let ok_drag_up = self.queue.front().map(|t| t.id.as_str()) == Some(id0.as_str());
+            self.queue_move_to(0, 2);
+            let ok_drag_down = front_is(&self.queue, &id1) && self.queue.pos == Some(2);
+            self.queue_move_to(2, 0);
+            let ok_drag_up = front_is(&self.queue, &id0) && self.queue.pos == Some(0);
             // shuffle toggle must restore the original order deterministically
-            let before: Vec<String> = self.queue.iter().map(|t| t.id.clone()).collect();
+            let before: Vec<String> = self.queue.tracks.iter().map(|t| t.id.clone()).collect();
             self.toggle_shuffle();
             self.toggle_shuffle();
-            let after: Vec<String> = self.queue.iter().map(|t| t.id.clone()).collect();
-            let ok_shuffle = after == before;
-            if !ok_up || !ok_down || !ok_drag_down || !ok_drag_up || !ok_shuffle {
+            let after: Vec<String> = self.queue.tracks.iter().map(|t| t.id.clone()).collect();
+            let ok_shuffle = after == before && self.queue.pos == Some(0);
+
+            // (4) manual ⏭ / ⏮ move the pointer without consuming
+            self.skip_current();
+            let ok_next = self.queue.pos == Some(1) && self.queue.len() == 3;
+            self.prev_track();
+            let ok_prev = self.queue.pos == Some(0) && self.queue.len() == 3;
+
+            // (5) paused + `+`: append only, no auto-jump
+            self.pause_now();
+            self.enqueue_tracks(vec![seed[3].clone()]);
+            let ok_paused_plus = self.queue.len() == 4
+                && self.queue.pos == Some(0)
+                && now_is(self, &n0);
+            self.toggle_pause_now();
+
+            // (6) ✕ of a later row leaves playback alone
+            self.remove_queue_row(3);
+            let ok_remove_later = self.queue.len() == 3 && self.queue.pos == Some(0);
+
+            // (7) ✕ of the current row hands over to its successor
+            self.remove_queue_row(0);
+            let ok_remove_cur = self.queue.pos == Some(0)
+                && self.queue.len() == 2
+                && now_is(self, &n1);
+
+            // (8) "play now" inserts right after the current entry
+            self.play_now(seed[4].clone());
+            let ok_insert = self.queue.len() == 3
+                && self.queue.pos == Some(1)
+                && get_is(&self.queue, 1, &seed[4].id);
+
+            let ok = ok_start
+                && ok_plus
+                && ok_up
+                && ok_down
+                && ok_drag_down
+                && ok_drag_up
+                && ok_shuffle
+                && ok_next
+                && ok_prev
+                && ok_paused_plus
+                && ok_remove_later
+                && ok_remove_cur
+                && ok_insert;
+            if !ok {
                 eprintln!(
-                    "[selftest] stage0 FAIL (reorder up={ok_up} down={ok_down} \
-                     drag_down={ok_drag_down} drag_up={ok_drag_up} shuffle_restore={ok_shuffle})"
+                    "[selftest] stage0 FAIL (start={ok_start} plus={ok_plus} up={ok_up} \
+                     down={ok_down} drag_down={ok_drag_down} drag_up={ok_drag_up} \
+                     shuffle={ok_shuffle} next={ok_next} prev={ok_prev} \
+                     paused_plus={ok_paused_plus} remove_later={ok_remove_later} \
+                     remove_cur={ok_remove_cur} insert={ok_insert})"
                 );
                 eprintln!("[selftest] RESULT: FAIL");
                 std::process::exit(1);
             }
-            eprintln!("[selftest] stage0 reorder+drag+shuffle PASS");
-            self.play_now(
-                self.results
-                    .as_ref()
-                    .expect("checked")
-                    .tracks
-                    .get(2)
-                    .expect("len>=3")
-                    .clone(),
-            );
+            eprintln!("[selftest] stage0 queue-model PASS");
             if let Some(st) = &mut self.selftest {
-                st.expect = [n2, n0];
+                st.expect = [n4, n2, n0];
                 st.stage = 1;
                 st.started = std::time::Instant::now();
             }
@@ -1435,37 +1467,88 @@ impl App {
             let elapsed = st.started.elapsed();
             let now_name = self.now.as_ref().map(|t| t.name.clone()).unwrap_or_default();
             let matches = |want: &str| now_name == *want;
-            // stage 1: the play_now target must eventually play (any time ≤ 15 s)
-            if st.stage == 1 {
-                if matches(&st.expect[0]) {
-                    eprintln!("[selftest] stage1 PASS (now={now_name:?}, queue={})", self.queue.len());
-                    st.stage = 2;
-                    st.started = std::time::Instant::now();
-                } else if elapsed > std::time::Duration::from_secs(15) {
-                    eprintln!(
-                        "[selftest] stage1 FAIL (now={now_name:?}, want {:?}, queue={})",
-                        st.expect[0],
-                        self.queue.len()
-                    );
-                    eprintln!("[selftest] RESULT: FAIL");
-                    std::process::exit(1);
+            match st.stage {
+                // stage 1: the play_now target must eventually play (≤ 15 s)
+                1 => {
+                    if matches(&st.expect[0]) && !self.preparing {
+                        eprintln!("[selftest] stage1 PASS (now={now_name:?}, queue={})", self.queue.len());
+                        st.stage = 2;
+                        st.started = std::time::Instant::now();
+                    } else if elapsed > std::time::Duration::from_secs(15) {
+                        eprintln!(
+                            "[selftest] stage1 FAIL (now={now_name:?}, want {:?}, queue={})",
+                            st.expect[0],
+                            self.queue.len()
+                        );
+                        eprintln!("[selftest] RESULT: FAIL");
+                        std::process::exit(1);
+                    }
                 }
+                // stage 2: natural end auto-advances to the next entry; the
+                // queue is NOT consumed (still 3 rows, pointer moved on)
+                2 => {
+                    if matches(&st.expect[1]) && self.queue.len() == 3 && self.queue.pos == Some(2) {
+                        eprintln!("[selftest] stage2 PASS (now={now_name:?}, queue={})", self.queue.len());
+                        st.stage = 3;
+                        st.started = std::time::Instant::now();
+                    } else if elapsed > std::time::Duration::from_secs(15) {
+                        eprintln!(
+                            "[selftest] stage2 FAIL (now={now_name:?}, want {:?}, queue={} pos={:?})",
+                            st.expect[1],
+                            self.queue.len(),
+                            self.queue.pos
+                        );
+                        eprintln!("[selftest] RESULT: FAIL");
+                        std::process::exit(1);
+                    }
+                }
+                // stage 3: natural end on the LAST entry stops cleanly — the
+                // pointer stays on the finished entry, history stays listed.
+                // (5 = same check passed; the `+` fires outside this borrow.)
+                3 | 5 => {
+                    let done =
+                        self.now.is_none() && self.queue.pos == Some(2) && self.queue.len() == 3;
+                    if st.stage == 3 && done {
+                        st.stage = 5;
+                        st.started = std::time::Instant::now();
+                    } else if elapsed > std::time::Duration::from_secs(15) {
+                        eprintln!(
+                            "[selftest] stage3 FAIL (now={now_name:?}, queue={} pos={:?})",
+                            self.queue.len(),
+                            self.queue.pos
+                        );
+                        eprintln!("[selftest] RESULT: FAIL");
+                        std::process::exit(1);
+                    }
+                }
+                // stage 4: the post-finish `+` auto-started the appended track
+                4 => {
+                    if matches(&st.expect[2]) && self.queue.len() == 4 && self.queue.pos == Some(3) {
+                        eprintln!("[selftest] stage4 PASS (now={now_name:?}, queue={})", self.queue.len());
+                        eprintln!("[selftest] RESULT: PASS");
+                        std::process::exit(0);
+                    } else if elapsed > std::time::Duration::from_secs(15) {
+                        eprintln!(
+                            "[selftest] stage4 FAIL (now={now_name:?}, want {:?}, queue={} pos={:?})",
+                            st.expect[2],
+                            self.queue.len(),
+                            self.queue.pos
+                        );
+                        eprintln!("[selftest] RESULT: FAIL");
+                        std::process::exit(1);
+                    }
+                }
+                _ => {}
             }
-            // stage 2: auto-advance must move to the first queued track
-            if st.stage == 2 {
-                if matches(&st.expect[1]) && self.queue.len() == 1 {
-                    eprintln!("[selftest] stage2 PASS (now={now_name:?}, queue={})", self.queue.len());
-                    eprintln!("[selftest] RESULT: PASS");
-                    std::process::exit(0);
-                } else if elapsed > std::time::Duration::from_secs(15) {
-                    eprintln!(
-                        "[selftest] stage2 FAIL (now={now_name:?}, want {:?}, queue={})",
-                        st.expect[1],
-                        self.queue.len()
-                    );
-                    eprintln!("[selftest] RESULT: FAIL");
-                    std::process::exit(1);
-                }
+        }
+        // trigger (b), outside the selftest borrow: a `+` after the queue ran
+        // out must resume playback from the appended track
+        if self.selftest.as_ref().is_some_and(|st| st.stage == 5) {
+            let again = self.results.as_ref().expect("checked").tracks[0].clone();
+            self.enqueue_tracks(vec![again]);
+            if let Some(st) = &mut self.selftest {
+                st.stage = 4;
+                st.started = std::time::Instant::now();
             }
         }
     }
@@ -1544,7 +1627,7 @@ impl eframe::App for App {
             self.player.is_idle()
         };
         if self.now.is_some() && !self.preparing && idle {
-            self.advance(false);
+            self.advance();
         }
 
         // ---- window title ----
@@ -1663,7 +1746,7 @@ impl eframe::App for App {
             }
             match act {
                 Some(CentralAction::Play(t)) => self.play_now(t),
-                Some(CentralAction::Enqueue(t)) => self.enqueue(t),
+                Some(CentralAction::Enqueue(t)) => self.enqueue_tracks(vec![t]),
                 Some(CentralAction::OpenAlbum(a)) => self.open_album(a),
                 Some(CentralAction::QueueAlbum(a)) => self.queue_album(a),
                 Some(CentralAction::OpenPlaylist(p)) => self.open_playlist(p),
@@ -2169,13 +2252,17 @@ impl App {
                 let mut remove: Option<usize> = None;
                 let mut mv: Option<(usize, isize)> = None;
                 let mut fav: Option<Track> = None;
+                let mut jump: Option<usize> = None;
                 // drag-and-drop state collected this frame (applied after the loop)
                 let mut rows: Vec<(f32, f32)> = Vec::new();
                 let mut drag_from: Option<usize> = None;
                 let mut drag_y: Option<f32> = None;
                 let mut drag_end = false;
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    for (i, t) in self.queue.iter().enumerate() {
+                    for (i, t) in self.queue.tracks.iter().enumerate() {
+                        // current entry: ▶ marker + accent; played entries dim
+                        let is_cur = self.queue.pos == Some(i);
+                        let played = self.queue.pos.is_some_and(|p| i < p);
                         let row = ui.horizontal(|ui| {
                             if self.queue_drag == Some(i) {
                                 ui.visuals_mut().override_text_color =
@@ -2210,16 +2297,31 @@ impl App {
                                 drag_y = hresp.interact_pointer_pos().map(|p| p.y);
                                 drag_end |= hresp.drag_stopped();
                             }
-                            ui.monospace(format!("{:>2}", i + 1));
+                            if is_cur {
+                                ui.monospace(
+                                    egui::RichText::new("▶")
+                                        .size(11.0)
+                                        .color(self.theme.accent),
+                                );
+                            } else {
+                                ui.monospace(
+                                    egui::RichText::new(format!("{:>2}", i + 1))
+                                        .size(11.0)
+                                        .weak(),
+                                );
+                            }
                             if fav_button(ui, self.favorites.contains(&t.id), self.theme.accent).clicked() {
                                 fav = Some(t.clone());
                             }
-                            ui.add_sized(
-                                [130.0, 16.0],
-                                egui::Label::new(egui::RichText::new(&t.name).size(12.0))
-                                    .halign(egui::Align::LEFT)
-                                    .truncate(),
-                            );
+                            let mut name = egui::RichText::new(&t.name).size(12.0);
+                            if is_cur {
+                                name = name.strong().color(self.theme.accent);
+                            } else if played {
+                                name = name.weak();
+                            }
+                            if cell(ui, 130.0, 16.0, name, true).clicked() {
+                                jump = Some(i);
+                            }
                             if hand(ui.small_button("↑")).clicked() {
                                 mv = Some((i, -1));
                             }
@@ -2270,16 +2372,55 @@ impl App {
                 if let Some((i, d)) = mv {
                     self.queue_move(i, d);
                 }
+                if let Some(i) = jump {
+                    self.play_queue_row(i);
+                }
                 if let Some(i) = remove {
-                    self.queue.remove(i);
+                    self.remove_queue_row(i);
                 }
                 if clear {
+                    let pos = self.report_pos_ms();
+                    self.report_end(PlayEvent::END_SUSPENDED, pos);
                     self.queue.clear();
+                    self.stop_playback();
                 }
                 if shuf {
                     self.toggle_shuffle();
                 }
             });
+    }
+
+    /// Click a queue row: move the pointer there and play it (the outgoing
+    /// current stays listed, its segment closes with END_REPLACED).
+    fn play_queue_row(&mut self, i: usize) {
+        if self.queue.play_at(i).is_none() {
+            return;
+        }
+        let pos = self.report_pos_ms();
+        self.report_end(PlayEvent::END_REPLACED, pos);
+        let t = self.queue.tracks[i].clone();
+        self.play_now_at(t, std::time::Duration::ZERO);
+    }
+
+    /// Queue-row ✕: the pointer-aware removal decides what happens to
+    /// playback — a removed current track hands over to its successor (kept
+    /// playing) or, with no successor, stops cleanly.
+    fn remove_queue_row(&mut self, i: usize) {
+        match self.queue.remove(i) {
+            RemoveEffect::PlayNext(j) => {
+                let pos = self.report_pos_ms();
+                self.report_end(PlayEvent::END_SKIPPED_FORWARDS, pos);
+                self.player.skip();
+                let t = self.queue.tracks[j].clone();
+                self.play_now_at(t, std::time::Duration::ZERO);
+            }
+            RemoveEffect::Stopped => {
+                let pos = self.report_pos_ms();
+                self.report_end(PlayEvent::END_SUSPENDED, pos);
+                self.stop_playback();
+            }
+            RemoveEffect::Nothing => {}
+        }
     }
 
     fn album_modal_ui(&mut self, ctx: &egui::Context) {
@@ -2385,11 +2526,11 @@ impl App {
             close = true;
         }
         if let Some(tracks) = queue_all {
-            self.queue.extend(tracks);
+            self.enqueue_tracks(tracks);
         }
         match act {
             Some(CentralAction::Play(t)) => self.play_now(t),
-            Some(CentralAction::Enqueue(t)) => self.enqueue(t),
+            Some(CentralAction::Enqueue(t)) => self.enqueue_tracks(vec![t]),
             _ => {}
         }
         if close {
@@ -2515,11 +2656,11 @@ impl App {
             close = true;
         }
         if let Some(tracks) = queue_all {
-            self.queue.extend(tracks);
+            self.enqueue_tracks(tracks);
         }
         match act {
             Some(CentralAction::Play(t)) => self.play_now(t),
-            Some(CentralAction::Enqueue(t)) => self.enqueue(t),
+            Some(CentralAction::Enqueue(t)) => self.enqueue_tracks(vec![t]),
             Some(CentralAction::ToggleFav(t)) => self.toggle_favorite(&t),
             _ => {}
         }
@@ -2663,40 +2804,6 @@ fn drop_slot(rows: &[(f32, f32)], dragged: Option<usize>, pointer_y: f32) -> usi
     slot
 }
 
-/// Direction and number of neighbour swaps that move row `from` to final
-/// index `to` via the ▲▼ `queue_move` primitive.
-fn move_steps(from: usize, to: usize) -> (isize, usize) {
-    if to > from {
-        (1, to - from)
-    } else {
-        (-1, from - to)
-    }
-}
-
-/// Move `from` to final index `to` with successive neighbour swaps (no-op when
-/// the row would stay put; out-of-range indices are ignored).
-fn move_row_to<T>(q: &mut VecDeque<T>, from: usize, to: usize) {
-    if from >= q.len() || q.is_empty() {
-        return;
-    }
-    let to = to.min(q.len() - 1);
-    if from == to {
-        return;
-    }
-    let (dir, steps) = move_steps(from, to);
-    let mut i = from;
-    for _ in 0..steps {
-        let Some(j) = i.checked_add_signed(dir) else {
-            return;
-        };
-        if j >= q.len() {
-            return;
-        }
-        q.swap(i, j);
-        i = j;
-    }
-}
-
 /// Small ♥/♡ favorite toggle (both glyphs are covered by egui's bundled emoji
 /// fonts and the DejaVu fallback).
 fn fav_button(ui: &mut egui::Ui, fav: bool, accent: egui::Color32) -> egui::Response {
@@ -2819,12 +2926,28 @@ mod dnd_tests {
     /// Three stacked rows: y 0-10, 10-20, 20-30 (midpoints 5, 15, 25).
     const ROWS: [(f32, f32); 3] = [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)];
 
-    fn q(s: &str) -> VecDeque<char> {
+    fn q(s: &str) -> Vec<char> {
         s.chars().collect()
     }
 
-    fn s(v: &VecDeque<char>) -> String {
+    fn s(v: &[char]) -> String {
         v.iter().collect()
+    }
+
+    /// Mirrors `queuemodel::Queue::move_row`'s order effect (remove+insert,
+    /// destination clamped) so these tests verify the drop_slot → move
+    /// composition; the pointer bookkeeping itself is unit-tested in
+    /// queuemodel.
+    fn move_to(v: &mut Vec<char>, from: usize, to: usize) {
+        if from >= v.len() {
+            return;
+        }
+        let to = to.min(v.len() - 1);
+        if from == to {
+            return;
+        }
+        let c = v.remove(from);
+        v.insert(to, c);
     }
 
     #[test]
@@ -2853,44 +2976,33 @@ mod dnd_tests {
     }
 
     #[test]
-    fn move_steps_direction_and_length() {
-        assert_eq!(move_steps(0, 2), (1, 2)); // down
-        assert_eq!(move_steps(3, 1), (-1, 2)); // up
-        assert_eq!(move_steps(1, 1), (-1, 0)); // no-op
-        assert_eq!(move_steps(0, 0), (-1, 0));
-    }
-
-    #[test]
-    fn move_row_to_both_directions() {
+    fn move_to_matches_queue_move_row_order_effect() {
         let mut v = q("abcde");
-        move_row_to(&mut v, 0, 2); // a down by two
+        move_to(&mut v, 0, 2); // a down by two
         assert_eq!(s(&v), "bcade");
-        move_row_to(&mut v, 2, 0); // a (now index 2) back to the top
+        move_to(&mut v, 2, 0); // a (now index 2) back to the top
         assert_eq!(s(&v), "abcde");
-        move_row_to(&mut v, 4, 1); // multi-step upward move == remove+insert
+        move_to(&mut v, 4, 1); // multi-step upward move == remove+insert
         assert_eq!(s(&v), "aebcd");
         // unchanged idempotent cases
         let mut w = q("abcde");
-        move_row_to(&mut w, 2, 2); // identity
+        move_to(&mut w, 2, 2); // identity
         assert_eq!(s(&w), "abcde");
-        move_row_to(&mut w, 1, 9); // clamped to the last index
+        move_to(&mut w, 1, 9); // clamped to the last index
         assert_eq!(s(&w), "acdeb");
-        move_row_to(&mut w, 9, 0); // out of range: ignored
+        move_to(&mut w, 9, 0); // out of range: ignored
         assert_eq!(s(&w), "acdeb");
-        let mut empty: VecDeque<char> = VecDeque::new();
-        move_row_to(&mut empty, 0, 0); // empty queue is a no-op
-        assert!(empty.is_empty());
     }
 
     #[test]
     fn drag_down_reindexes_after_removal() {
         // queue a,b,c; the user drags row 0 (a) below row 1's midpoint:
         // drop_slot already reports the index among the *remaining* rows, so
-        // the drop handler can feed it straight to move_row_to.
+        // the drop handler can feed it straight to the row move.
         let mut v = q("abc");
         let slot = drop_slot(&ROWS, Some(0), 22.0);
         assert_eq!(slot, 1);
-        move_row_to(&mut v, 0, slot);
+        move_to(&mut v, 0, slot);
         assert_eq!(s(&v), "bac");
     }
 
@@ -2900,13 +3012,13 @@ mod dnd_tests {
         let mut v = q("abc");
         let slot = drop_slot(&ROWS, Some(2), 3.0);
         assert_eq!(slot, 0);
-        move_row_to(&mut v, 2, slot);
+        move_to(&mut v, 2, slot);
         assert_eq!(s(&v), "cab");
         // and a downward drag of a middle row: b lands below c (and d)
         let mut v = q("abcd");
         let slot = drop_slot(&ROWS, Some(1), 99.0);
         assert_eq!(slot, 2); // among a, c → after them
-        move_row_to(&mut v, 1, slot);
+        move_to(&mut v, 1, slot);
         assert_eq!(s(&v), "acbd");
     }
 }

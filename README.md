@@ -85,15 +85,25 @@ paginates). The Favorites tab lists favorited tracks — click to play, `+` to
 queue; a favorite whose metadata has not been seen in the session (only its id
 is persisted) shows as a bare id until the track is played or searched.
 
-The queue panel (right side) has per-row favorites, ▲▼ reordering, ✕ remove,
-drag-and-drop reordering by the ⠿ handle (the ↑↓ buttons stay as the keyboard
-path), clear, and a shuffle toggle that restores the original order when
-switched off.
-The player bar shows elapsed/remaining time, a click-to-seek progress bar, ⏮
-(restarts after 3 s, else previous track), shuffle, repeat off/all/one, and a
-compact volume slider. The window title mirrors the playing track. Errors
-surface as a dismissible toast, empty states are explicit, and the pointer
-turns into a hand over clickable rows.
+The queue is a single non-consuming list with a pointer to the current entry:
+played tracks stay in place (dimmed) as history, the current row is
+highlighted with a ▶ marker, and advancing only moves the pointer. "Play now"
+(search/album rows, album **Play**) inserts right after the current entry and
+jumps to it; `+`, album `+` and **Queue All** always append at the end — and
+start playing immediately when nothing has been started or the queue has run
+out (otherwise playback is untouched). The queue panel has per-row favorites,
+▲▼ reordering, ✕ remove (removing the current track keeps playing its
+successor), click-a-row to jump there, drag-and-drop reordering by the ⠿
+handle (the ↑↓ buttons stay as the keyboard path), clear, and a shuffle toggle
+that keeps the played region + current intact, shuffles only the up-next
+tracks, and restores the original order when switched off. ⏭/⏮ move the
+pointer (⏮ restarts after 3 s, else steps back); at the end of the list ⏭
+does nothing and a finished queue simply stops, with the session still listed.
+The player bar shows elapsed/remaining time, a click-to-seek progress bar,
+shuffle, repeat off/all/one (repeat-one replays the current entry, repeat-all
+wraps the pointer to the top), and a compact volume slider. The window title
+mirrors the playing track. Errors surface as a dismissible toast, empty states
+are explicit, and the pointer turns into a hand over clickable rows.
 
 ### Keyboard shortcuts
 
@@ -112,8 +122,10 @@ turns into a hand over clickable rows.
 | click progress bar | seek |
 
 `AMC_SELFTEST=1 amc ui` runs a deterministic headless state-machine test
-(play-now replaces current, queue ordering, ▲▼ + drag reorder, shuffle
-restore, auto-advance) and prints `RESULT: PASS/FAIL`.
+(queue pointer model: non-consumption, `+` auto-start rules, ▲▼ + drag
+reorder and shuffle bookkeeping, prev/next, ✕ of the current row,
+auto-advance, stop-at-end and resume-on-append) and prints
+`RESULT: PASS/FAIL`.
 `AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums|favorites|playlists`
 pre-seed the UI for headless screenshots; `AMC_DEMO_PLAYLIST=<n>` additionally
 opens the n-th library playlist (0-based) once the list loads.
