@@ -1,5 +1,6 @@
-//! Dense egui UI: search / albums / library / favorites / playlists tabs,
-//! album & playlist detail modals, explicit queue, upgraded player bar.
+//! Dense egui UI: search (Songs/Albums sub-views) / library (albums) /
+//! favorites / playlists tabs, album & playlist detail modals, explicit
+//! queue, upgraded player bar.
 //!
 //! Favorites are a set of track ids persisted in state.toml; the favorites
 //! view names them from an in-memory id→Track map filled as tracks are seen.
@@ -26,7 +27,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 enum Msg {
     Results(Box<SearchResults>),
-    Library(Vec<Track>, Option<u32>),
+    /// One page of the user's library albums (appended), next offset.
+    Library(Vec<AlbumHit>, Option<u32>),
     /// Fully prepared decoder for the given playback generation.
     Source(u64, Box<PacketSource>),
     /// Tracks of an album, in order, tagged with the album they belong to.
@@ -51,10 +53,28 @@ enum Msg {
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     Search,
-    Albums,
     Library,
     Favorites,
     Playlists,
+}
+
+/// Sub-view of the Search tab (segmented toggle; switching does not
+/// re-query).
+#[derive(PartialEq, Clone, Copy)]
+enum SearchSub {
+    /// The track results grid.
+    Songs,
+    /// The album results for the current/last search.
+    Albums,
+}
+
+/// Library view sort order.
+#[derive(PartialEq, Clone, Copy)]
+enum LibrarySort {
+    /// Newest first by the API's dateAdded.
+    Added,
+    /// Case-insensitive by album name.
+    Name,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -109,6 +129,8 @@ struct SelftestState {
 struct UiState {
     volume: Option<f32>,
     last_view: Option<String>,
+    /// Search sub-view: "songs" | "albums" (optional; older builds lack it).
+    search_sub: Option<String>,
     repeat: Option<String>,
     /// Favorited track ids, sorted for a stable file (in memory it is a set).
     favorites: Option<Vec<String>>,
@@ -155,9 +177,14 @@ pub struct App {
     results: Option<SearchResults>,
     searching: bool,
     view: View,
-    library: Option<Vec<Track>>,
+    /// Active Search sub-view (Songs | Albums).
+    search_sub: SearchSub,
+    /// User library albums (paginated).
+    library: Option<Vec<AlbumHit>>,
     library_loading: bool,
     library_next: Option<u32>,
+    /// Library sort order (not persisted).
+    library_sort: LibrarySort,
     /// Favorited track ids (persisted; sorted on save).
     favorites: HashSet<String>,
     /// id → Track seen so far, for the favorites view.
@@ -273,9 +300,11 @@ impl App {
             results: None,
             searching: false,
             view: View::Search,
+            search_sub: SearchSub::Songs,
             library: None,
             library_loading: false,
             library_next: None,
+            library_sort: LibrarySort::Added,
             favorites: state.favorites.clone().unwrap_or_default().into_iter().collect(),
             fav_tracks: HashMap::new(),
             state_dirty: None,
@@ -335,10 +364,18 @@ impl App {
             tx,
         };
         match state.last_view.as_deref() {
-            Some("albums") => app.view = View::Albums,
+            // older builds had Albums as a main tab; map it to the Search
+            // sub-view. Unknown values fall back to Search (the default).
+            Some("albums") => app.search_sub = SearchSub::Albums,
             Some("library") => app.switch_view(View::Library),
             Some("favorites") => app.switch_view(View::Favorites),
             Some("playlists") => app.switch_view(View::Playlists),
+            _ => {}
+        }
+        // persisted Search sub-view; unknown values → Songs (the default)
+        match state.search_sub.as_deref() {
+            Some("albums") => app.search_sub = SearchSub::Albums,
+            Some("songs") => app.search_sub = SearchSub::Songs,
             _ => {}
         }
         if app.selftest.is_some() {
@@ -350,13 +387,14 @@ impl App {
         }
         // headless verification hooks: AMC_DEMO_TERM=<query> auto-searches,
         // AMC_DEMO_VIEW=library|albums|favorites|playlists opens that view
+        // ("albums" = the Search view's Albums sub-view)
         if let Ok(term) = std::env::var("AMC_DEMO_TERM") {
             app.search = term;
             app.spawn_search();
         }
         match std::env::var("AMC_DEMO_VIEW").as_deref() {
             Ok("library") => app.switch_view(View::Library),
-            Ok("albums") => app.view = View::Albums,
+            Ok("albums") => app.search_sub = SearchSub::Albums,
             Ok("favorites") => app.switch_view(View::Favorites),
             Ok("playlists") => app.switch_view(View::Playlists),
             _ => {}
@@ -399,9 +437,9 @@ impl App {
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            match Api::new(cfg).and_then(|api| api.library_songs(100, offset)) {
-                Ok((songs, next)) => {
-                    let _ = tx.send(Msg::Library(songs, next));
+            match Api::new(cfg).and_then(|api| api.library_albums_page(100, offset)) {
+                Ok((albums, next)) => {
+                    let _ = tx.send(Msg::Library(albums, next));
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Error(format!("{e:#}")));
@@ -469,6 +507,14 @@ impl App {
         }
         if v == View::Playlists && self.playlists.is_none() && !self.playlists_loading {
             self.spawn_playlists(0);
+        }
+    }
+
+    /// Toggle the Search sub-view (no re-query); persisted like last_view.
+    fn set_search_sub(&mut self, s: SearchSub) {
+        if self.search_sub != s {
+            self.search_sub = s;
+            self.save_ui_state();
         }
     }
 
@@ -1150,10 +1196,16 @@ impl App {
                 last_view: Some(
                     match self.view {
                         View::Search => "search",
-                        View::Albums => "albums",
                         View::Library => "library",
                         View::Favorites => "favorites",
                         View::Playlists => "playlists",
+                    }
+                    .to_string(),
+                ),
+                search_sub: Some(
+                    match self.search_sub {
+                        SearchSub::Songs => "songs",
+                        SearchSub::Albums => "albums",
                     }
                     .to_string(),
                 ),
@@ -1232,15 +1284,12 @@ impl App {
                     self.switch_view(View::Search);
                 }
                 if i.key_pressed(egui::Key::Num2) {
-                    self.switch_view(View::Albums);
-                }
-                if i.key_pressed(egui::Key::Num3) {
                     self.switch_view(View::Library);
                 }
-                if i.key_pressed(egui::Key::Num4) {
+                if i.key_pressed(egui::Key::Num3) {
                     self.switch_view(View::Favorites);
                 }
-                if i.key_pressed(egui::Key::Num5) {
+                if i.key_pressed(egui::Key::Num4) {
                     self.switch_view(View::Playlists);
                 }
                 if i.key_pressed(egui::Key::Q) {
@@ -1265,9 +1314,8 @@ impl App {
                     self.results = Some(*r);
                     self.searching = false;
                 }
-                Msg::Library(songs, next) => {
-                    self.remember_tracks(&songs);
-                    self.library.get_or_insert_with(Vec::new).extend(songs);
+                Msg::Library(albums, next) => {
+                    self.library.get_or_insert_with(Vec::new).extend(albums);
                     self.library_next = next;
                     self.library_loading = false;
                 }
@@ -1571,12 +1619,6 @@ impl eframe::App for App {
                     self.switch_view(View::Search);
                 }
                 if ui
-                    .selectable_label(self.view == View::Albums, "Albums")
-                    .clicked()
-                {
-                    self.switch_view(View::Albums);
-                }
-                if ui
                     .selectable_label(self.view == View::Library, "Library")
                     .clicked()
                 {
@@ -1656,7 +1698,6 @@ impl eframe::App for App {
             let mut act: Option<CentralAction> = None;
             match self.view {
                 View::Search => self.search_central(ui, &mut act),
-                View::Albums => self.albums_central(ui, &mut act),
                 View::Library => self.library_central(ui, &mut act),
                 View::Favorites => self.favorites_central(ui, &mut act),
                 View::Playlists => self.playlists_central(ui, &mut act),
@@ -1708,34 +1749,111 @@ impl eframe::App for App {
 // ---- central views (all gather clicks into `act`; applied by caller) ----
 
 impl App {
-    fn search_central(&self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
-        match self.results.as_ref() {
-            None => self.empty_state(
-                ui,
-                if self.searching {
-                    "searching…".to_string()
-                } else {
-                    "type to search · enter plays · + queues · Q queue · ? shortcuts".to_string()
-                },
-                self.searching,
-            ),
-            Some(r) if r.tracks.is_empty() => {
-                if self.searching {
-                    self.empty_state(ui, "searching…".to_string(), true);
-                } else {
-                    self.empty_state(
-                        ui,
-                        format!("no results for \u{201c}{}\u{201d}", self.last_term),
-                        false,
-                    );
-                }
+    fn search_central(&mut self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
+        // segmented sub-bar: Songs = the track results grid, Albums = the
+        // album results for the current/last search (no re-query on switch).
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui
+                .selectable_label(self.search_sub == SearchSub::Songs, "Songs")
+                .clicked()
+            {
+                self.set_search_sub(SearchSub::Songs);
             }
-            Some(r) => self.track_grid(ui, &r.tracks, act),
+            if ui
+                .selectable_label(self.search_sub == SearchSub::Albums, "Albums")
+                .clicked()
+            {
+                self.set_search_sub(SearchSub::Albums);
+            }
+        });
+        ui.add_space(2.0);
+        match self.search_sub {
+            SearchSub::Songs => match self.results.as_ref() {
+                None => self.empty_state(
+                    ui,
+                    if self.searching {
+                        "searching…".to_string()
+                    } else {
+                        "type to search · enter plays · + queues · Q queue · ? shortcuts"
+                            .to_string()
+                    },
+                    self.searching,
+                ),
+                Some(r) if r.tracks.is_empty() => {
+                    if self.searching {
+                        self.empty_state(ui, "searching…".to_string(), true);
+                    } else {
+                        self.empty_state(
+                            ui,
+                            format!("no results for \u{201c}{}\u{201d}", self.last_term),
+                            false,
+                        );
+                    }
+                }
+                Some(r) => self.track_grid(ui, &r.tracks, act),
+            },
+            SearchSub::Albums => {
+                let albums: &[AlbumHit] = match self.results.as_ref() {
+                    Some(r) => &r.albums,
+                    None => &[],
+                };
+                if albums.is_empty() {
+                    let msg = if self.searching {
+                        "searching…".to_string()
+                    } else if self.results.is_some() {
+                        "no albums in the last search — try another term".to_string()
+                    } else {
+                        "albums from your last search appear here — run a search first"
+                            .to_string()
+                    };
+                    self.empty_state(ui, msg, self.searching);
+                    return;
+                }
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    self.album_rows_grid(ui, "search_albums", albums, act);
+                });
+            }
         }
     }
 
+    /// Library albums with a sort toggle (add date newest first, or name).
     fn library_central(&mut self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
         let loading = self.library_loading;
+        // sort control (client-side; switching does not re-query)
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.weak("sort");
+            if ui
+                .selectable_label(self.library_sort == LibrarySort::Added, "add date")
+                .clicked()
+            {
+                self.library_sort = LibrarySort::Added;
+            }
+            if ui
+                .selectable_label(self.library_sort == LibrarySort::Name, "name")
+                .clicked()
+            {
+                self.library_sort = LibrarySort::Name;
+            }
+        });
+        ui.add_space(2.0);
+        // sort in place; idempotent across frames
+        if let Some(v) = self.library.as_mut() {
+            match self.library_sort {
+                LibrarySort::Name => v.sort_by(|a, b| cmp_ignore_case(&a.name, &b.name)),
+                LibrarySort::Added => v.sort_by(|a, b| match (&a.date_added, &b.date_added) {
+                    // ISO-8601 strings compare chronologically; newest first,
+                    // undated rows last (stable sort keeps ties in API order)
+                    (Some(x), Some(y)) => y.cmp(x),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }),
+            }
+        }
         match self.library.as_ref() {
             None => self.empty_state(ui, "loading library…".to_string(), loading),
             Some(v) if v.is_empty() => {
@@ -1750,7 +1868,9 @@ impl App {
                 }
             }
             Some(v) => {
-                self.track_grid(ui, v, act);
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    self.album_rows_grid(ui, "library_albums", v, act);
+                });
                 if self.library_next.is_some() && !loading {
                     ui.add_space(4.0);
                     if ui.small_button("load more").clicked() {
@@ -1763,53 +1883,48 @@ impl App {
         }
     }
 
-    fn albums_central(&self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
-        let albums: &[AlbumHit] = match self.results.as_ref() {
-            Some(r) => &r.albums,
-            None => &[],
-        };
-        if albums.is_empty() {
-            let msg = if self.searching {
-                "searching…".to_string()
-            } else if self.results.is_some() {
-                "no albums in the last search — try another term".to_string()
-            } else {
-                "albums from your last search appear here — run a search first".to_string()
-            };
-            self.empty_state(ui, msg, self.searching);
-            return;
-        }
-        ui.add_space(2.0);
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            egui::Grid::new("albums")
-                .num_columns(6)
-                .spacing([10.0, 2.0])
-                .min_col_width(0.0)
-                .show(ui, |ui| {
-                    for a in albums {
-                        ui.monospace(" ♫ ");
-                        let name = egui::RichText::new(&a.name).size(13.0).strong();
-                        if cell(ui, 340.0, 20.0, name, true).clicked() {
-                            *act = Some(CentralAction::OpenAlbum(a.clone()));
-                        }
-                        cell(
-                            ui,
-                            220.0,
-                            20.0,
-                            egui::RichText::new(&a.artist).weak().size(12.0),
-                            false,
-                        );
-                        ui.weak(format!("{} tracks", a.track_count));
-                        ui.weak(&a.release_date);
-                        if self.album_busy.as_deref() == Some(a.id.as_str()) {
-                            ui.weak("adding…");
-                        } else if hand(ui.small_button("+")).clicked() {
-                            *act = Some(CentralAction::QueueAlbum(a.clone()));
-                        }
-                        ui.end_row();
+    /// Album rows shared by the Search/Albums sub-view and the Library view;
+    /// callers own the surrounding ScrollArea and any header controls. Click
+    /// opens the album detail modal, `+` queues the whole album.
+    fn album_rows_grid(
+        &self,
+        ui: &mut egui::Ui,
+        id: &str,
+        albums: &[AlbumHit],
+        act: &mut Option<CentralAction>,
+    ) {
+        egui::Grid::new(id)
+            .num_columns(6)
+            .spacing([10.0, 2.0])
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                for a in albums {
+                    ui.monospace(" ♫ ");
+                    let name = egui::RichText::new(&a.name).size(13.0).strong();
+                    if cell(ui, 340.0, 20.0, name, true).clicked() {
+                        *act = Some(CentralAction::OpenAlbum(a.clone()));
                     }
-                });
-        });
+                    cell(
+                        ui,
+                        220.0,
+                        20.0,
+                        egui::RichText::new(&a.artist).weak().size(12.0),
+                        false,
+                    );
+                    ui.weak(format!("{} tracks", a.track_count));
+                    if !a.release_date.is_empty() {
+                        ui.weak(&a.release_date);
+                    } else {
+                        ui.weak("");
+                    }
+                    if self.album_busy.as_deref() == Some(a.id.as_str()) {
+                        ui.weak("adding…");
+                    } else if hand(ui.small_button("+")).clicked() {
+                        *act = Some(CentralAction::QueueAlbum(a.clone()));
+                    }
+                    ui.end_row();
+                }
+            });
     }
 
     fn track_grid(&self, ui: &mut egui::Ui, rows: &[Track], act: &mut Option<CentralAction>) {
@@ -2555,8 +2670,8 @@ impl App {
                             ("N / P", "next / previous track"),
                             ("Q", "toggle queue panel"),
                             ("/ or ctrl+F", "focus search"),
-                            ("ctrl+1 / 2 / 3", "search / albums / library"),
-                            ("ctrl+4 / 5", "favorites / playlists"),
+                            ("ctrl+1 / 2 / 3", "search / library / favorites"),
+                            ("ctrl+4", "playlists"),
                             ("♥ / ♡", "toggle favorite on a row"),
                             ("esc", "close modal / panel"),
                             ("?", "this cheatsheet"),
@@ -2755,6 +2870,14 @@ fn seek_bar_ui(
             )));
         }
     }
+}
+
+/// Allocation-free case-insensitive ordering for names (Iterator::cmp walks
+/// both char streams lazily).
+fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
 }
 
 fn fmt_ms(ms: u64) -> String {

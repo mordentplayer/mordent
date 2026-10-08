@@ -1,0 +1,42 @@
+{
+ "next": "/v1/me/library/albums?l=en-US&offset=2",
+ "meta": {
+  "total": 2
+ },
+ "data": [
+  {
+   "id": "i.FIXTURE00000001",
+   "type": "library-albums",
+   "href": "/v1/me/library/albums/i.FIXTURE00000001",
+   "attributes": {
+    "name": "Discovery",
+    "artistName": "Daft Punk",
+    "trackCount": 14,
+    "releaseDate": "2001-03-07",
+    "dateAdded": "2026-01-15T09:30:00Z",
+    "playParams": {
+     "id": "i.FIXTURE00000001",
+     "kind": "album",
+     "catalogId": "528ismsiL5S2WByYmm6b-9v"
+    },
+    "artwork": {
+     "url": "https://is1-ssl.mzstatic.com/image/thumb/Music125/v4/8a/6a/1f/8a6a1f9d-5310-dfba-8bid-8e1ea8f00e5e/0724384960650.jpg/{w}x{h}bb.jpg",
+     "width": 1500,
+     "height": 1500,
+     "bgColor": "0d0d0f",
+     "hasP3": false
+    }
+   }
+  },
+  {
+   "id": "i.FIXTURE00000002",
+   "type": "library-albums",
+   "href": "/v1/me/library/albums/i.FIXTURE00000002",
+   "attributes": {
+    "name": "No Date, No Artwork",
+    "artistName": "Fixture Artist",
+    "trackCount": 3
+   }
+  }
+ ]
+}
