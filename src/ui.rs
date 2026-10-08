@@ -15,6 +15,7 @@
 
 use crate::api::{AlbumHit, Api, LibraryPlaylist, PlayEvent, PlayMode, SearchResults, Track};
 use crate::config::Config;
+use crate::fonts::FontChoice;
 use crate::mpris;
 use crate::player::{PacketSource, Player};
 use crate::report;
@@ -242,6 +243,9 @@ pub struct App {
     theme_stamp: Option<(std::time::SystemTime, u64)>,
     /// Throttles the once-per-second hot-reload poll; `None` = not polled yet.
     theme_poll: Option<std::time::Instant>,
+    /// Font set currently installed on the egui context; starts as egui's
+    /// built-ins (which is what eframe sets up) and follows `theme.font`.
+    font: FontChoice,
     error: Option<(String, std::time::Instant)>,
     last_title: String,
     /// Desktop media controls (MPRIS); `None` if D-Bus is unusable.
@@ -338,6 +342,9 @@ impl App {
             theme,
             theme_stamp: Theme::stamp(&crate::theme::theme_path()),
             theme_poll: None,
+            // eframe starts every app on egui's built-in fonts; the first
+            // poll_theme installs the configured set.
+            font: FontChoice::Default,
             // invalid theme keys are surfaced once through the toast
             error: theme_warns
                 .first()
@@ -377,10 +384,14 @@ impl App {
         }
         // headless verification hooks: AMC_DEMO_TERM=<query> auto-searches,
         // AMC_DEMO_VIEW=library|albums|favorites|playlists opens that view
-        // ("albums" = the Search view's Albums sub-view)
+        // ("albums" = the Search view's Albums sub-view), AMC_DEMO_QUEUE=1
+        // opens the queue panel.
         if let Ok(term) = std::env::var("AMC_DEMO_TERM") {
             app.search = term;
             app.spawn_search();
+        }
+        if std::env::var("AMC_DEMO_QUEUE").is_ok() {
+            app.show_queue = true;
         }
         match std::env::var("AMC_DEMO_VIEW").as_deref() {
             Ok("library") => app.switch_view(View::Library),
@@ -1630,6 +1641,14 @@ impl App {
         }
         self.theme = theme;
         self.theme.apply(ctx);
+        // Fonts are hot-reloadable the same way: egui picks up new
+        // definitions at the start of the next pass, so editing the `font`
+        // key switches the typeface without a restart. Only resubmit when the
+        // choice actually changed (set_fonts compares the TTF data).
+        if self.font != self.theme.font {
+            crate::fonts::apply(ctx, self.theme.font);
+            self.font = self.theme.font;
+        }
         ctx.request_repaint();
     }
 }
@@ -2918,8 +2937,8 @@ fn drop_slot(rows: &[(f32, f32)], dragged: Option<usize>, pointer_y: f32) -> usi
     slot
 }
 
-/// Small ♥/♡ favorite toggle (both glyphs are covered by egui's bundled emoji
-/// fonts and the DejaVu fallback).
+/// Small ♥/♡ favorite toggle (both glyphs are covered by egui's built-in
+/// emoji fonts and the bundled DejaVu Sans fallback).
 fn fav_button(ui: &mut egui::Ui, fav: bool, accent: egui::Color32) -> egui::Response {
     let (txt, col) = if fav {
         ("♥", accent)
@@ -3014,29 +3033,10 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
     eframe::run_native(
         "amc",
         native,
-        Box::new(move |cc| {
-            // egui's compiled-in fonts lack arrows (↑ ↓); add a system
-            // fallback once at startup when available.
-            let mut fonts = egui::FontDefinitions::default();
-            if let Ok(data) =
-                std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-            {
-                fonts.font_data.insert(
-                    "dejavu".into(),
-                    std::sync::Arc::new(egui::FontData::from_owned(data)),
-                );
-                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
-                {
-                    fonts
-                        .families
-                        .entry(family)
-                        .or_default()
-                        .push("dejavu".into());
-                }
-                cc.egui_ctx.set_fonts(fonts);
-            }
-            Ok(Box::new(App::new(cfg)))
-        }),
+        // Fonts are bundled (`src/fonts.rs`, `include_bytes!`) and installed
+        // by the first `App::poll_theme`: nothing is read from the filesystem,
+        // so the UI renders identically on a bare system.
+        Box::new(move |_cc| Ok(Box::new(App::new(cfg)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }

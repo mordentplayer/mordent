@@ -6,6 +6,7 @@
 //! file's mtime about once per second while it is open, so editing the file
 //! recolors the running UI without a restart.
 
+use crate::fonts::FontChoice;
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,7 @@ struct ThemeFile {
     text: Option<String>,
     weak: Option<String>,
     opacity: Option<f32>,
+    font: Option<String>,
 }
 
 /// Active theme. Colors are opaque here; `opacity` is applied when the values
@@ -40,6 +42,8 @@ pub struct Theme {
     pub weak: egui::Color32,
     /// Painted background alpha, 0.0-1.0 (needs a compositor to see through).
     pub opacity: f32,
+    /// Which bundled font set the UI uses (`font` key).
+    pub font: FontChoice,
 }
 
 impl Default for Theme {
@@ -52,6 +56,7 @@ impl Default for Theme {
             text: egui::Color32::from_gray(150),
             weak: egui::Color32::from_gray(90),
             opacity: 1.0,
+            font: FontChoice::Inter,
         }
     }
 }
@@ -132,6 +137,15 @@ impl Theme {
                 theme.opacity = o.clamp(0.0, 1.0);
             } else {
                 warns.push("theme.toml: opacity must be a number in 0.0-1.0".into());
+            }
+        }
+        if let Some(raw) = file.font.as_deref() {
+            match FontChoice::parse(raw) {
+                Some(f) => theme.font = f,
+                // unknown name: keep the built-in default font, warn once
+                None => warns.push(format!(
+                    "theme.toml: font: {raw:?} is not one of inter|dejavu|default (using inter)"
+                )),
             }
         }
         (theme, warns)
@@ -223,6 +237,30 @@ mod tests {
         assert!(warns.is_empty());
         assert_eq!(t.accent, Theme::default().accent);
         assert_eq!(t.opacity, 1.0);
+        assert_eq!(t.font, FontChoice::Inter);
+    }
+
+    /// `font` accepts only the three known names; anything else keeps the
+    /// built-in default (inter) and warns once, like a bad colour.
+    #[test]
+    fn font_key_parses_and_falls_back() {
+        let p = std::env::temp_dir().join("amc-theme-font.toml");
+        for (text, want, warn) in [
+            ("font = \"inter\"\n", FontChoice::Inter, false),
+            ("font = \" dejavu \"\n", FontChoice::DejaVu, false),
+            ("font = \"default\"\n", FontChoice::Default, false),
+            ("font = \"comic sans\"\n", FontChoice::Inter, true),
+            ("font = 3\n", FontChoice::Inter, true), // wrong type: whole file fails
+        ] {
+            std::fs::write(&p, text).unwrap();
+            let (t, warns) = Theme::load_from(&p);
+            assert_eq!(t.font, want, "for {text:?}");
+            assert_eq!(!warns.is_empty(), warn, "for {text:?}: {warns:?}");
+            if warn {
+                assert!(warns[0].contains("theme.toml"), "for {text:?}");
+            }
+        }
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

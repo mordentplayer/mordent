@@ -1,6 +1,7 @@
 mod acache;
 mod api;
 mod config;
+mod fonts;
 mod player;
 mod queuemodel;
 mod report;

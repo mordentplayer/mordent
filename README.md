@@ -155,8 +155,10 @@ default for that key is kept.
 | `text` | `#969696` | normal text |
 | `weak` | `#5a5a5a` | secondary text |
 | `opacity` | `1.0` | background alpha, `0.0`–`1.0` |
+| `font` | `inter` | bundled font set: `inter`, `dejavu` or `default` (egui's built-ins) |
 
-Colors accept `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`.
+Colors accept `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`; `font` hot-reloads
+with the colors, so the typeface switches without a restart.
 
 ```toml
 accent = "#4dd0fa"
