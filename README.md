@@ -61,13 +61,51 @@ cargo build --release
 ## Usage
 
 ```sh
-amc ui                    # the app (search-first, / to focus, space pause, n skip)
+amc ui                    # the app (tabs, queue, seek — see UI section below)
 amc search "daft punk"    # catalog search
 amc play "get lucky"      # CLI playback with time-to-music stats
 amc lyrics <songId> [--syllable]   # line- or word-timed lyrics
 amc decrypt <songId> [out]  # stream + decrypt to file
 amc decode <file>         # verify a decrypted file decodes
 ```
+
+## UI (`amc ui`)
+
+Three tabs — **Search**, **Albums**, **Library**. Clicking a track plays it
+immediately (replacing the current track and cancelling its download); `+`
+appends to the queue. The Albums tab lists the albums of the current/last
+search; clicking one opens an album detail page (per-track play/enqueue,
+**Play** = play from the top and queue the rest, **Queue All**, esc/outside
+click closes).
+
+The queue panel (right side) has per-row ▲▼ reordering, ✕ remove, clear, and
+a shuffle toggle that restores the original order when switched off. The
+player bar shows elapsed/remaining time, a click-to-seek progress bar, ⏮
+(restarts after 3 s, else previous track), shuffle, repeat off/all/one, and a
+compact volume slider. The window title mirrors the playing track. Errors
+surface as a dismissible toast, empty states are explicit, and the pointer
+turns into a hand over clickable rows.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `space` | play / pause |
+| `→` / `←` | seek ±5 s |
+| `↑` / `↓` | volume up / down |
+| `N` / `P` | next / previous track |
+| `Q` | toggle queue panel |
+| `/` or `ctrl+F` | focus search |
+| `ctrl+1` / `2` / `3` | switch to Search / Albums / Library |
+| `esc` | close modal / panel |
+| `?` | shortcut cheatsheet overlay |
+| click progress bar | seek |
+
+`AMC_SELFTEST=1 amc ui` runs a deterministic headless state-machine test
+(play-now replaces current, queue ordering, ▲▼ reorder, shuffle
+restore, auto-advance) and prints `RESULT: PASS/FAIL`.
+`AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums` pre-seed the UI for
+headless screenshots.
 
 ## Measured (VPS, download-throttled Apple CDN)
 
@@ -82,6 +120,8 @@ amc decode <file>         # verify a decrypted file decodes
 ## Status
 
 Working: search, your library (songs/albums/search), ALAC/lossless streaming playback, previews fallback,
-lyrics endpoint, decrypt-to-file, dense search-first UI.
+lyrics endpoint, decrypt-to-file, dense search-first UI with albums tab +
+album detail modal, queue with reorder/shuffle, seekable player bar with
+shuffle/repeat, keyboard shortcuts.
 Next: animated word-synced lyrics
-view, queue UI, media keys, wrapper auto-spawn from the app.
+view, media keys, wrapper auto-spawn from the app.

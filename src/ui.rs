@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::player::{PacketSource, Player};
 use crate::{stream, wrapper};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -42,7 +43,7 @@ enum View {
     Library,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Repeat {
     Off,
     All,
@@ -73,6 +74,46 @@ struct SelftestState {
     stage: u8,
     expect: [String; 2],
     started: std::time::Instant,
+}
+
+/// UI settings persisted to ~/.config/amc/state.toml (atomic write).
+#[derive(Serialize, Deserialize, Default)]
+struct UiState {
+    volume: Option<f32>,
+    last_view: Option<String>,
+    repeat: Option<String>,
+}
+
+fn state_path() -> std::path::PathBuf {
+    crate::config::home().join(".config/amc/state.toml")
+}
+
+fn load_state() -> UiState {
+    std::fs::read_to_string(state_path())
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(st: &UiState) {
+    let Ok(text) = toml::to_string_pretty(st) else {
+        return;
+    };
+    let path = state_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("toml.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+fn sleep_label(sleep_at: &Option<(std::time::Instant, std::time::Duration)>) -> String {
+    match sleep_at {
+        None => "sleep off".to_string(),
+        Some((t0, d)) => format!("sleep {}", fmt_pos(d.saturating_sub(t0.elapsed()))),
+    }
 }
 
 pub struct App {
@@ -117,6 +158,8 @@ pub struct App {
     album_busy: Option<String>,
     album_modal: Option<AlbumModal>,
     cheatsheet: bool,
+    /// Sleep timer deadline (paused playback when it fires).
+    sleep_at: Option<(std::time::Instant, std::time::Duration)>,
     /// AMC_SELFTEST=1: drive play_now/queue/auto-advance deterministically
     /// and print SELFTEST PASS/FAIL (headless CI aid).
     selftest: Option<SelftestState>,
@@ -130,7 +173,9 @@ pub struct App {
 impl App {
     fn new(cfg: Config) -> Self {
         let player = Player::new();
-        player.volume(0.8);
+        let state = load_state();
+        let volume = state.volume.unwrap_or(0.8).clamp(0.0, 1.0);
+        player.volume(volume);
         let (tx, rx) = channel();
         let mut app = Self {
             cfg,
@@ -153,24 +198,34 @@ impl App {
             play_offset: std::time::Duration::ZERO,
             resume_paused: false,
             history: VecDeque::new(),
-            repeat: Repeat::Off,
+            repeat: match state.repeat.as_deref() {
+                Some("all") => Repeat::All,
+                Some("one") => Repeat::One,
+                _ => Repeat::Off,
+            },
             shuffle: false,
             shuffle_saved: None,
             album_job: None,
             album_busy: None,
             album_modal: None,
             cheatsheet: false,
+            sleep_at: None,
             selftest: std::env::var("AMC_SELFTEST").is_ok().then(|| SelftestState {
                 stage: 0,
                 expect: Default::default(),
                 started: std::time::Instant::now(),
             }),
-            volume: 0.8,
+            volume,
             error: None,
             last_title: "amc".into(),
             rx,
             tx,
         };
+        match state.last_view.as_deref() {
+            Some("albums") => app.view = View::Albums,
+            Some("library") => app.switch_view(View::Library),
+            _ => {}
+        }
         if app.selftest.is_some() {
             eprintln!("[selftest] armed");
         }
@@ -236,6 +291,7 @@ impl App {
 
     fn switch_view(&mut self, v: View) {
         self.view = v;
+        self.save_ui_state();
         if v == View::Library && self.library.is_none() && !self.library_loading {
             self.spawn_library(0);
         }
@@ -268,7 +324,7 @@ impl App {
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         let t = track;
-        std::thread::Builder::new().name("play-worker".into()).spawn(move || {
+        let _ = std::thread::Builder::new().name("play-worker".into()).spawn(move || {
             let res = (|| -> anyhow::Result<()> {
                 let w = wrapper::Wrapper::new(&cfg.wrapper_url);
                 let logged_in = w.regions().map(|r| !r.is_empty()).unwrap_or(false);
@@ -517,10 +573,8 @@ impl App {
         let target = target.min(total);
         if self.player.decode_only {
             let now = std::time::Instant::now();
-            self.fake_play = Some((
-                now.checked_sub(target).unwrap_or(now),
-                total.saturating_sub(target),
-            ));
+            let end = std::time::Duration::from_millis(t.min(8_000));
+            self.fake_play = Some((now.checked_sub(target).unwrap_or(now), end));
             if self.fake_pause_at.is_some() {
                 self.fake_pause_at = Some(now);
             }
@@ -537,6 +591,40 @@ impl App {
     fn change_volume(&mut self, delta: f32) {
         self.volume = (self.volume + delta).clamp(0.0, 1.0);
         self.player.volume(self.volume);
+    }
+
+    /// Pause without toggling (sleep timer).
+    fn pause_now(&mut self) {
+        if self.player.decode_only {
+            if self.fake_play.is_some() && self.fake_pause_at.is_none() {
+                self.fake_pause_at = Some(std::time::Instant::now());
+            }
+        } else {
+            self.player.sink().map(|s| if !s.is_paused() { s.pause(); });
+        }
+    }
+
+    fn save_ui_state(&self) {
+        save_state(&UiState {
+                volume: Some(self.volume),
+                last_view: Some(
+                    match self.view {
+                        View::Search => "search",
+                        View::Albums => "albums",
+                        View::Library => "library",
+                    }
+                    .to_string(),
+                ),
+                repeat: Some(
+                    match self.repeat {
+                        Repeat::Off => "off",
+                        Repeat::All => "all",
+                        Repeat::One => "one",
+                    }
+                    .to_string(),
+                ),
+            },
+        );
     }
 
     // ---- keyboard ----
@@ -636,15 +724,16 @@ impl App {
                             self.player.sink().map(|s| s.pause());
                             self.resume_paused = false;
                         }
-                        // start the decode-only fake clock (keep a seek target)
+                        // start the decode-only fake clock (keep a seek target);
+                        // tuple = (clock start, elapsed-at-end)
                         if self.player.decode_only && self.fake_play.is_none() {
                             if let Some(t) = &self.now {
-                                let start = std::time::Instant::now() + self.play_offset;
-                                let rem = std::time::Duration::from_millis(
-                                    t.duration_ms.min(8_000),
-                                )
-                                .saturating_sub(self.play_offset);
-                                self.fake_play = Some((start, rem));
+                                let end =
+                                    std::time::Duration::from_millis(t.duration_ms.min(8_000));
+                                let start = std::time::Instant::now()
+                                    .checked_sub(self.play_offset)
+                                    .unwrap_or_else(std::time::Instant::now);
+                                self.fake_play = Some((start, end));
                             }
                         }
                     } // stale: dropping src also cancels its download
@@ -708,7 +797,7 @@ impl App {
                 .take(2)
                 .cloned()
                 .collect();
-            // reorder assertion: same method the ▲▼ buttons call
+            // reorder assertion: same method the ↑↓ buttons call
             self.queue_move(1, -1);
             let ok_up = self.queue.front().map(|t| t.id.as_str()) == Some(id1.as_str());
             self.queue_move(0, 1);
@@ -788,10 +877,20 @@ impl eframe::App for App {
         self.poll_messages();
         self.selftest_step();
 
+        // ---- sleep timer ----
+        if let Some((t0, d)) = self.sleep_at {
+            if t0.elapsed() >= d {
+                self.sleep_at = None;
+                self.pause_now();
+                self.fail("sleep timer expired — playback paused".into());
+            }
+        }
+
         // ---- auto-advance ----
         let idle = if self.player.decode_only {
             match &self.fake_play {
-                Some((t0, d)) => t0.elapsed() >= *d,
+                // playback_position freezes while paused
+                Some((_, end)) => self.playback_position() >= *end,
                 None => true,
             }
         } else {
@@ -860,6 +959,22 @@ impl eframe::App for App {
                 }
                 if ui.small_button("?").clicked() {
                     self.cheatsheet = !self.cheatsheet;
+                }
+                let sl = sleep_label(&self.sleep_at);
+                if hand(ui.small_button(egui::RichText::new(sl).size(11.0))).clicked() {
+                    self.sleep_at = match &self.sleep_at {
+                        None => Some((
+                            std::time::Instant::now(),
+                            std::time::Duration::from_secs(15 * 60),
+                        )),
+                        Some((_, d)) if *d <= std::time::Duration::from_secs(15 * 60) => {
+                            Some((std::time::Instant::now(), std::time::Duration::from_secs(30 * 60)))
+                        }
+                        Some((_, d)) if *d <= std::time::Duration::from_secs(30 * 60) => {
+                            Some((std::time::Instant::now(), std::time::Duration::from_secs(60 * 60)))
+                        }
+                        Some(_) => None,
+                    };
                 }
                 if self.searching {
                     ui.spinner();
@@ -1101,7 +1216,7 @@ enum BarIntent {
     Queue,
     CycleRepeat,
     ToggleShuffle,
-    Seek(f64),
+    Seek(std::time::Duration),
 }
 
 impl App {
@@ -1136,9 +1251,17 @@ impl App {
                             );
                         }
                         let pos = self.playback_position();
-                        let total_ms =
+                        let real_ms =
                             self.now.as_ref().map(|t| t.duration_ms).unwrap_or(0);
-                        let total = std::time::Duration::from_millis(total_ms);
+                        // decode-only simulates an 8 s track — make the bar
+                        // and remaining label match the simulation
+                        let total = if self.player.decode_only {
+                            self.fake_play
+                                .map(|(_, e)| e)
+                                .unwrap_or(std::time::Duration::from_millis(real_ms))
+                        } else {
+                            std::time::Duration::from_millis(real_ms)
+                        };
                         let remain = total.saturating_sub(pos);
                         ui.horizontal(|ui| {
                             ui.monospace(fmt_pos(pos));
@@ -1166,6 +1289,7 @@ impl App {
         if vol != self.volume {
             self.volume = vol;
             self.player.volume(vol);
+            self.save_ui_state();
         }
         match act {
             Some(BarIntent::Toggle) => self.toggle_pause_now(),
@@ -1178,16 +1302,10 @@ impl App {
                     Repeat::All => Repeat::One,
                     Repeat::One => Repeat::Off,
                 };
+                self.save_ui_state();
             }
             Some(BarIntent::ToggleShuffle) => self.toggle_shuffle(),
-            Some(BarIntent::Seek(f)) => {
-                let total = self
-                    .now
-                    .as_ref()
-                    .map(|t| t.duration_ms as f64 / 1000.0)
-                    .unwrap_or(0.0);
-                self.seek_to(std::time::Duration::from_secs_f64(f * total));
-            }
+            Some(BarIntent::Seek(target)) => self.seek_to(target),
             None => {}
         }
     }
@@ -1253,13 +1371,13 @@ impl App {
                                     .halign(egui::Align::LEFT)
                                     .truncate(),
                             );
-                            if hand(ui.small_button("▲")).clicked() {
+                            if hand(ui.small_button("↑")).clicked() {
                                 mv = Some((i, -1));
                             }
-                            if hand(ui.small_button("▼")).clicked() {
+                            if hand(ui.small_button("↓")).clicked() {
                                 mv = Some((i, 1));
                             }
-                            if hand(ui.small_button("✕")).clicked() {
+                            if hand(ui.small_button("×")).clicked() {
                                 remove = Some(i);
                             }
                         });
@@ -1281,34 +1399,18 @@ impl App {
     }
 
     fn album_modal_ui(&mut self, ctx: &egui::Context) {
-        // dim backdrop; click outside closes
-        let screen = ctx.screen_rect();
-        let backdrop = egui::Area::new(egui::Id::new("album_backdrop"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(screen.min);
-        let mut close = false;
-        backdrop.show(ctx, |ui| {
-            let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
-            ui.painter()
-                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
-            if resp.clicked() {
-                close = true;
-            }
-        });
-        egui::Area::new(egui::Id::new("album_modal"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        let resp = egui::Modal::new(egui::Id::new("album_modal"))
+            .backdrop_color(egui::Color32::from_black_alpha(150))
             .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(ui.visuals().panel_fill)
-                    .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
-                    .inner_margin(14.0)
-                    .corner_radius(8.0_f32)
-                    .show(ui, |ui| {
-                        self.album_modal_body(ui);
-                    });
+                // floating Areas don't reserve height for ScrollArea —
+                // reserve an explicit box for the detail page
+                ui.allocate_ui_with_layout(
+                    egui::vec2(560.0, 430.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| self.album_modal_body(ui),
+                );
             });
-        if close {
+        if resp.should_close() {
             self.close_album_modal();
         }
     }
@@ -1324,7 +1426,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.strong(egui::RichText::new(&album.name).size(18.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if hand(ui.small_button("✕")).clicked() {
+                    if hand(ui.small_button("×")).clicked() {
                         close = true;
                     }
                 });
@@ -1355,8 +1457,8 @@ impl App {
                     });
                     ui.separator();
                     egui::ScrollArea::vertical()
-                        .max_height(360.0)
-                        .auto_shrink(false)
+                        .max_height(340.0)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             egui::Grid::new("album_tracks")
                                 .num_columns(4)
@@ -1409,53 +1511,35 @@ impl App {
     }
 
     fn cheatsheet_ui(&mut self, ctx: &egui::Context) {
-        let mut close = false;
-        egui::Area::new(egui::Id::new("cheatsheet"))
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        let resp = egui::Modal::new(egui::Id::new("cheatsheet"))
+            .backdrop_color(egui::Color32::from_black_alpha(120))
             .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(ui.visuals().panel_fill)
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        ui.visuals().widgets.noninteractive.bg_stroke.color,
-                    ))
-                    .inner_margin(14.0)
-                    .corner_radius(8.0_f32)
+                ui.set_width(420.0);
+                ui.strong(egui::RichText::new("keyboard shortcuts").size(15.0));
+                ui.separator();
+                egui::Grid::new("cheats")
+                    .num_columns(2)
+                    .spacing([18.0, 3.0])
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(egui::RichText::new("keyboard shortcuts").size(15.0));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if hand(ui.small_button("✕")).clicked() {
-                                    close = true;
-                                }
-                            });
-                        });
-                        ui.separator();
-                        egui::Grid::new("cheats")
-                            .num_columns(2)
-                            .spacing([18.0, 3.0])
-                            .show(ui, |ui| {
-                                for (k, v) in [
-                                    ("space", "play / pause"),
-                                    ("→ / ←", "seek ±5 s"),
-                                    ("↑ / ↓", "volume"),
-                                    ("N / P", "next / previous track"),
-                                    ("Q", "toggle queue panel"),
-                                    ("/ or ctrl+F", "focus search"),
-                                    ("ctrl+1 / 2 / 3", "search / albums / library"),
-                                    ("esc", "close modal / panel"),
-                                    ("?", "this cheatsheet"),
-                                    ("click progress bar", "seek"),
-                                ] {
-                                    ui.monospace(egui::RichText::new(k).color(ACCENT));
-                                    ui.weak(v);
-                                    ui.end_row();
-                                }
-                            });
+                        for (k, v) in [
+                            ("space", "play / pause"),
+                            ("→ / ←", "seek ±5 s"),
+                            ("↑ / ↓", "volume"),
+                            ("N / P", "next / previous track"),
+                            ("Q", "toggle queue panel"),
+                            ("/ or ctrl+F", "focus search"),
+                            ("ctrl+1 / 2 / 3", "search / albums / library"),
+                            ("esc", "close modal / panel"),
+                            ("?", "this cheatsheet"),
+                            ("click progress bar", "seek"),
+                        ] {
+                            ui.monospace(egui::RichText::new(k).color(ACCENT));
+                            ui.weak(v);
+                            ui.end_row();
+                        }
                     });
             });
-        if close {
+        if resp.should_close() {
             self.cheatsheet = false;
         }
     }
@@ -1491,7 +1575,7 @@ impl App {
                                     .truncate(),
                                 );
                             }
-                            if hand(ui.small_button("✕")).clicked() {
+                            if hand(ui.small_button("×")).clicked() {
                                 dismiss = true;
                             }
                         });
@@ -1543,11 +1627,14 @@ fn seek_bar_ui(
         0.0
     };
     let h = 8.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
-    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(64));
+    // generous hit target; the visual bar is centred inside it
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click());
+    let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(width, h));
+    ui.painter()
+        .rect_filled(bar, 4.0, egui::Color32::from_gray(64));
     let w = (rect.width() as f64 * frac) as f32;
     ui.painter().rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(w, h)),
+        egui::Rect::from_min_size(bar.min, egui::vec2(w, h)),
         4.0,
         ACCENT,
     );
@@ -1555,7 +1642,9 @@ fn seek_bar_ui(
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             let f = ((p.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) as f64;
-            *act = Some(BarIntent::Seek(f));
+            *act = Some(BarIntent::Seek(std::time::Duration::from_secs_f64(
+                f * total.as_secs_f64(),
+            )));
         }
     }
 }
@@ -1579,7 +1668,29 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
     eframe::run_native(
         "amc",
         native,
-        Box::new(move |_cc| Ok(Box::new(App::new(cfg)))),
+        Box::new(move |cc| {
+            // egui's compiled-in fonts lack arrows (↑ ↓); add a system
+            // fallback once at startup when available.
+            let mut fonts = egui::FontDefinitions::default();
+            if let Ok(data) =
+                std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+            {
+                fonts.font_data.insert(
+                    "dejavu".into(),
+                    std::sync::Arc::new(egui::FontData::from_owned(data)),
+                );
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
+                {
+                    fonts
+                        .families
+                        .entry(family)
+                        .or_default()
+                        .push("dejavu".into());
+                }
+                cc.egui_ctx.set_fonts(fonts);
+            }
+            Ok(Box::new(App::new(cfg)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }
