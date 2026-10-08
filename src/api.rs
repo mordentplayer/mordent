@@ -28,6 +28,8 @@ pub struct AlbumHit {
     pub name: String,
     pub artist: String,
     pub artwork: Option<String>,
+    /// Raw artwork object (template + palette metadata) for size-aware renders.
+    pub artwork_obj: Option<Artwork>,
     pub track_count: u32,
     pub release_date: String,
 }
@@ -37,6 +39,82 @@ pub struct ArtistHit {
     pub id: String,
     pub name: String,
     pub genres: String,
+    /// Raw artwork object (template + palette metadata) for size-aware renders.
+    pub artwork_obj: Option<Artwork>,
+}
+
+/// Apple artwork object: a URL template (`.../{w}x{h}bb.jpg`) plus palette
+/// metadata. Every field is optional/defaulted so partial payloads parse.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Artwork {
+    pub url: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// The crop/format code the API suggests for this asset (`bb` = letterbox
+    /// fit with background fill, `sr` = source-ratio fill, ...). Acts as the
+    /// "jam"/shared-listening fit hint when present.
+    #[serde(rename = "defaultCropCode")]
+    pub default_crop_code: Option<String>,
+    #[serde(rename = "bgColor")]
+    pub bg_color: Option<String>,
+    #[serde(rename = "textColor1")]
+    pub text_color1: Option<String>,
+    #[serde(rename = "textColor2")]
+    pub text_color2: Option<String>,
+    #[serde(rename = "textColor3")]
+    pub text_color3: Option<String>,
+    #[serde(rename = "textColor4")]
+    pub text_color4: Option<String>,
+    #[serde(rename = "hasP3")]
+    pub has_p3: bool,
+}
+
+impl Artwork {
+    /// Render the template at `w`×`h` (e.g. `.../{w}x{h}bb.jpg` →
+    /// `.../600x600bb.jpg`). Placeholder and pre-rendered URLs both work. A
+    /// template with a literal crop code keeps it; `{c}` uses the API's
+    /// `defaultCropCode` (else `bb`).
+    pub fn url(&self, w: u32, h: u32) -> String {
+        render_artwork(&self.url, w, h, self.default_crop_code.as_deref(), None)
+    }
+
+    /// Square letterbox "fit" render at `size`×`size` (jam/shared-listening
+    /// style: image fitted inside the box, background filled).
+    pub fn fit_url(&self, size: u32) -> String {
+        render_artwork(&self.url, size, size, Some("bb"), None)
+    }
+}
+
+impl Track {
+    /// Re-render this track's artwork at a different size. `Track::artwork`
+    /// holds a concrete 600×600 URL; its size token is swapped in place.
+    pub fn artwork_url(&self, w: u32, h: u32) -> Option<String> {
+        self.artwork
+            .as_deref()
+            .map(|u| render_artwork(u, w, h, None, None))
+    }
+}
+
+/// A user library playlist (`/v1/me/library/playlists`).
+#[derive(Clone, Debug, Default)]
+pub struct LibraryPlaylist {
+    pub id: String,
+    pub name: String,
+    /// `description.standard` when present, else empty.
+    pub description: String,
+    pub track_count: u32,
+    pub artwork: Option<Artwork>,
+}
+
+/// Catalog artist with top songs (`/v1/catalog/{sf}/artists/{id}?views=top-songs`).
+#[derive(Clone, Debug, Default)]
+pub struct Artist {
+    pub id: String,
+    pub name: String,
+    pub genres: String,
+    pub artwork: Option<Artwork>,
+    pub top_songs: Vec<Track>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +144,14 @@ struct RawAttrs {
     track_count: u32,
     release_date: String,
     genre_names: Vec<String>,
+    /// Library playlists only: `{ "standard": "..." }`.
+    description: Option<RawDescription>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawDescription {
+    #[serde(default)]
+    standard: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -77,8 +163,42 @@ struct RawPlayParams {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(default)]
 struct RawArtwork {
     url: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    #[serde(rename = "defaultCropCode")]
+    default_crop_code: Option<String>,
+    #[serde(rename = "bgColor")]
+    bg_color: Option<String>,
+    #[serde(rename = "textColor1")]
+    text_color1: Option<String>,
+    #[serde(rename = "textColor2")]
+    text_color2: Option<String>,
+    #[serde(rename = "textColor3")]
+    text_color3: Option<String>,
+    #[serde(rename = "textColor4")]
+    text_color4: Option<String>,
+    #[serde(rename = "hasP3")]
+    has_p3: bool,
+}
+
+impl RawArtwork {
+    fn to_artwork(&self) -> Artwork {
+        Artwork {
+            url: self.url.clone(),
+            width: self.width,
+            height: self.height,
+            default_crop_code: self.default_crop_code.clone(),
+            bg_color: self.bg_color.clone(),
+            text_color1: self.text_color1.clone(),
+            text_color2: self.text_color2.clone(),
+            text_color3: self.text_color3.clone(),
+            text_color4: self.text_color4.clone(),
+            has_p3: self.has_p3,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -99,6 +219,11 @@ impl RawResource {
             .artwork
             .as_ref()
             .map(|a| a.url.replace("{w}x{h}bb.jpg", "600x600bb.jpg"))
+    }
+
+    /// Raw artwork object (template + palette) for size-aware rendering.
+    fn artwork_obj(&self) -> Option<Artwork> {
+        self.attributes.artwork.as_ref().map(|a| a.to_artwork())
     }
 
     /// The playable id: catalog adamId when known (library items carry it in
@@ -135,6 +260,7 @@ impl RawResource {
             name: self.attributes.name.clone(),
             artist: self.attributes.artist_name.clone(),
             artwork: self.artwork_templated(),
+            artwork_obj: self.artwork_obj(),
             track_count: self.attributes.track_count,
             release_date: self.attributes.release_date.clone(),
         }
@@ -145,6 +271,23 @@ impl RawResource {
             id: self.id.clone(),
             name: self.attributes.name.clone(),
             genres: self.attributes.genre_names.join(", "),
+            artwork_obj: self.artwork_obj(),
+        }
+    }
+
+    /// A library playlist resource.
+    fn to_playlist(&self) -> LibraryPlaylist {
+        LibraryPlaylist {
+            id: self.id.clone(),
+            name: self.attributes.name.clone(),
+            description: self
+                .attributes
+                .description
+                .as_ref()
+                .map(|d| d.standard.clone())
+                .unwrap_or_default(),
+            track_count: self.attributes.track_count,
+            artwork: self.artwork_obj(),
         }
     }
 }
@@ -153,6 +296,8 @@ impl RawResource {
 struct RawGroup {
     #[serde(default)]
     data: Vec<RawResource>,
+    #[serde(default)]
+    next: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -180,6 +325,34 @@ struct RawLibraryResp {
     data: Vec<RawResource>,
     #[serde(default)]
     next: Option<String>,
+}
+
+/// `/v1/catalog/{sf}/artists/{id}?views=top-songs` payload.
+#[derive(Deserialize, Default)]
+struct RawArtistResp {
+    #[serde(default)]
+    data: Vec<RawArtist>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawArtist {
+    id: String,
+    attributes: RawAttrs,
+    views: RawArtistViews,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawArtistViews {
+    #[serde(rename = "top-songs")]
+    top_songs: RawGroup,
+}
+
+impl RawArtist {
+    fn artwork_obj(&self) -> Option<Artwork> {
+        self.attributes.artwork.as_ref().map(|a| a.to_artwork())
+    }
 }
 
 fn parse_next_offset(next: &str) -> Option<u32> {
@@ -343,6 +516,22 @@ impl Api {
         Ok(raw.data.iter().map(|r| r.to_album()).collect())
     }
 
+    /// User library playlists (requires media-user-token). `extend` asks the
+    /// API for `trackCount`/`description`, which the plain list omits. Returns
+    /// playlists plus the offset for the next page (None = end).
+    pub fn library_playlists(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<LibraryPlaylist>, Option<u32>)> {
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/me/library/playlists?limit={limit}&offset={offset}&extend=trackCount%2Cdescription&l=en-US"
+        );
+        let raw: RawLibraryResp = from_value(self.get_json_retry(&url)?)?;
+        let lists = raw.data.iter().map(|r| r.to_playlist()).collect();
+        Ok((lists, raw.next.as_deref().and_then(parse_next_offset)))
+    }
+
     /// Tracks of a library album (id starting with `i.`) or a catalog album.
     pub fn album_tracks_any(&self, id: &str) -> Result<Vec<Track>> {
         if id.starts_with("i.") {
@@ -373,6 +562,47 @@ impl Api {
         );
         let raw: RawGroup = from_value(self.get_json_retry(&url)?)?;
         Ok(raw.data.first().map(|r| r.to_track()))
+    }
+
+    /// Catalog artist with top songs. Fetches the `top-songs` view and follows
+    /// its pagination (capped at 100 songs).
+    pub fn artist(&self, id: &str) -> Result<Artist> {
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/catalog/{}/artists/{id}?views=top-songs&l=en-US",
+            self.cfg.storefront
+        );
+        let raw: RawArtistResp =
+            from_value(self.get_json_retry(&url)?).context("decoding artist response")?;
+        let artist = raw.data.into_iter().next().context("artist not found")?;
+
+        let mut top_songs: Vec<Track> = artist
+            .views
+            .top_songs
+            .data
+            .iter()
+            .map(|r| r.to_track())
+            .collect();
+        let mut next = artist.views.top_songs.next.clone();
+        while let Some(n) = next {
+            if top_songs.len() >= 100 {
+                break;
+            }
+            let page: RawGroup = from_value(self.get_json_retry(&api_url(&n))?)?;
+            if page.data.is_empty() {
+                break;
+            }
+            top_songs.extend(page.data.iter().map(|r| r.to_track()));
+            next = page.next.clone();
+        }
+
+        let artwork = artist.artwork_obj();
+        Ok(Artist {
+            id: artist.id,
+            name: artist.attributes.name.clone(),
+            genres: artist.attributes.genre_names.join(", "),
+            artwork,
+            top_songs,
+        })
     }
 
     /// 90-second unencrypted preview URL for a track (anonymous playback).
@@ -489,6 +719,105 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Absolute amp-api URL for a `next`/`href` value that may be a bare path.
+fn api_url(next: &str) -> String {
+    if next.starts_with("http://") || next.starts_with("https://") {
+        next.to_string()
+    } else {
+        format!("https://amp-api.music.apple.com{next}")
+    }
+}
+
+/// Render an Apple artwork URL template.
+///
+/// Handles both `{w}`/`{h}`/`{c}`/`{f}` placeholders (and their percent-encoded
+/// forms) and already-rendered URLs (whose size token is swapped). `crop`/
+/// `fmt` override the template's own literal values when supplied.
+fn render_artwork(tpl: &str, w: u32, h: u32, crop: Option<&str>, fmt: Option<&str>) -> String {
+    if tpl.is_empty() {
+        return String::new();
+    }
+    let mut out = tpl.to_string();
+
+    let had_wh = out.contains("{w}") || out.contains("%7Bw%7D");
+    out = out
+        .replace("{w}", &w.to_string())
+        .replace("%7Bw%7D", &w.to_string())
+        .replace("{h}", &h.to_string())
+        .replace("%7Bh%7D", &h.to_string());
+    if !had_wh {
+        // Already-rendered URL: swap the concrete `NNNxNNN` size token.
+        out = replace_size_token(&out, w, h);
+    }
+
+    let fallback_crop = crop.unwrap_or("bb");
+    if out.contains("{c}") || out.contains("%7Bc%7D") {
+        out = out
+            .replace("{c}", fallback_crop)
+            .replace("%7Bc%7D", fallback_crop);
+    } else if let Some(c) = crop {
+        out = replace_crop_code(&out, c);
+    }
+
+    if out.contains("{f}") || out.contains("%7Bf%7D") {
+        let fallback_fmt = fmt.unwrap_or("jpg");
+        out = out
+            .replace("{f}", fallback_fmt)
+            .replace("%7Bf%7D", fallback_fmt);
+    }
+
+    out
+}
+
+/// Replace the first `NNNxNNN` dimension token with `w`x`h`.
+fn replace_size_token(s: &str, w: u32, h: u32) -> String {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() && (i == 0 || !b[i - 1].is_ascii_digit()) {
+            let start = i;
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < b.len() && (b[j] == b'x' || b[j] == b'X') {
+                let mut e = j + 1;
+                while e < b.len() && b[e].is_ascii_digit() {
+                    e += 1;
+                }
+                if e > j + 1 {
+                    let mut out = String::with_capacity(s.len() + 8);
+                    out.push_str(&s[..start]);
+                    out.push_str(&format!("{w}x{h}"));
+                    out.push_str(&s[e..]);
+                    return out;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    s.to_string()
+}
+
+/// Swap the two-letter crop code that precedes the final `.ext` in an artwork
+/// URL (e.g. `.../600x600sr.jpg` → `.../600x600bb.jpg`).
+fn replace_crop_code(s: &str, crop: &str) -> String {
+    if let Some(dot) = s.rfind('.') {
+        let b = s.as_bytes();
+        if dot >= 2 && b[dot - 1].is_ascii_lowercase() && b[dot - 2].is_ascii_lowercase() {
+            let mut out = String::with_capacity(s.len());
+            out.push_str(&s[..dot - 2]);
+            out.push_str(crop);
+            out.push_str(&s[dot..]);
+            return out;
+        }
+    }
+    s.to_string()
+}
+
+
 /// Extract a catalog id from an Apple Music URL or return the input as-is.
 pub fn id_from_arg(arg: &str) -> Result<String> {
     if let Some(id) = arg.split('?').next().unwrap_or(arg).rsplit('/').next() {
@@ -501,3 +830,216 @@ pub fn id_from_arg(arg: &str) -> Result<String> {
     }
     anyhow::bail!("cannot parse id from {arg:?}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Load a recorded, trimmed API response. Offline: fixtures only.
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let txt = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        serde_json::from_str(&txt).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    }
+
+    fn decoded<T: DeserializeOwned>(name: &str) -> T {
+        from_value(fixture(name)).unwrap_or_else(|e| panic!("decode {name}: {e}"))
+    }
+
+    #[test]
+    fn search_fixture_parses_tracks_albums_artists() {
+        let raw: RawSearch = decoded("search_daft_punk.json");
+        let songs = &raw.results.songs.data;
+        assert_eq!(songs.len(), 2);
+        assert_eq!(songs[0].attributes.name, "Get Lucky");
+        let track = songs[0].to_track();
+        assert_eq!(track.id, "617154366");
+        assert_eq!(track.artist, "Daft Punk, Pharrell Williams & Nile Rodgers");
+        assert!(track.duration_ms > 0);
+
+        let albums = &raw.results.albums.data;
+        assert_eq!(albums.len(), 1);
+        let album = albums[0].to_album();
+        assert_eq!(album.name, "Starboy");
+        assert_eq!(album.track_count, 18);
+        assert!(album.artwork.as_deref().unwrap().ends_with("600x600bb.jpg"));
+
+        let artists = &raw.results.artists.data;
+        assert_eq!(artists.len(), 1);
+        let artist = artists[0].to_artist();
+        assert_eq!(artist.name, "Daft Punk");
+        assert_eq!(artist.genres, "Dance");
+        assert!(artist.artwork_obj.is_some());
+    }
+
+    #[test]
+    fn album_tracks_fixture_parses_and_reports_next_offset() {
+        let raw: RawGroup = decoded("album_tracks.json");
+        assert_eq!(raw.data.len(), 3);
+        assert_eq!(raw.data[0].attributes.name, "Starboy (feat. Daft Punk)");
+        assert_eq!(raw.data[0].attributes.track_number, 1);
+        assert_eq!(raw.data[0].attributes.disc_number, 1);
+        assert_eq!(
+            raw.next.as_deref().and_then(parse_next_offset),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn artist_fixture_parses_detail_and_top_songs() {
+        let raw: RawArtistResp = decoded("artist.json");
+        let a = &raw.data[0];
+        assert_eq!(a.id, "5468295");
+        assert_eq!(a.attributes.name, "Daft Punk");
+        assert_eq!(a.attributes.genre_names, vec!["Dance"]);
+        assert_eq!(a.views.top_songs.data.len(), 3);
+        let top: Vec<Track> = a.views.top_songs.data.iter().map(|r| r.to_track()).collect();
+        assert_eq!(top[1].name, "Get Lucky");
+        assert_eq!(top[1].album, "Random Access Memories");
+        assert_eq!(
+            a.views.top_songs.next.as_deref().and_then(parse_next_offset),
+            Some(10)
+        );
+
+        let art = a.artwork_obj().expect("artist artwork");
+        assert_eq!(art.default_crop_code.as_deref(), Some("bb"));
+        assert_eq!(art.width, Some(2909));
+        assert!(art.url(1000, 1000).ends_with("1000x1000bb.jpg"));
+    }
+
+    #[test]
+    fn library_playlists_fixture_parses_optional_fields() {
+        let raw: RawLibraryResp = decoded("library_playlists.json");
+        let lists: Vec<LibraryPlaylist> = raw.data.iter().map(|r| r.to_playlist()).collect();
+        assert_eq!(lists.len(), 2);
+
+        assert_eq!(lists[0].id, "p.FIXTURE00000001");
+        assert_eq!(lists[0].name, "Road Trip");
+        assert_eq!(lists[0].track_count, 12);
+        assert_eq!(lists[0].description, "Public-shaped fixture playlist used by offline tests.");
+        let art = lists[0].artwork.as_ref().expect("playlist artwork");
+        assert!(art.url(64, 64).ends_with("64x64bb.jpg"));
+
+        // Optional fields absent → defaults, not a parse failure.
+        assert_eq!(lists[1].name, "No Artwork, No Description");
+        assert_eq!(lists[1].track_count, 3);
+        assert_eq!(lists[1].description, "");
+        assert!(lists[1].artwork.is_none());
+
+        assert_eq!(raw.next.as_deref().and_then(parse_next_offset), Some(2));
+    }
+
+    #[test]
+    fn artwork_deserializes_with_defaults() {
+        let art: Artwork = from_value(serde_json::json!({
+            "url": "https://example.test/{w}x{h}bb.jpg",
+            "width": 1500,
+        }))
+        .unwrap();
+        assert_eq!(art.width, Some(1500));
+        assert_eq!(art.height, None);
+        assert_eq!(art.default_crop_code, None);
+        assert!(!art.has_p3);
+        assert_eq!(art.url(300, 300), "https://example.test/300x300bb.jpg");
+    }
+
+    #[test]
+    fn artwork_renders_templates_and_rendered_urls() {
+        let template = Artwork {
+            url: "https://is1.example/image/{w}x{h}bb.jpg".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            template.url(600, 600),
+            "https://is1.example/image/600x600bb.jpg"
+        );
+        assert_eq!(
+            template.url(120, 90),
+            "https://is1.example/image/120x90bb.jpg"
+        );
+
+        // {c}/{f} placeholders honour defaultCropCode / format defaults.
+        let coded = Artwork {
+            url: "https://is1.example/image/{w}x{h}{c}.{f}".into(),
+            default_crop_code: Some("sr".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            coded.url(60, 60),
+            "https://is1.example/image/60x60sr.jpg"
+        );
+        // jam/shared-listening square fit forces the letterbox crop.
+        assert_eq!(
+            coded.fit_url(60),
+            "https://is1.example/image/60x60bb.jpg"
+        );
+
+        // Percent-encoded placeholders (some payloads escape the braces).
+        let encoded = Artwork {
+            url: "https://is1.example/image/%7Bw%7Dx%7Bh%7Dbf.jpg".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            encoded.url(50, 50),
+            "https://is1.example/image/50x50bf.jpg"
+        );
+
+        // Already-rendered URLs still resize (and fit can swap the crop code).
+        let rendered = Artwork {
+            url: "https://is1.example/image/600x600sr.jpg".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            rendered.url(1200, 1200),
+            "https://is1.example/image/1200x1200sr.jpg"
+        );
+        assert_eq!(
+            rendered.fit_url(1200),
+            "https://is1.example/image/1200x1200bb.jpg"
+        );
+
+        // Empty template stays empty rather than panicking.
+        assert_eq!(Artwork::default().url(10, 10), "");
+    }
+
+    #[test]
+    fn track_artwork_url_resizes_stored_url() {
+        let t = Track {
+            id: "1".into(),
+            name: "n".into(),
+            artist: "a".into(),
+            album: "al".into(),
+            duration_ms: 1,
+            track_no: 1,
+            disc_no: 1,
+            artwork: Some("https://is1.example/image/600x600bb.jpg".into()),
+            lossless: false,
+        };
+        assert_eq!(
+            t.artwork_url(100, 100).as_deref(),
+            Some("https://is1.example/image/100x100bb.jpg")
+        );
+        assert_eq!(Track { artwork: None, ..t }.artwork_url(10, 10), None);
+    }
+
+    #[test]
+    fn api_url_absolutizes_relative_paths() {
+        assert_eq!(
+            api_url("/v1/catalog/us/artists/1/view/top-songs?offset=10"),
+            "https://amp-api.music.apple.com/v1/catalog/us/artists/1/view/top-songs?offset=10"
+        );
+        assert_eq!(
+            api_url("https://amp-api.music.apple.com/x"),
+            "https://amp-api.music.apple.com/x"
+        );
+    }
+
+    #[test]
+    fn parse_next_offset_handles_empty_and_missing() {
+        assert_eq!(parse_next_offset("/v1/me/library/playlists?l=en-US&offset=42"), Some(42));
+        assert_eq!(parse_next_offset("/v1/me/library/playlists?offset="), None);
+        assert_eq!(parse_next_offset("/v1/me/library/playlists"), None);
+    }
+}
+

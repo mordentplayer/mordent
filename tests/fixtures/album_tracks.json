@@ -1,0 +1,107 @@
+{
+ "data": [
+  {
+   "id": "1440871420",
+   "type": "songs",
+   "attributes": {
+    "albumName": "Starboy",
+    "artistName": "The Weeknd",
+    "artwork": {
+     "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e2/61/f8/e261f8c1-73db-9a7a-c89e-1068f19970e0/16UMGIM67863.rgb.jpg/{w}x{h}bb.jpg",
+     "width": 3000,
+     "height": 3000,
+     "bgColor": "121c42",
+     "hasP3": false
+    },
+    "audioTraits": [
+     "atmos",
+     "lossless",
+     "lossy-stereo",
+     "spatial"
+    ],
+    "discNumber": 1,
+    "durationInMillis": 230461,
+    "genreNames": [
+     "R&B/Soul",
+     "Music"
+    ],
+    "name": "Starboy (feat. Daft Punk)",
+    "playParams": {
+     "id": "1440871420",
+     "kind": "song"
+    },
+    "releaseDate": "2016-09-21",
+    "trackNumber": 1
+   }
+  },
+  {
+   "id": "1440871694",
+   "type": "songs",
+   "attributes": {
+    "albumName": "Starboy",
+    "artistName": "The Weeknd",
+    "artwork": {
+     "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e2/61/f8/e261f8c1-73db-9a7a-c89e-1068f19970e0/16UMGIM67863.rgb.jpg/{w}x{h}bb.jpg",
+     "width": 3000,
+     "height": 3000,
+     "bgColor": "121c42",
+     "hasP3": false
+    },
+    "audioTraits": [
+     "atmos",
+     "lossless",
+     "lossy-stereo",
+     "spatial"
+    ],
+    "discNumber": 1,
+    "durationInMillis": 249208,
+    "genreNames": [
+     "R&B/Soul",
+     "Music"
+    ],
+    "name": "Party Monster",
+    "playParams": {
+     "id": "1440871694",
+     "kind": "song"
+    },
+    "releaseDate": "2016-11-18",
+    "trackNumber": 2
+   }
+  },
+  {
+   "id": "1440871698",
+   "type": "songs",
+   "attributes": {
+    "albumName": "Starboy",
+    "artistName": "The Weeknd",
+    "artwork": {
+     "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e2/61/f8/e261f8c1-73db-9a7a-c89e-1068f19970e0/16UMGIM67863.rgb.jpg/{w}x{h}bb.jpg",
+     "width": 3000,
+     "height": 3000,
+     "bgColor": "121c42",
+     "hasP3": false
+    },
+    "audioTraits": [
+     "atmos",
+     "lossless",
+     "lossy-stereo",
+     "spatial"
+    ],
+    "discNumber": 1,
+    "durationInMillis": 220309,
+    "genreNames": [
+     "R&B/Soul",
+     "Music"
+    ],
+    "name": "False Alarm",
+    "playParams": {
+     "id": "1440871698",
+     "kind": "song"
+    },
+    "releaseDate": "2016-11-25",
+    "trackNumber": 3
+   }
+  }
+ ],
+ "next": "/v1/catalog/us/albums/1440871397/tracks?l=en-US&offset=3"
+}
