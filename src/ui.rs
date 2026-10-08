@@ -84,6 +84,23 @@ enum AlbumJob {
     Queue { id: String },
 }
 
+/// What kind of source application [`App::play_now_at`] performs: it decides
+/// both the report segment semantics and the pause state on arrival.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum PlayKind {
+    /// User-initiated fresh segment (click-replace, album/queue/row play,
+    /// ⏭/⏮ to another entry): PLAY_START at 0; audible unless the user had
+    /// explicitly paused right before.
+    NewSegment,
+    /// Natural-end handover to the next queue entry: PLAY_START at 0;
+    /// always audible.
+    AutoAdvance,
+    /// Reposition inside the current track (seek bar, ±5 s, ⏮ restart):
+    /// no PLAY_START (the segment continues, or the resume opens it); the
+    /// exact pre-seek pause state is restored.
+    SeekRestart,
+}
+
 /// Open album detail modal.
 struct AlbumModal {
     album: AlbumHit,
@@ -220,8 +237,10 @@ pub struct App {
     /// Sink-mode playback starts at this offset (pre-seek samples were
     /// discarded by the worker).
     play_offset: std::time::Duration,
-    /// Re-pause the sink when a seek restart lands.
-    resume_paused: bool,
+    /// Pause state the next applied source must start with (see
+    /// [`applied_source_pause_state`]). `None` once consumed or when the user
+    /// acted in between (their action then wins over the pending decision).
+    arrival_paused: Option<bool>,
     repeat: Repeat,
     shuffle: bool,
     /// Album being fetched, and what to do with its tracks.
@@ -317,7 +336,7 @@ impl App {
             fake_play: None,
             fake_pause_at: None,
             play_offset: std::time::Duration::ZERO,
-            resume_paused: false,
+            arrival_paused: None,
             repeat: match state.repeat.as_deref() {
                 Some("all") => Repeat::All,
                 Some("one") => Repeat::One,
@@ -630,22 +649,46 @@ impl App {
     /// Play a track immediately at `offset`: cancels whatever is
     /// current/preparing by bumping the generation. Queue/pointer changes are
     /// the caller's job; this only owns audio, `now` and the START report.
-    fn play_now_at(&mut self, track: Track, offset: std::time::Duration) {
-        eprintln!("[play] {} — {}", track.name, track.artist);
+    /// `kind` decides the report segment semantics and the pause state the
+    /// source starts with on arrival.
+    fn play_now_at(&mut self, track: Track, offset: std::time::Duration, kind: PlayKind) {
+        match kind {
+            PlayKind::SeekRestart => {
+                // a seek restart, not a new play — log it distinctly so a
+                // seek is never mistaken for a second dispatch
+                eprintln!(
+                    "[play] {} — {} (seek → {})",
+                    track.name,
+                    track.artist,
+                    fmt_ms(offset.as_millis() as u64)
+                );
+            }
+            PlayKind::NewSegment | PlayKind::AutoAdvance => {
+                eprintln!("[play] {} — {}", track.name, track.artist);
+                self.report_start(&track, 0);
+            }
+        }
         self.preparing = true;
         self.now = Some(track.clone());
         self.play_offset = offset;
-        // offset == 0 → a fresh segment (click-replace / advance / ⏮ landed
-        // here after their outgoing END). offset > 0 is a seek restart: the
-        // segment continues (seek_to already emitted the scrub pair).
-        if offset.is_zero() {
-            self.report_start(&track, 0);
-        }
+        let pre_pause = if self.player.decode_only {
+            self.fake_pause_at.is_some()
+        } else {
+            self.player.sink().is_some_and(|s| s.is_paused())
+        };
+        let arrival_paused =
+            applied_source_pause_state(pre_pause, kind != PlayKind::AutoAdvance, kind == PlayKind::AutoAdvance);
         self.fake_play = None;
-        self.fake_pause_at = None;
-        self.resume_paused = self.player.sink().is_some_and(|s| s.is_paused());
+        self.fake_pause_at = arrival_paused.then(std::time::Instant::now);
+        self.arrival_paused = Some(arrival_paused);
         if let Some(s) = self.player.sink() {
+            // rodio 0.20 `Sink::clear()` also pauses the sink; restore the
+            // arrival state right away so the appended source is audible
+            // unless paused-on-arrival is exactly what the user asked for.
             s.clear();
+            if !arrival_paused {
+                s.play();
+            }
         }
         self.generation += 1;
         let generation = self.generation;
@@ -682,7 +725,7 @@ impl App {
         let pos = self.report_pos_ms();
         self.report_end(PlayEvent::END_REPLACED, pos);
         self.queue.insert_after_current(vec![track.clone()]);
-        self.play_now_at(track, std::time::Duration::ZERO);
+        self.play_now_at(track, std::time::Duration::ZERO, PlayKind::NewSegment);
     }
 
     // ---- favorites ----
@@ -754,7 +797,7 @@ impl App {
         let idle_finished = self.now.is_none();
         if let Some(idx) = self.queue.append(new, idle_finished) {
             let t = self.queue.tracks[idx].clone();
-            self.play_now_at(t, std::time::Duration::ZERO);
+            self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
         }
     }
 
@@ -770,7 +813,7 @@ impl App {
         self.report_end(PlayEvent::END_REPLACED, pos);
         let first = tracks[0].clone();
         self.queue.insert_after_current(tracks);
-        self.play_now_at(first, std::time::Duration::ZERO);
+        self.play_now_at(first, std::time::Duration::ZERO, PlayKind::NewSegment);
     }
 
     fn spawn_album_fetch(&mut self, id: String, name: String) {
@@ -880,6 +923,8 @@ impl App {
         } else {
             self.player.toggle_pause();
         }
+        // the user just acted — a pending source must not override the new state
+        self.arrival_paused = None;
         // pause closes the segment (3); resume opens one at the paused
         // position (hint 0 — same container)
         let pos = self.report_pos_ms();
@@ -908,7 +953,7 @@ impl App {
         self.player.skip();
         self.queue.play_at(next);
         let t = self.queue.tracks[next].clone();
-        self.play_now_at(t, std::time::Duration::ZERO);
+        self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
     }
 
     /// Natural end of the current track: move the pointer (repeat-one
@@ -929,7 +974,7 @@ impl App {
         };
         if let Some(i) = next {
             let t = self.queue.tracks[i].clone();
-            self.play_now_at(t, std::time::Duration::ZERO);
+            self.play_now_at(t, std::time::Duration::ZERO, PlayKind::AutoAdvance);
         } else {
             self.stop_playback();
         }
@@ -946,7 +991,11 @@ impl App {
         self.play_offset = std::time::Duration::ZERO;
         if let Some(s) = self.player.sink() {
             s.clear();
+            // rodio 0.20 `Sink::clear()` also pauses the sink; nothing is
+            // playing here, so leave the flag clean for the next application
+            s.play();
         }
+        self.arrival_paused = None;
     }
 
     /// ⏮: restart current if >3s elapsed, else the previous entry (pointer-1);
@@ -966,7 +1015,7 @@ impl App {
         self.report_end(PlayEvent::END_SKIPPED_BACKWARDS, pos);
         self.queue.play_at(prev);
         let t = self.queue.tracks[prev].clone();
-        self.play_now_at(t, std::time::Duration::ZERO);
+        self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
     }
 
     /// Click-to-seek / ±5s. Sink mode restarts the stream at the offset;
@@ -981,9 +1030,14 @@ impl App {
         // Scrub while PLAYING: END(12, old pos) then END(13, new pos) and the
         // segment continues at the new position without a new START. Seeking
         // while paused only repositions — the resume START lands there.
-        if self.report_open && !self.is_paused() {
-            let old = self.report_pos_ms();
-            self.report_scrub(old, target.as_millis() as u64);
+        let old = self.report_pos_ms();
+        if let Some((o, n)) = seek_scrub_events(
+            self.report_open,
+            !self.is_paused(),
+            old,
+            target.as_millis() as u64,
+        ) {
+            self.report_scrub(o, n);
         }
         if self.player.decode_only {
             let now = std::time::Instant::now();
@@ -995,7 +1049,7 @@ impl App {
             self.play_offset = target;
         } else if self.now.is_some() {
             let t = self.now.clone().expect("checked above");
-            self.play_now_at(t, target);
+            self.play_now_at(t, target, PlayKind::SeekRestart);
         }
     }
 
@@ -1022,6 +1076,8 @@ impl App {
                 s.pause();
             }
         }
+        // the user just acted — a pending source must not override the new state
+        self.arrival_paused = None;
         if playing {
             let pos = self.report_pos_ms();
             self.report_end(PlayEvent::END_PAUSED, pos);
@@ -1318,12 +1374,15 @@ impl App {
                     if g == self.generation {
                         self.player.enqueue(*src);
                         self.preparing = false;
-                        if self.resume_paused {
-                            if let Some(s) = self.player.sink() {
-                                s.pause();
-                            }
-                            self.resume_paused = false;
+                        // enforce the planned arrival pause state; `None` means
+                        // the user acted during preparation and their action
+                        // (already applied to the sink) must not be overridden
+                        if let Some(true) = self.arrival_paused
+                            && let Some(s) = self.player.sink()
+                        {
+                            s.pause();
                         }
+                        self.arrival_paused = None;
                         // start the decode-only fake clock (keep a seek target);
                         // tuple = (clock start, elapsed-at-end)
                         if self.player.decode_only
@@ -1572,8 +1631,11 @@ impl App {
                 4 => {
                     if matches(&st.expect[2]) && self.queue.len() == 4 && self.queue.pos == Some(3) {
                         eprintln!("[selftest] stage4 PASS (now={now_name:?}, queue={})", self.queue.len());
-                        eprintln!("[selftest] RESULT: PASS");
-                        std::process::exit(0);
+                        // stages 6-8 verify the pause mirror (seek restarts
+                        // restore the pre-seek pause state; a paused replace
+                        // lands paused) and then finish the run
+                        st.stage = 6;
+                        st.started = std::time::Instant::now();
                     } else if elapsed > std::time::Duration::from_secs(15) {
                         eprintln!(
                             "[selftest] stage4 FAIL (now={now_name:?}, want {:?}, queue={} pos={:?})",
@@ -1584,6 +1646,18 @@ impl App {
                         eprintln!("[selftest] RESULT: FAIL");
                         std::process::exit(1);
                     }
+                }
+                // stages 6-8: wait for the current source to land; the actual
+                // steps run outside this borrow (below), like trigger (b).
+                // Only the timeout is handled here.
+                6..=8 if elapsed > std::time::Duration::from_secs(15) => {
+                    eprintln!(
+                        "[selftest] stage{} FAIL (now={now_name:?}, preparing={})",
+                        st.stage,
+                        self.preparing
+                    );
+                    eprintln!("[selftest] RESULT: FAIL");
+                    std::process::exit(1);
                 }
                 _ => {}
             }
@@ -1597,6 +1671,54 @@ impl App {
                 st.stage = 4;
                 st.started = std::time::Instant::now();
             }
+        }
+        // triggers (c)-(e), outside the selftest borrow: the pause-mirror
+        // stages. In decode-only mode the mirror is the fake clock; on a real
+        // sink it is the sink's pause flag — the same assertions cover both.
+        match self.selftest.as_ref().map(|st| st.stage) {
+            // (c) stage 6: pause, then a seek restart — the exact pre-seek
+            // pause state must be restored; resuming must be audible.
+            Some(6) if !self.preparing => {
+                self.pause_now();
+                self.seek_to(std::time::Duration::ZERO);
+                let ok_seek = self.is_paused() && self.now.is_some();
+                self.toggle_pause_now();
+                let ok_resume = !self.is_paused();
+                if let Some(st) = &mut self.selftest {
+                    st.started = std::time::Instant::now();
+                    if ok_seek && ok_resume {
+                        eprintln!("[selftest] stage6 PASS (seek restores pause; resume plays)");
+                        st.stage = 7;
+                    } else {
+                        eprintln!("[selftest] stage6 FAIL (seek_paused={ok_seek} resume_playing={ok_resume})");
+                        eprintln!("[selftest] RESULT: FAIL");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // (d) stage 7: replace the current track while PAUSED.
+            Some(7) if !self.preparing => {
+                self.pause_now();
+                let t = self.results.as_ref().expect("checked").tracks[2].clone();
+                self.play_now(t);
+                if let Some(st) = &mut self.selftest {
+                    st.stage = 8;
+                    st.started = std::time::Instant::now();
+                }
+            }
+            // (e) stage 8: the replacement must land PAUSED (paused-on-arrival
+            // is correct when the user had explicitly paused); resuming plays.
+            Some(8) if !self.preparing => {
+                let landed_paused = self.is_paused();
+                self.toggle_pause_now();
+                let resume_plays = !self.is_paused();
+                if landed_paused && resume_plays {
+                    eprintln!("[selftest] stage8 PASS (paused replace lands paused; resume plays)");
+                    eprintln!("[selftest] RESULT: PASS");
+                    std::process::exit(0);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2513,7 +2635,7 @@ impl App {
         let pos = self.report_pos_ms();
         self.report_end(PlayEvent::END_REPLACED, pos);
         let t = self.queue.tracks[i].clone();
-        self.play_now_at(t, std::time::Duration::ZERO);
+        self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
     }
 
     /// Queue-row ✕: the pointer-aware removal decides what happens to
@@ -2526,7 +2648,7 @@ impl App {
                 self.report_end(PlayEvent::END_SKIPPED_FORWARDS, pos);
                 self.player.skip();
                 let t = self.queue.tracks[j].clone();
-                self.play_now_at(t, std::time::Duration::ZERO);
+                self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
             }
             RemoveEffect::Stopped => {
                 let pos = self.report_pos_ms();
@@ -2986,6 +3108,39 @@ fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
         .cmp(b.chars().flat_map(char::to_lowercase))
 }
 
+/// Pause state a freshly applied source must start with (pure; unit-tested).
+///
+/// * `pre_pause` — did the user explicitly pause right before this application
+/// * `user_initiated` — click/shortcut/MPRIS replace or seek (vs programmatic)
+/// * `auto_advance` — natural-end handover to the next queue entry
+///
+/// | transition                        | audible on arrival?    |
+/// |-----------------------------------|------------------------|
+/// | auto-advance (any)                | yes                    |
+/// | replace/seek, user was playing    | yes                    |
+/// | replace/seek, user was paused     | no (paused-on-arrival) |
+///
+/// Callers must apply the decision both at application time (rodio 0.20's
+/// `Sink::clear()` also pauses the sink — undo it unless `true` is returned)
+/// and on source arrival.
+fn applied_source_pause_state(pre_pause: bool, _user_initiated: bool, auto_advance: bool) -> bool {
+    !auto_advance && pre_pause
+}
+
+/// Whether a user seek emits the scrub pair (pure; unit-tested): END(12) at
+/// the old position + END(13) at the new one — only while a segment is open
+/// AND audibly playing (Cider: the segment continues, no new START). A paused
+/// seek repositions silently; the pause already closed the segment and the
+/// resume START carries the seeked position. Returns the positions to report.
+fn seek_scrub_events(
+    report_open: bool,
+    playing: bool,
+    old_ms: u64,
+    new_ms: u64,
+) -> Option<(u64, u64)> {
+    (report_open && playing).then_some((old_ms, new_ms))
+}
+
 fn fmt_ms(ms: u64) -> String {
     format!("{}:{:02}", ms / 60000, (ms % 60000) / 1000)
 }
@@ -3142,5 +3297,50 @@ mod dnd_tests {
         assert_eq!(slot, 2); // among a, c → after them
         move_to(&mut v, 1, slot);
         assert_eq!(s(&v), "acbd");
+    }
+}
+
+#[cfg(test)]
+mod pause_state_tests {
+    use super::{applied_source_pause_state, seek_scrub_events, PlayKind};
+
+    #[test]
+    fn auto_advance_always_lands_audible() {
+        assert!(!applied_source_pause_state(false, true, true));
+        assert!(!applied_source_pause_state(true, true, true));
+        assert!(!applied_source_pause_state(true, false, true));
+    }
+
+    #[test]
+    fn replace_and_seek_restore_the_pre_action_pause_state() {
+        // user was playing → the new source is audible on arrival
+        assert!(!applied_source_pause_state(false, true, false));
+        // user had explicitly paused → paused-on-arrival is correct
+        assert!(applied_source_pause_state(true, true, false));
+    }
+
+    #[test]
+    fn seek_restart_is_distinct_from_fresh_segments() {
+        // only SeekRestart skips the PLAY_START; a seek-to-zero restart must
+        // not re-START the way an offset==0 fresh segment does
+        assert_ne!(PlayKind::SeekRestart, PlayKind::NewSegment);
+        assert_ne!(PlayKind::SeekRestart, PlayKind::AutoAdvance);
+        assert_ne!(PlayKind::NewSegment, PlayKind::AutoAdvance);
+    }
+
+    #[test]
+    fn scrub_pair_only_while_open_and_playing() {
+        // seek while playing: END(12) at the old pos, END(13) at the new one,
+        // and NO new START (the segment continues)
+        assert_eq!(
+            seek_scrub_events(true, true, 7_971, 146_956),
+            Some((7_971, 146_956))
+        );
+        // seek while paused: the pause already closed the segment — emit
+        // nothing; the resume START carries the seeked position
+        assert_eq!(seek_scrub_events(true, false, 7_971, 146_956), None);
+        // no open segment (gates closed, or nothing reported yet): nothing
+        assert_eq!(seek_scrub_events(false, true, 0, 1_000), None);
+        assert_eq!(seek_scrub_events(false, false, 0, 1_000), None);
     }
 }
