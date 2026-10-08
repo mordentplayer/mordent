@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// symphonia. Blocks on reads when the download frontier catches up — that
 /// pacing is what streams audio in lockstep with the fetch worker.
 pub struct PacketSource {
-    reader: Box<dyn Read + Send + 'static>,
+    reader: Box<dyn Read + Send>,
     decoder: Box<dyn symphonia::core::codecs::Decoder>,
     /// f32 interleaved samples pending output.
     pending: Vec<f32>,
@@ -19,9 +19,20 @@ pub struct PacketSource {
     pub sample_rate: u32,
     pub channels: usize,
     pub frames_decoded: u64,
+    /// Set on drop so the fetch worker of a skipped source stops early.
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl PacketSource {
+    pub fn with_cancel(
+        reader: Box<dyn Read + Send>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self> {
+        let mut s = Self::new(reader)?;
+        s.cancel = Some(cancel);
+        Ok(s)
+    }
+
     pub fn new(mut reader: Box<dyn Read + Send>) -> Result<Self> {
         // init: ftyp + moov
         let mut init_raw = Vec::new();
@@ -55,6 +66,7 @@ impl PacketSource {
             sample_rate: alac.sample_rate,
             channels: alac.channels as usize,
             frames_decoded: 0,
+            cancel: None,
         })
     }
 

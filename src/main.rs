@@ -226,13 +226,33 @@ fn cmd_library(cfg: &config::Config, rest: &[String]) -> Result<()> {
 fn cmd_play(cfg: &config::Config, term: &str) -> Result<()> {
     use std::io::Write;
 
-    let api = api::Api::new(cfg.clone())?;
-    let track = api
-        .search(term, 1)?
-        .tracks
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no results for {term:?}"))?;
+    // direct id / URL: play that track instead of searching (6+ digit ids —
+    // shorter all-digit queries stay searches)
+    let looks_id = term.contains("music.apple.com")
+        || (term.chars().all(|c| c.is_ascii_digit()) && term.len() >= 6);
+    let track = if looks_id {
+        let id = api::id_from_arg(term)?;
+        api::Api::new(cfg.clone())?
+            .search_by_id(&id)?
+            .unwrap_or_else(|| api::Track {
+                id: id.clone(),
+                name: format!("track {id}"),
+                artist: String::new(),
+                album: String::new(),
+                duration_ms: 0,
+                track_no: 0,
+                disc_no: 0,
+                artwork: None,
+                lossless: false,
+            })
+    } else {
+        api::Api::new(cfg.clone())?
+            .search(term, 1)?
+            .tracks
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no results for {term:?}"))?
+    };
     println!("▶ {} — {} [{}]", track.name, track.artist, track.id);
 
     let w = wrapper::Wrapper::new(&cfg.wrapper_url);
@@ -247,7 +267,7 @@ fn cmd_play(cfg: &config::Config, term: &str) -> Result<()> {
         println!("  mode: full ALAC stream via wrapper");
         stream::ProgressiveSource::start_fairplay(plan, &resolver, cache, agent)?
     } else {
-        let url = api.preview_url(&track.id)?;
+        let url = api::Api::new(cfg.clone())?.preview_url(&track.id)?;
         println!("  mode: 90s preview (wrapper not logged in)");
         stream::ProgressiveSource::start_plain(&url, cache, agent)?
     };

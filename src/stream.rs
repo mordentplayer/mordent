@@ -192,6 +192,7 @@ pub struct ProgressiveSource {
     sh: Arc<Mutex<Shared>>,
     cv: Arc<Condvar>,
     pos: Mutex<u64>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProgressiveSource {
@@ -248,6 +249,13 @@ impl ProgressiveSource {
         }
     }
 
+    /// A shared flag that tells the fetch worker to stop early. Dropping a
+    /// PacketSource wrapping this source sets it, so a skipped track stops
+    /// downloading in the background.
+    pub fn cancel_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
     /// True when the fetch worker finished (clean EOF) or failed (Err).
     pub fn is_done(&self) -> Result<bool> {
         let g = self.sh.lock();
@@ -266,8 +274,10 @@ impl ProgressiveSource {
     pub fn start_plain(url: &str, cache_file: PathBuf, agent: ureq::Agent) -> Result<Self> {
         let sh = Self::shared(&cache_file)?;
         let cv = Arc::new(Condvar::new());
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wsh = sh.clone();
         let wcv = cv.clone();
+        let wcancel = Arc::clone(&cancel);
         let url = url.to_string();
         std::thread::Builder::new().name("amc-fetch".into()).spawn(move || {
             let run = || -> Result<()> {
@@ -275,6 +285,9 @@ impl ProgressiveSource {
                 let mut buf = [0u8; 64 * 1024];
                 let mut r = resp.into_reader();
                 loop {
+                    if wcancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     let n = r.read(&mut buf)?;
                     if n == 0 {
                         break;
@@ -289,6 +302,7 @@ impl ProgressiveSource {
             sh,
             cv,
             pos: Mutex::new(0),
+            cancel: Arc::clone(&cancel),
         };
         src.wait_available(1)?;
         Ok(src)
@@ -303,8 +317,10 @@ impl ProgressiveSource {
     ) -> Result<Self> {
         let sh = Self::shared(&cache_file)?;
         let cv = Arc::new(Condvar::new());
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wsh = sh.clone();
         let wcv = cv.clone();
+        let wcancel = Arc::clone(&cancel);
 
         // pre-resolve the first key's template off-thread is unnecessary;
         // worker resolves lazily per key change.
@@ -392,6 +408,9 @@ impl ProgressiveSource {
                         Some(m) => m,
                         None => bail!("mdat without moof"),
                     };
+                    if wcancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     let key_uri = plan.keys.get(frag_idx).cloned().flatten();
                     if let Some(uri) = key_uri {
                         cur_tmpl = templates
@@ -416,6 +435,7 @@ impl ProgressiveSource {
             sh,
             cv,
             pos: Mutex::new(0),
+            cancel: Arc::clone(&cancel),
         };
         // wait for the container header so probing can start
         src.wait_available(1)?;

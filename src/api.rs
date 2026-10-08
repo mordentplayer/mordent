@@ -365,6 +365,16 @@ impl Api {
         Ok(raw.data.iter().map(|r| r.to_track()).collect())
     }
 
+    /// Fetch a single catalog song by adamId.
+    pub fn search_by_id(&self, id: &str) -> Result<Option<Track>> {
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/catalog/{}/songs/{id}?l=en-US",
+            self.cfg.storefront
+        );
+        let raw: RawGroup = from_value(self.get_json_retry(&url)?)?;
+        Ok(raw.data.first().map(|r| r.to_track()))
+    }
+
     /// 90-second unencrypted preview URL for a track (anonymous playback).
     pub fn preview_url(&self, id: &str) -> Result<String> {
         let url = format!(

@@ -14,6 +14,7 @@ parking_lot = "0.12"
 rodio = "0.20"
 symphonia = { version = "0.5", default-features = false, features = ["aac", "alac", "isomp4", "mpa", "pcm"] }
 eframe = "=0.32.3"
+log = "0.4.34"
 
 [profile.release]
 lto = "thin"

@@ -164,6 +164,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
+ "log",
  "parking_lot",
  "rodio",
  "serde",
