@@ -1,3 +1,4 @@
+mod acache;
 mod api;
 mod config;
 mod player;
@@ -21,6 +22,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let cfg = config::Config::load()?;
+    // TTL-clean the metadata cache once per process (audio cache is
+    // budget-managed per play attempt).
+    api::clean_meta_cache(&cfg);
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
         usage();
@@ -259,23 +263,8 @@ fn cmd_play(cfg: &config::Config, term: &str) -> Result<()> {
     };
     println!("▶ {} — {} [{}]", track.name, track.artist, track.id);
 
-    let w = wrapper::Wrapper::new(&cfg.wrapper_url);
-    let logged_in = w.regions().map(|r| !r.is_empty()).unwrap_or(false);
-    let agent = ureq::AgentBuilder::new().build();
-    let cache = config::cache_path(cfg, &format!("tracks/{}.m4a", track.id))?;
-
     let t0 = std::time::Instant::now();
-    let prog = if logged_in {
-        let plan = stream::plan_for_track(&w, &agent, &track.id)?;
-        let resolver = stream::KeyResolver::new(&w, &track.id);
-        println!("  mode: full ALAC stream via wrapper");
-        stream::ProgressiveSource::start_fairplay(plan, &resolver, cache, agent)?
-    } else {
-        let url = api::Api::new(cfg.clone())?.preview_url(&track.id)?;
-        println!("  mode: 90s preview (wrapper not logged in)");
-        stream::ProgressiveSource::start_plain(&url, cache, agent)?
-    };
-    println!("  stream header in {:.1?}", t0.elapsed());
+    let (prog, _mode) = stream::open_track(cfg, &track.id)?;
 
     let player = player::Player::new();
     let mut src = player::PacketSource::new(Box::new(prog))?;
@@ -316,7 +305,7 @@ fn cmd_decrypt(cfg: &config::Config, id: &str, out: &str) -> Result<()> {
     println!("plan ready in {:.1?}: {} ({} fragments)", t0.elapsed(), plan.file_url, plan.keys.len());
     let resolver = stream::KeyResolver::new(&w, id);
     let cache = std::path::PathBuf::from(out);
-    let src = stream::ProgressiveSource::start_fairplay(plan, &resolver, cache, agent)?;
+    let src = stream::ProgressiveSource::start_fairplay(plan, &resolver, cache, agent, None)?;
     println!("first bytes in {:.1?}", t0.elapsed());
 
     // wait for EOF by polling the frontier

@@ -16,6 +16,10 @@ pub struct Config {
     /// Report plays to Apple's Universal Activity Service (Recently Played /
     /// play counts). Default true when the key is absent.
     pub report_plays: bool,
+    /// Audio-cache budget in GiB. Whole track dirs are evicted
+    /// oldest-last-played first. 0 disables the audio cache (the metadata
+    /// cache is unaffected and TTL-cleaned on startup).
+    pub cache_size_gb: u64,
 }
 
 impl Default for Config {
@@ -26,6 +30,7 @@ impl Default for Config {
             media_user_token: None,
             cache_dir: home().join(".cache/amc"),
             report_plays: true,
+            cache_size_gb: 10,
         }
     }
 }
@@ -70,10 +75,12 @@ fn default_toml(cfg: &Config) -> String {
          wrapper_url = \"{}\"\n\
          media_user_token = \"\"\n\
          cache_dir = \"{}\"\n\
-         report_plays = true\n",
+         report_plays = true\n\
+         cache_size_gb = {}\n",
         cfg.storefront,
         cfg.wrapper_url,
-        cfg.cache_dir.display()
+        cfg.cache_dir.display(),
+        cfg.cache_size_gb
     )
 }
 
@@ -98,4 +105,26 @@ pub fn fresh(path: &Path, max_age_secs: u64) -> bool {
         .elapsed()
         .map(|e| e.as_secs() < max_age_secs)
         .unwrap_or(false)
+}
+
+/// Unix seconds now. Injected as a plain `u64` everywhere a cache needs a
+/// clock so freshness/eviction decisions stay pure and testable.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Stable 128-bit FNV-1a (two independent lanes) as hex — cache-file key
+/// material for URLs / key URIs. Hand-rolled to avoid a hash crate.
+pub fn fnv128(data: &[u8]) -> String {
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x2545_f491_4f6c_dd1d;
+    for &b in data {
+        h1 = (h1 ^ b as u64).wrapping_mul(PRIME);
+        h2 = (h2 ^ (b as u64).rotate_left(17)).wrapping_mul(PRIME);
+    }
+    format!("{h1:016x}{h2:016x}")
 }
