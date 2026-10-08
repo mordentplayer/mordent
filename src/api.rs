@@ -372,10 +372,16 @@ pub struct Api {
 
 impl Api {
     pub fn new(cfg: Config) -> Result<Self> {
+        Self::with_timeouts(cfg, Duration::from_secs(5), Duration::from_secs(20))
+    }
+
+    /// Api with custom timeouts; the play reporter uses a shorter budget so
+    /// app exit never blocks long on the final report POST.
+    pub fn with_timeouts(cfg: Config, connect: Duration, total: Duration) -> Result<Self> {
         cfg.ensure_cache_dir()?;
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
+            .timeout_connect(connect)
+            .timeout(total)
             .user_agent(UA)
             .build();
         Ok(Self {
@@ -666,6 +672,254 @@ impl Api {
             })
             .collect())
     }
+
+    /// POST play-activity events to Apple's Universal Activity Service
+    /// (`JSPLAY` channel). The web player sends ONE event per POST; do the
+    /// same (pass a one-element slice per call). Best-effort by contract —
+    /// the caller swallows failures, there is no retry.
+    pub fn report_activity(&self, events: &[PlayEvent]) -> Result<()> {
+        const URL: &str = "https://universal-activity-service.itunes.apple.com/play";
+        let bearer = self.bearer()?;
+        let mut req = self
+            .agent
+            .post(URL)
+            .set("content-type", "application/json")
+            .set("Authorization", &format!("Bearer {bearer}"))
+            .set("origin", "https://music.apple.com")
+            .set("referer", "https://music.apple.com/");
+        if let Some(t) = &self.cfg.media_user_token {
+            if !t.is_empty() {
+                req = req.set("media-user-token", t);
+            }
+        }
+        req.send_json(JsPlayBody {
+            client_id: "JSCLIENT",
+            event_type: "JSPLAY",
+            data: events,
+        })
+        .with_context(|| format!("POST {URL}"))?
+        .into_string()
+        .with_context(|| format!("body of {URL}"))?;
+        Ok(())
+    }
+}
+
+// ---- play reporting (universal-activity-service JSPLAY wire shapes) ----
+
+/// Body `build-version` mirroring the Windows web player; not validated
+/// server-side but kept byte-identical to the observed payload.
+pub const REPORT_BUILD_VERSION: &str =
+    "AppleMusic/1.0 Windows/nt 10.0; win64; x64 model/Win32 build/2626.2.0-external";
+/// Body `user-agent` (a *body field* of every report, not the HTTP header).
+pub const REPORT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+
+/// `play-mode` triple. Values as sent by music.apple.com: repeat
+/// 1 = off / 2 = all / 3 = one, shuffle 1 = off / 2 = on, auto
+/// 1 = no autoplay-after-queue / 2 = autoplay enabled.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlayMode {
+    #[serde(rename = "auto-play-mode")]
+    pub auto: u8,
+    #[serde(rename = "repeat-play-mode")]
+    pub repeat: u8,
+    #[serde(rename = "shuffle-play-mode")]
+    pub shuffle: u8,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PlayIds {
+    /// Numeric catalog adam id as a STRING (never a `i.`/`l.` library id).
+    #[serde(rename = "subscription-adam-id")]
+    pub subscription_adam_id: String,
+    #[serde(rename = "cloud-id", skip_serializing_if = "Option::is_none")]
+    pub cloud_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ContainerIds {
+    #[serde(rename = "album-adam-id")]
+    pub album_adam_id: String,
+}
+
+/// One JSPLAY `data[]` element. Field names are Apple's hyphenated wire
+/// names; START-only / END-only / optional fields are Options so exactly the
+/// expected key set serializes.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlayEvent {
+    #[serde(rename = "build-version")]
+    pub build_version: String,
+    #[serde(rename = "developer-token")]
+    pub developer_token: String,
+    /// 1 = PLAY_START, 0 = PLAY_END.
+    #[serde(rename = "event-type")]
+    pub event_type: u8,
+    pub ids: PlayIds,
+    #[serde(rename = "internal-build")]
+    pub internal_build: bool,
+    #[serde(rename = "media-duration-in-milliseconds")]
+    pub media_duration_ms: u64,
+    /// 0 = audio, 1 = video.
+    #[serde(rename = "media-type")]
+    pub media_type: u8,
+    #[serde(rename = "milliseconds-since-play")]
+    pub milliseconds_since_play: u64,
+    pub offline: bool,
+    /// Fresh random 16-hex per event (rotated by the reporter at send time).
+    #[serde(rename = "persistent-id")]
+    pub persistent_id: String,
+    #[serde(rename = "play-mode")]
+    pub play_mode: PlayMode,
+    #[serde(rename = "private-enabled")]
+    pub private_enabled: bool,
+    #[serde(rename = "sb-enabled")]
+    pub sb_enabled: bool,
+    #[serde(rename = "siri-initiated")]
+    pub siri_initiated: bool,
+    /// 16 = WEB_APP.
+    #[serde(rename = "source-type")]
+    pub source_type: u8,
+    #[serde(rename = "start-position-in-milliseconds")]
+    pub start_position_ms: u64,
+    /// Lowercased storefront.
+    #[serde(rename = "store-front")]
+    pub store_front: String,
+    /// 1 = ITUNES_STORE_CONTENT, 4 = STREAM (live radio).
+    #[serde(rename = "type")]
+    pub item_type: u8,
+    #[serde(rename = "user-agent")]
+    pub user_agent: String,
+    #[serde(rename = "user-token")]
+    pub user_token: String,
+    /// Seconds EAST of UTC (US timezones send negative values).
+    #[serde(rename = "utc-offset-in-seconds")]
+    pub utc_offset_seconds: i32,
+    /// START only: 0 = not specified, 1 = container changed.
+    #[serde(
+        rename = "event-reason-hint-type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub event_reason_hint_type: Option<u8>,
+    /// END only.
+    #[serde(
+        rename = "end-position-in-milliseconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end_position_ms: Option<u64>,
+    /// END only: 2 skip-fwd, 3 pause, 4 suspend/stop, 5 replaced, 7 natural,
+    /// 12 scrub-begin, 13 scrub-end, 14 skip-back.
+    #[serde(rename = "end-reason-type", skip_serializing_if = "Option::is_none")]
+    pub end_reason_type: Option<u8>,
+    /// Always serialized (0 = none); ids only when the container is known.
+    #[serde(rename = "container-type")]
+    pub container_type: u8,
+    #[serde(rename = "container-ids", skip_serializing_if = "Option::is_none")]
+    pub container_ids: Option<ContainerIds>,
+}
+
+impl PlayEvent {
+    pub const EVENT_TYPE_PLAY_END: u8 = 0;
+    pub const EVENT_TYPE_PLAY_START: u8 = 1;
+    // end-reason-type
+    pub const END_SKIPPED_FORWARDS: u8 = 2;
+    pub const END_PAUSED: u8 = 3;
+    pub const END_SUSPENDED: u8 = 4;
+    pub const END_REPLACED: u8 = 5;
+    pub const END_NATURAL: u8 = 7;
+    pub const END_SCRUB_BEGIN: u8 = 12;
+    pub const END_SCRUB_END: u8 = 13;
+    pub const END_SKIPPED_BACKWARDS: u8 = 14;
+    // event-reason-hint-type
+    pub const HINT_NONE: u8 = 0;
+    pub const HINT_CONTAINER_CHANGED: u8 = 1;
+    // container-type
+    pub const CONTAINER_NONE: u8 = 0;
+    pub const CONTAINER_ALBUM: u8 = 3;
+
+    fn base(adam_id: &str, duration_ms: u64, mode: PlayMode, album_adam_id: Option<String>) -> Self {
+        Self {
+            build_version: REPORT_BUILD_VERSION.into(),
+            developer_token: String::new(),
+            event_type: 0,
+            ids: PlayIds {
+                subscription_adam_id: adam_id.to_string(),
+                cloud_id: None,
+            },
+            internal_build: false,
+            media_duration_ms: duration_ms,
+            media_type: 0,
+            milliseconds_since_play: 1,
+            offline: false,
+            persistent_id: String::new(),
+            play_mode: mode,
+            private_enabled: false,
+            sb_enabled: true,
+            siri_initiated: false,
+            source_type: 16,
+            start_position_ms: 0,
+            store_front: String::new(),
+            item_type: 1,
+            user_agent: REPORT_USER_AGENT.into(),
+            user_token: String::new(),
+            utc_offset_seconds: 0,
+            event_reason_hint_type: None,
+            end_position_ms: None,
+            end_reason_type: None,
+            container_type: if album_adam_id.is_some() {
+                Self::CONTAINER_ALBUM
+            } else {
+                Self::CONTAINER_NONE
+            },
+            container_ids: album_adam_id.map(|id| ContainerIds {
+                album_adam_id: id,
+            }),
+        }
+    }
+
+    /// A PLAY_START. `hint`: 1 when the container changed vs the previously
+    /// reported one, else 0.
+    pub fn start(
+        adam_id: &str,
+        duration_ms: u64,
+        start_position_ms: u64,
+        hint: u8,
+        mode: PlayMode,
+        album_adam_id: Option<String>,
+    ) -> Self {
+        let mut ev = Self::base(adam_id, duration_ms, mode, album_adam_id);
+        ev.event_type = Self::EVENT_TYPE_PLAY_START;
+        ev.start_position_ms = start_position_ms;
+        ev.event_reason_hint_type = Some(hint);
+        ev
+    }
+
+    /// A PLAY_END. `start_position_ms` chains from the open segment's start;
+    /// natural ends pass the full duration as `end_position_ms`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn end(
+        adam_id: &str,
+        duration_ms: u64,
+        start_position_ms: u64,
+        end_position_ms: u64,
+        reason: u8,
+        mode: PlayMode,
+        album_adam_id: Option<String>,
+    ) -> Self {
+        let mut ev = Self::base(adam_id, duration_ms, mode, album_adam_id);
+        ev.event_type = Self::EVENT_TYPE_PLAY_END;
+        ev.start_position_ms = start_position_ms;
+        ev.end_position_ms = Some(end_position_ms);
+        ev.end_reason_type = Some(reason);
+        ev
+    }
+}
+
+/// `{client_id:"JSCLIENT",event_type:"JSPLAY",data:[…]}` envelope.
+#[derive(Serialize)]
+struct JsPlayBody<'a> {
+    client_id: &'static str,
+    event_type: &'static str,
+    data: &'a [PlayEvent],
 }
 
 // ---- helpers ----
@@ -1071,6 +1325,149 @@ mod tests {
         assert_eq!(parse_next_offset("/v1/me/library/playlists?l=en-US&offset=42"), Some(42));
         assert_eq!(parse_next_offset("/v1/me/library/playlists?offset="), None);
         assert_eq!(parse_next_offset("/v1/me/library/playlists"), None);
+    }
+
+    /// Deterministic PLAY_START fixture with the exact observed wire values.
+    fn start_fixture() -> PlayEvent {
+        PlayEvent {
+            build_version: REPORT_BUILD_VERSION.into(),
+            developer_token: "dev.jwt".into(),
+            event_type: PlayEvent::EVENT_TYPE_PLAY_START,
+            ids: PlayIds {
+                subscription_adam_id: "1440857781".into(),
+                cloud_id: None,
+            },
+            internal_build: false,
+            media_duration_ms: 213_000,
+            media_type: 0,
+            milliseconds_since_play: 1,
+            offline: false,
+            persistent_id: "a1b2c3d4e5f60718".into(),
+            play_mode: PlayMode { auto: 1, repeat: 1, shuffle: 1 },
+            private_enabled: false,
+            sb_enabled: true,
+            siri_initiated: false,
+            source_type: 16,
+            start_position_ms: 0,
+            store_front: "us".into(),
+            item_type: 1,
+            user_agent: REPORT_USER_AGENT.into(),
+            user_token: "muser".into(),
+            utc_offset_seconds: -18_000,
+            event_reason_hint_type: Some(PlayEvent::HINT_CONTAINER_CHANGED),
+            end_position_ms: None,
+            end_reason_type: None,
+            container_type: PlayEvent::CONTAINER_ALBUM,
+            container_ids: Some(ContainerIds { album_adam_id: "1440857780".into() }),
+        }
+    }
+
+    #[test]
+    fn play_start_serializes_exact_hyphenated_key_set() {
+        let v = serde_json::to_value(start_fixture()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "build-version",
+                "container-ids",
+                "container-type",
+                "developer-token",
+                "event-reason-hint-type",
+                "event-type",
+                "ids",
+                "internal-build",
+                "media-duration-in-milliseconds",
+                "media-type",
+                "milliseconds-since-play",
+                "offline",
+                "persistent-id",
+                "play-mode",
+                "private-enabled",
+                "sb-enabled",
+                "siri-initiated",
+                "source-type",
+                "start-position-in-milliseconds",
+                "store-front",
+                "type",
+                "user-agent",
+                "user-token",
+                "utc-offset-in-seconds",
+            ]
+        );
+        assert_eq!(v["event-type"], 1);
+        assert_eq!(v["event-reason-hint-type"], 1);
+        assert_eq!(v["ids"]["subscription-adam-id"], "1440857781"); // string, not number
+        assert!(v["ids"].get("cloud-id").is_none());
+        assert_eq!(v["container-type"], 3);
+        assert_eq!(v["container-ids"]["album-adam-id"], "1440857780");
+        assert_eq!(
+            v["play-mode"],
+            serde_json::json!({"auto-play-mode": 1, "repeat-play-mode": 1, "shuffle-play-mode": 1})
+        );
+        assert_eq!(v["type"], 1);
+        assert_eq!(v["source-type"], 16);
+        assert_eq!(v["media-type"], 0);
+        assert_eq!(v["utc-offset-in-seconds"], -18_000); // seconds east (US = negative)
+        assert_eq!(v["sb-enabled"], true);
+        assert_eq!(v["internal-build"], false);
+        assert_eq!(v["persistent-id"], "a1b2c3d4e5f60718");
+    }
+
+    #[test]
+    fn play_end_serializes_end_fields_and_drops_start_only_ones() {
+        let mut ev = start_fixture();
+        ev.event_type = PlayEvent::EVENT_TYPE_PLAY_END;
+        ev.event_reason_hint_type = None;
+        ev.end_position_ms = Some(213_000);
+        ev.end_reason_type = Some(PlayEvent::END_NATURAL);
+        ev.container_type = PlayEvent::CONTAINER_NONE;
+        ev.container_ids = None;
+        let v = serde_json::to_value(&ev).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("end-position-in-milliseconds"));
+        assert!(obj.contains_key("end-reason-type"));
+        assert!(!obj.contains_key("event-reason-hint-type"));
+        assert!(!obj.contains_key("container-ids")); // unknown container → omitted
+        assert_eq!(v["event-type"], 0);
+        assert_eq!(v["end-position-in-milliseconds"], 213_000);
+        assert_eq!(v["end-reason-type"], 7);
+        assert_eq!(v["container-type"], 0);
+    }
+
+    #[test]
+    fn play_event_builders_produce_start_and_end_shapes() {
+        let mode = PlayMode { auto: 1, repeat: 3, shuffle: 2 };
+        let start = PlayEvent::start("69719099", 224_693, 0, PlayEvent::HINT_CONTAINER_CHANGED, mode.clone(), None);
+        assert_eq!(start.event_type, PlayEvent::EVENT_TYPE_PLAY_START);
+        assert_eq!(start.event_reason_hint_type, Some(1));
+        assert_eq!(start.end_reason_type, None);
+        assert_eq!(start.start_position_ms, 0);
+        // no album context → container-type 0, no container-ids
+        let v = serde_json::to_value(&start).unwrap();
+        assert_eq!(v["container-type"], 0);
+        assert!(v.get("container-ids").is_none());
+
+        let end = PlayEvent::end("69719099", 224_693, 5_000, 224_693, PlayEvent::END_NATURAL, mode, None);
+        assert_eq!(end.event_type, PlayEvent::EVENT_TYPE_PLAY_END);
+        assert_eq!(end.start_position_ms, 5_000); // chains from the resumed segment
+        assert_eq!(end.end_position_ms, Some(224_693));
+        let v = serde_json::to_value(&end).unwrap();
+        assert!(v.get("event-reason-hint-type").is_none());
+        assert_eq!(v["play-mode"]["repeat-play-mode"], 3);
+        assert_eq!(v["play-mode"]["shuffle-play-mode"], 2);
+    }
+
+    #[test]
+    fn report_envelope_wraps_events_as_jsplay() {
+        let ev = start_fixture();
+        let body = JsPlayBody { client_id: "JSCLIENT", event_type: "JSPLAY", data: std::slice::from_ref(&ev) };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["client_id"], "JSCLIENT");
+        assert_eq!(v["event_type"], "JSPLAY");
+        assert_eq!(v["data"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["data"][0]["event-type"], 1);
     }
 }
 

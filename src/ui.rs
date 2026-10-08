@@ -12,10 +12,11 @@
 //! In decode-only mode (no audio device) a fake playback clock simulates the
 //! running track so queue/auto-advance behaves like a real player.
 
-use crate::api::{AlbumHit, Api, LibraryPlaylist, SearchResults, Track};
+use crate::api::{AlbumHit, Api, LibraryPlaylist, PlayEvent, PlayMode, SearchResults, Track};
 use crate::config::Config;
 use crate::mpris;
 use crate::player::{PacketSource, Player};
+use crate::report;
 use crate::theme::Theme;
 use crate::{stream, wrapper};
 use eframe::egui;
@@ -228,6 +229,20 @@ pub struct App {
     mpris: Option<mpris::Mpris>,
     /// Bumped on every explicit seek so MPRIS emits `Seeked`.
     seek_epoch: u64,
+    /// Best-effort Apple play reporting; None = gated off (no token / no
+    /// sink / disabled), so nothing is ever sent in decode-only mode.
+    reporter: Option<report::PlayReporter>,
+    /// A segment is open for `now` (START went out; END pending).
+    report_open: bool,
+    /// start-position-in-milliseconds carried by the open segment's events
+    /// (positions chain: each event starts where the previous one ended).
+    report_seg_start_ms: u64,
+    /// Container reported by the previous START, for the 0/1 change hint.
+    report_last_container: Option<Option<String>>,
+    /// track id → numeric catalog album adam id, filled when tracks arrive
+    /// from an album context (album modal fetch / Queue All) so STARTs keep
+    /// their album attribution across queue auto-advance and shuffle.
+    album_ids: HashMap<String, String>,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
 }
@@ -242,6 +257,13 @@ impl App {
         }
         let volume = state.volume.unwrap_or(0.8).clamp(0.0, 1.0);
         player.volume(volume);
+        // Play reporting only with the config switch on, a media-user-token,
+        // and a REAL audio sink — the decode-only fake clock never reports.
+        let reporter = if report::PlayReporter::enabled(&cfg, player.sink().is_some()) {
+            Some(report::PlayReporter::spawn(cfg.clone()))
+        } else {
+            None
+        };
         let (tx, rx) = channel();
         let mut app = Self {
             cfg,
@@ -304,6 +326,11 @@ impl App {
             last_title: "amc".into(),
             mpris: None,
             seek_epoch: 0,
+            reporter,
+            report_open: false,
+            report_seg_start_ms: 0,
+            report_last_container: None,
+            album_ids: HashMap::new(),
             rx,
             tx,
         };
@@ -449,6 +476,121 @@ impl App {
         self.error = Some((e, std::time::Instant::now()));
     }
 
+    // ---- Apple play reporting ----
+
+    /// play-mode triple from the current repeat/shuffle state (amc has no
+    /// autoplay-after-queue feature → auto 1).
+    fn play_mode(&self) -> PlayMode {
+        PlayMode {
+            auto: 1,
+            repeat: match self.repeat {
+                Repeat::Off => 1,
+                Repeat::All => 2,
+                Repeat::One => 3,
+            },
+            shuffle: if self.shuffle { 2 } else { 1 },
+        }
+    }
+
+    /// Numeric catalog album adam id for `track` when it came from an album
+    /// context; library (`i.`/`p.`) album ids are not adam ids → never sent.
+    fn album_context(&self, track: &Track) -> Option<String> {
+        self.album_ids.get(&track.id).cloned()
+    }
+
+    /// Per-send re-gate: any gate dropped mid-track silently discards the
+    /// open segment.
+    fn report_gates_open(&self) -> bool {
+        self.reporter.is_some() && self.player.sink().is_some()
+    }
+
+    fn report_pos_ms(&self) -> u64 {
+        self.playback_position().as_millis() as u64
+    }
+
+    /// Open a segment for `track` at `pos_ms` (PLAY_START; hint 1 when the
+    /// album container changed vs the previously reported one, else 0).
+    fn report_start(&mut self, track: &Track, pos_ms: u64) {
+        self.report_open = false; // never two open segments
+        if !self.report_gates_open() {
+            return;
+        }
+        let container = self.album_context(track);
+        let hint = if self.report_last_container.as_ref() != Some(&container) {
+            PlayEvent::HINT_CONTAINER_CHANGED
+        } else {
+            PlayEvent::HINT_NONE
+        };
+        self.report_last_container = Some(container.clone());
+        self.report_seg_start_ms = pos_ms;
+        self.report_open = true;
+        if let Some(r) = &self.reporter {
+            r.send(PlayEvent::start(
+                &track.id,
+                track.duration_ms,
+                pos_ms,
+                hint,
+                self.play_mode(),
+                container,
+            ));
+        }
+    }
+
+    /// Close `track`'s segment (PLAY_END) with `reason` at `pos_ms`.
+    fn report_end_for(&mut self, track: &Track, reason: u8, pos_ms: u64) {
+        if !self.report_open {
+            return;
+        }
+        self.report_open = false;
+        if !self.report_gates_open() {
+            return;
+        }
+        let start_ms = self.report_seg_start_ms;
+        let container = self.album_context(track);
+        if let Some(r) = &self.reporter {
+            r.send(PlayEvent::end(
+                &track.id,
+                track.duration_ms,
+                start_ms,
+                pos_ms,
+                reason,
+                self.play_mode(),
+                container,
+            ));
+        }
+    }
+
+    /// Close the current track's segment.
+    fn report_end(&mut self, reason: u8, pos_ms: u64) {
+        match self.now.clone() {
+            Some(t) => self.report_end_for(&t, reason, pos_ms),
+            None => self.report_open = false,
+        }
+    }
+
+    /// Seek while playing: END(12, old) + END(13, new); the segment stays
+    /// open and continues at the new position (no new START).
+    fn report_scrub(&mut self, old_ms: u64, new_ms: u64) {
+        if !self.report_open {
+            return;
+        }
+        self.report_end(PlayEvent::END_SCRUB_BEGIN, old_ms);
+        self.report_open = true; // same segment continues across the scrub pair
+        self.report_end(PlayEvent::END_SCRUB_END, new_ms);
+        self.report_open = true;
+        self.report_seg_start_ms = new_ms;
+    }
+
+    /// Best-effort END(4) at the current position + bounded flush; used by
+    /// every exit path (window close, ctrl+Q, MPRIS Quit).
+    fn exit_flush(&mut self) {
+        let pos = self.report_pos_ms();
+        self.report_end(PlayEvent::END_SUSPENDED, pos);
+        if let Some(r) = self.reporter.take() {
+            r.shutdown(None);
+        }
+    }
+
     /// Play a track immediately at `offset`: cancels whatever is
     /// current/preparing by bumping the generation.
     fn play_now_at(&mut self, track: Track, offset: std::time::Duration, record: bool) {
@@ -463,6 +605,12 @@ impl App {
         self.preparing = true;
         self.now = Some(track.clone());
         self.play_offset = offset;
+        // offset == 0 → a fresh segment (click-replace / advance / ⏮ landed
+        // here after their outgoing END). offset > 0 is a seek restart: the
+        // segment continues (seek_to already emitted the scrub pair).
+        if offset.is_zero() {
+            self.report_start(&track, 0);
+        }
         self.fake_play = None;
         self.fake_pause_at = None;
         self.resume_paused = self.player.sink().is_some_and(|s| s.is_paused());
@@ -508,6 +656,9 @@ impl App {
 
     fn play_now(&mut self, track: Track) {
         self.remember_tracks(std::slice::from_ref(&track));
+        // click-replacing the current track closes its segment (reason 5)
+        let pos = self.report_pos_ms();
+        self.report_end(PlayEvent::END_REPLACED, pos);
         self.play_now_at(track, std::time::Duration::ZERO, true);
     }
 
@@ -706,6 +857,7 @@ impl App {
         if self.now.is_none() {
             return;
         }
+        let was_paused = self.is_paused();
         if self.player.decode_only {
             if let Some((start, _)) = &mut self.fake_play {
                 if let Some(p) = self.fake_pause_at.take() {
@@ -719,6 +871,16 @@ impl App {
         } else {
             self.player.toggle_pause();
         }
+        // pause closes the segment (3); resume opens one at the paused
+        // position (hint 0 — same container)
+        let pos = self.report_pos_ms();
+        if was_paused {
+            if let Some(t) = self.now.clone() {
+                self.report_start(&t, pos);
+            }
+        } else {
+            self.report_end(PlayEvent::END_PAUSED, pos);
+        }
     }
 
     /// Skip to the next queued track (manual).
@@ -726,6 +888,8 @@ impl App {
         if self.now.is_none() {
             return;
         }
+        let pos = self.report_pos_ms();
+        self.report_end(PlayEvent::END_SKIPPED_FORWARDS, pos);
         self.player.skip();
         self.advance(true);
     }
@@ -736,6 +900,11 @@ impl App {
         let Some(finished) = self.now.take() else {
             return;
         };
+        // natural end (auto-advance / queue exhausted): END 7 at the full
+        // duration. Manual skips already reported END 2 in skip_current.
+        if !manual {
+            self.report_end_for(&finished, PlayEvent::END_NATURAL, finished.duration_ms);
+        }
         if !manual && self.repeat == Repeat::One {
             self.push_history(finished.clone());
             self.play_now_at(finished, std::time::Duration::ZERO, false);
@@ -770,6 +939,8 @@ impl App {
         if self.now.is_some() && self.playback_position().as_secs_f64() > 3.0 {
             self.seek_to(std::time::Duration::ZERO);
         } else if let Some(t) = self.history.pop_back() {
+            let pos = self.report_pos_ms();
+            self.report_end(PlayEvent::END_SKIPPED_BACKWARDS, pos);
             self.play_now_at(t, std::time::Duration::ZERO, false);
         } else if self.now.is_some() {
             self.seek_to(std::time::Duration::ZERO);
@@ -785,6 +956,13 @@ impl App {
         self.seek_epoch += 1; // MPRIS emits Seeked
         let total = std::time::Duration::from_millis(t);
         let target = target.min(total);
+        // Scrub while PLAYING: END(12, old pos) then END(13, new pos) and the
+        // segment continues at the new position without a new START. Seeking
+        // while paused only repositions — the resume START lands there.
+        if self.report_open && !self.is_paused() {
+            let old = self.report_pos_ms();
+            self.report_scrub(old, target.as_millis() as u64);
+        }
         if self.player.decode_only {
             let now = std::time::Instant::now();
             let end = std::time::Duration::from_millis(t.min(8_000));
@@ -809,6 +987,11 @@ impl App {
 
     /// Pause without toggling (sleep timer).
     fn pause_now(&mut self) {
+        let playing = if self.player.decode_only {
+            self.fake_play.is_some() && self.fake_pause_at.is_none()
+        } else {
+            self.player.sink().is_some_and(|s| !s.is_paused())
+        };
         if self.player.decode_only {
             if self.fake_play.is_some() && self.fake_pause_at.is_none() {
                 self.fake_pause_at = Some(std::time::Instant::now());
@@ -816,11 +999,17 @@ impl App {
         } else {
             self.player.sink().map(|s| if !s.is_paused() { s.pause(); });
         }
+        if playing {
+            let pos = self.report_pos_ms();
+            self.report_end(PlayEvent::END_PAUSED, pos);
+        }
     }
 
     /// MPRIS Stop: clear the queue (the queue panel's "clear") and drop the
     /// current track, cancelling any in-flight source.
     fn stop_all(&mut self) {
+        let pos = self.report_pos_ms();
+        self.report_end(PlayEvent::END_SUSPENDED, pos);
         self.queue.clear();
         self.shuffle_saved = None;
         self.generation += 1;
@@ -888,7 +1077,10 @@ impl App {
                     self.save_ui_state();
                 }
                 mpris::Command::Raise => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
-                mpris::Command::Quit => std::process::exit(0), // same as ctrl+Q
+                mpris::Command::Quit => {
+                    self.exit_flush();
+                    std::process::exit(0);
+                } // same as ctrl+Q
             }
         }
     }
@@ -1052,6 +1244,7 @@ impl App {
                     self.switch_view(View::Playlists);
                 }
                 if i.key_pressed(egui::Key::Q) {
+                    self.exit_flush();
                     std::process::exit(0);
                 }
                 if i.key_pressed(egui::Key::F) {
@@ -1125,6 +1318,15 @@ impl App {
                     } // stale: dropping src also cancels its download
                 }
                 Msg::AlbumTracks { id, tracks, .. } => {
+                    // album-context attribution: keep the album adam id for
+                    // these tracks so STARTs stay attributed through queue
+                    // auto-advance / shuffle (library `i.` ids are not adam
+                    // ids and are never reported).
+                    if id.chars().all(|c| c.is_ascii_digit()) {
+                        for t in &tracks {
+                            self.album_ids.insert(t.id.clone(), id.clone());
+                        }
+                    }
                     let modal_want =
                         matches!(&self.album_job, Some(AlbumJob::Modal { id: w }) if w.as_str() == id.as_str());
                     let queue_want =
@@ -1493,6 +1695,13 @@ impl eframe::App for App {
     /// opacity. See `theme.rs` for the compositor caveat.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         self.theme.clear_color()
+    }
+
+    /// Best-effort play-report flush on window close: END(4) at the current
+    /// position, then the reporter thread drains and exits (bounded by its
+    /// 8 s request timeout).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.exit_flush();
     }
 }
 

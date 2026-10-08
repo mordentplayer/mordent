@@ -13,6 +13,9 @@ pub struct Config {
     pub media_user_token: Option<String>,
     /// Cache directory (bearer token, artwork, audio segments).
     pub cache_dir: PathBuf,
+    /// Report plays to Apple's Universal Activity Service (Recently Played /
+    /// play counts). Default true when the key is absent.
+    pub report_plays: bool,
 }
 
 impl Default for Config {
@@ -22,6 +25,7 @@ impl Default for Config {
             wrapper_url: "http://127.0.0.1:12340".into(),
             media_user_token: None,
             cache_dir: home().join(".cache/amc"),
+            report_plays: true,
         }
     }
 }
@@ -65,7 +69,8 @@ fn default_toml(cfg: &Config) -> String {
          storefront = \"{}\"\n\
          wrapper_url = \"{}\"\n\
          media_user_token = \"\"\n\
-         cache_dir = \"{}\"\n",
+         cache_dir = \"{}\"\n\
+         report_plays = true\n",
         cfg.storefront,
         cfg.wrapper_url,
         cfg.cache_dir.display()

@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod player;
+mod report;
 mod ui;
 mod fairplay;
 mod mpris;

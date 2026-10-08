@@ -56,6 +56,7 @@ cargo build --release
    storefront = "us"                      # your country code
    wrapper_url = "http://127.0.0.1:12340"
    media_user_token = ""                  # optional: library features
+   report_plays = true                    # report plays to Apple (Recently Played)
    ```
 
 ## Usage
@@ -163,6 +164,17 @@ playerctl --player=amc volume 0.5
 playerctl --player=amc loop Track        # None / Track / Playlist
 playerctl --player=amc shuffle On
 ```
+
+## Play reporting
+
+With `media_user_token` set and `report_plays = true` (the default), `amc ui`
+reports playback segments to Apple's Universal Activity Service so plays land
+in your Recently Played / play counts — the same JSPLAY protocol the web
+player uses (PLAY_START / PLAY_END per pause, resume, seek, skip, natural
+end, stop; one best-effort POST per event on a background thread, failures
+ignored). Reporting needs a real audio sink: on a headless decode-only host
+(VPS/CI) nothing is ever sent. Private sessions are not supported by the
+client, so no private-session handling exists.
 
 ## Measured (VPS, download-throttled Apple CDN)
 

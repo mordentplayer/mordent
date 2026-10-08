@@ -17,6 +17,8 @@ eframe = "=0.32.3"
 log = "0.4.34"
 # MPRIS2 (already a transitive dep of eframe/accesskit on Linux — zero added packages)
 zbus = "5"
+# Local timezone offset for play reporting (seconds east of UTC).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.release]
 lto = "thin"
