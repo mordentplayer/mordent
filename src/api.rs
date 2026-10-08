@@ -365,6 +365,12 @@ impl RawArtist {
     }
 }
 
+/// True when `id` is a numeric catalog adam id (as opposed to a library id
+/// like `l.pxdMFlY` or `i.0abc`, which the catalog endpoints reject with 404).
+fn is_catalog_album_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn parse_next_offset(next: &str) -> Option<u32> {
     let i = next.find("offset=")?;
     let rest = &next[i + 7..];
@@ -625,16 +631,30 @@ impl Api {
         Ok((lists, raw.next.as_deref().and_then(parse_next_offset)))
     }
 
-    /// Tracks of a library album (id starting with `i.`) or a catalog album.
+    /// Tracks of any album: numeric adam id → catalog endpoint, anything
+    /// else (library ids: songs `i.`, albums `l.`) → the library-tracks
+    /// endpoint (catalog endpoints 404 on library ids).
     pub fn album_tracks_any(&self, id: &str) -> Result<Vec<Track>> {
-        if id.starts_with("i.") {
+        if is_catalog_album_id(id) {
+            self.album_tracks(id)
+        } else {
             let url = format!(
                 "https://amp-api.music.apple.com/v1/me/library/albums/{id}/tracks?limit=300&l=en-US"
             );
-            let raw: RawGroup = from_value(self.get_json_retry(&url)?)?;
+            // A 404 here means the album was removed from the library after
+            // the listing was fetched — say that instead of surfacing a raw
+            // HTTP error.
+            let body = self.get_json_retry(&url).map_err(|e| {
+                if e.to_string().contains("404") {
+                    anyhow::anyhow!(
+                        "this album is no longer in your library (it may have been removed) — refresh the Library view"
+                    )
+                } else {
+                    e
+                }
+            })?;
+            let raw: RawGroup = from_value(body)?;
             Ok(raw.data.iter().map(|r| r.to_track()).collect())
-        } else {
-            self.album_tracks(id)
         }
     }
 
@@ -1345,6 +1365,15 @@ mod tests {
         assert_eq!(artist.name, "Daft Punk");
         assert_eq!(artist.genres, "Dance");
         assert!(artist.artwork_obj.is_some());
+    }
+
+    #[test]
+    fn catalog_album_id_predicate() {
+        assert!(is_catalog_album_id("1440857781"));
+        // library ids are not catalog ids (catalog endpoints 404 on them)
+        assert!(!is_catalog_album_id("l.pxdMFlY"));
+        assert!(!is_catalog_album_id("i.0abc"));
+        assert!(!is_catalog_album_id(""));
     }
 
     #[test]
