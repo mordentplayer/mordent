@@ -12,8 +12,15 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 enum Msg {
     Results(Box<SearchResults>),
+    Library(Vec<Track>, Option<u32>),
     Source(Box<crate::player::PacketSource>, Track),
     Error(String),
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum View {
+    Search,
+    Library,
 }
 
 pub struct App {
@@ -24,6 +31,10 @@ pub struct App {
     searching: bool,
     queue: VecDeque<Track>,
     now: Option<Track>,
+    view: View,
+    library: Option<Vec<Track>>,
+    library_loading: bool,
+    library_next: Option<u32>,
     volume: f32,
     error: Option<String>,
     rx: Receiver<Msg>,
@@ -43,17 +54,44 @@ impl App {
             searching: false,
             queue: VecDeque::new(),
             now: None,
+            view: View::Search,
+            library: None,
+            library_loading: false,
+            library_next: None,
             volume: 0.8,
             error: None,
             rx,
             tx,
         };
-        // headless verification hook: AMC_DEMO_TERM=<query> auto-searches
+        // headless verification hook: AMC_DEMO_TERM=<query> auto-searches,
+        // AMC_DEMO_VIEW=library opens the library view
         if let Ok(term) = std::env::var("AMC_DEMO_TERM") {
             app.search = term;
             app.spawn_search();
         }
+        if std::env::var("AMC_DEMO_VIEW").as_deref() == Ok("library") {
+            app.switch_view(View::Library);
+        }
         app
+    }
+
+    fn switch_view(&mut self, v: View) {
+        self.view = v;
+        if v == View::Library && self.library.is_none() && !self.library_loading {
+            self.library_loading = true;
+            let tx = self.tx.clone();
+            let cfg = self.cfg.clone();
+            std::thread::spawn(move || {
+                match Api::new(cfg).and_then(|api| api.library_songs(100, 0)) {
+                    Ok((songs, next)) => {
+                        let _ = tx.send(Msg::Library(songs, next));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    }
+                }
+            });
+        }
     }
 
     fn spawn_search(&mut self) {
@@ -140,6 +178,11 @@ impl eframe::App for App {
                     self.results = Some(*r);
                     self.searching = false;
                 }
+                Msg::Library(songs, next) => {
+                    self.library.get_or_insert_with(Vec::new).extend(songs);
+                    self.library_next = next;
+                    self.library_loading = false;
+                }
                 Msg::Source(src, _t) => {
                     self.player.enqueue(*src);
                 }
@@ -160,7 +203,20 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("amc").strong());
-                ui.add_space(8.0);
+                ui.add_space(4.0);
+                if ui
+                    .selectable_label(self.view == View::Search, "Search")
+                    .clicked()
+                {
+                    self.view = View::Search;
+                }
+                if ui
+                    .selectable_label(self.view == View::Library, "Library")
+                    .clicked()
+                {
+                    self.switch_view(View::Library);
+                }
+                ui.separator();
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Search  ( / )")
@@ -241,18 +297,26 @@ impl eframe::App for App {
                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("search")));
             }
             self.player.volume(self.volume);
-            let Some(res) = self.results.clone() else {
+            let rows: Vec<Track> = match self.view {
+                View::Search => self.results.clone().map(|r| r.tracks).unwrap_or_default(),
+                View::Library => self.library.clone().unwrap_or_default(),
+            };
+            if rows.is_empty() && self.view == View::Library && self.library_loading {
+                ui.spinner();
+                return;
+            }
+            if rows.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.weak("type to search · enter to play · space pauses");
                 });
                 return;
-            };
+            }
             ui.add_space(2.0);
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
-                .show_rows(ui, 24.0, res.tracks.len(), |ui, range| {
+                .show_rows(ui, 24.0, rows.len(), |ui, range| {
                     for i in range {
-                        let t = &res.tracks[i];
+                        let t = &rows[i];
                         let playing = self.now.as_ref().is_some_and(|n| n.id == t.id);
                         ui.horizontal(|ui| {
                             let mark = if playing { "▶" } else { &format!("{:>2}", i + 1) };

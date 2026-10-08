@@ -61,9 +61,19 @@ struct RawAttrs {
     audio_traits: Vec<String>,
     #[serde(default)]
     previews: Vec<RawPreview>,
+    #[serde(default)]
+    play_params: Option<RawPlayParams>,
     track_count: u32,
     release_date: String,
     genre_names: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPlayParams {
+    #[serde(default, rename = "catalogId")]
+    catalog_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -90,6 +100,53 @@ impl RawResource {
             .as_ref()
             .map(|a| a.url.replace("{w}x{h}bb.jpg", "600x600bb.jpg"))
     }
+
+    /// The playable id: catalog adamId when known (library items carry it in
+    /// playParams.catalogId), else the resource id.
+    fn playable_id(&self) -> String {
+        self.attributes
+            .play_params
+            .as_ref()
+            .and_then(|p| p.catalog_id.clone().or_else(|| p.id.clone()))
+            .unwrap_or_else(|| self.id.clone())
+    }
+
+    fn to_track(&self) -> Track {
+        Track {
+            id: self.playable_id(),
+            name: self.attributes.name.clone(),
+            artist: self.attributes.artist_name.clone(),
+            album: self.attributes.album_name.clone(),
+            duration_ms: self.attributes.duration_in_millis,
+            track_no: self.attributes.track_number,
+            disc_no: self.attributes.disc_number,
+            artwork: self.artwork_templated(),
+            lossless: self
+                .attributes
+                .audio_traits
+                .iter()
+                .any(|t| t == "lossless" || t == "hi-res-lossless"),
+        }
+    }
+
+    fn to_album(&self) -> AlbumHit {
+        AlbumHit {
+            id: self.playable_id(),
+            name: self.attributes.name.clone(),
+            artist: self.attributes.artist_name.clone(),
+            artwork: self.artwork_templated(),
+            track_count: self.attributes.track_count,
+            release_date: self.attributes.release_date.clone(),
+        }
+    }
+
+    fn to_artist(&self) -> ArtistHit {
+        ArtistHit {
+            id: self.id.clone(),
+            name: self.attributes.name.clone(),
+            genres: self.attributes.genre_names.join(", "),
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -104,11 +161,32 @@ struct RawSearchResults {
     songs: RawGroup,
     albums: RawGroup,
     artists: RawGroup,
+    #[serde(default, rename = "library-songs")]
+    library_songs: RawGroup,
+    #[serde(default, rename = "library-albums")]
+    library_albums: RawGroup,
+    #[serde(default, rename = "library-artists")]
+    library_artists: RawGroup,
 }
 
 #[derive(Deserialize)]
 struct RawSearch {
     results: RawSearchResults,
+}
+
+#[derive(Deserialize, Default)]
+struct RawLibraryResp {
+    #[serde(default)]
+    data: Vec<RawResource>,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+fn parse_next_offset(next: &str) -> Option<u32> {
+    let i = next.find("offset=")?;
+    let rest = &next[i + 7..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 // ---- client ----
@@ -204,53 +282,87 @@ impl Api {
         let raw: RawSearch =
             from_value(self.get_json_retry(&url)?).context("decoding search response")?;
         Ok(SearchResults {
+            tracks: raw.results.songs.data.iter().map(|r| r.to_track()).collect(),
+            albums: raw.results.albums.data.iter().map(|r| r.to_album()).collect(),
+            artists: raw.results.artists.data.iter().map(|r| r.to_artist()).collect(),
+        })
+    }
+
+    /// Library search (requires media-user-token). Falls back cleanly to an
+    /// empty result when no token is configured.
+    pub fn library_search(&self, term: &str, limit: u32) -> Result<SearchResults> {
+        if self.cfg.media_user_token.as_deref().unwrap_or("").is_empty() {
+            return Ok(SearchResults::default());
+        }
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/me/library/search?term={}&limit={}&types=library-songs,library-albums,library-artists&l=en-US",
+            urlencode(term),
+            limit
+        );
+        let raw: RawSearch =
+            from_value(self.get_json_retry(&url)?).context("decoding library search")?;
+        Ok(SearchResults {
             tracks: raw
                 .results
-                .songs
+                .library_songs
                 .data
                 .iter()
-                .map(|r| Track {
-                    id: r.id.clone(),
-                    name: r.attributes.name.clone(),
-                    artist: r.attributes.artist_name.clone(),
-                    album: r.attributes.album_name.clone(),
-                    duration_ms: r.attributes.duration_in_millis,
-                    track_no: r.attributes.track_number,
-                    disc_no: r.attributes.disc_number,
-                    artwork: r.artwork_templated(),
-                    lossless: r
-                        .attributes
-                        .audio_traits
-                        .iter()
-                        .any(|t| t == "lossless" || t == "hi-res-lossless"),
-                })
+                .chain(raw.results.songs.data.iter())
+                .map(|r| r.to_track())
                 .collect(),
             albums: raw
                 .results
-                .albums
+                .library_albums
                 .data
                 .iter()
-                .map(|r| AlbumHit {
-                    id: r.id.clone(),
-                    name: r.attributes.name.clone(),
-                    artist: r.attributes.artist_name.clone(),
-                    artwork: r.artwork_templated(),
-                    track_count: r.attributes.track_count,
-                    release_date: r.attributes.release_date.clone(),
-                })
+                .chain(raw.results.albums.data.iter())
+                .map(|r| r.to_album())
                 .collect(),
-            artists: raw
-                .results
-                .artists
-                .data
-                .iter()
-                .map(|r| ArtistHit {
-                    id: r.id.clone(),
-                    name: r.attributes.name.clone(),
-                    genres: r.attributes.genre_names.join(", "),
-                })
-                .collect(),
+            artists: raw.results.library_artists.data.iter().map(|r| r.to_artist()).collect(),
         })
+    }
+
+    /// User library songs, most recently added first. Returns tracks plus the
+    /// offset for the next page (None = end).
+    pub fn library_songs(&self, limit: u32, offset: u32) -> Result<(Vec<Track>, Option<u32>)> {
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/me/library/songs?limit={limit}&offset={offset}&l=en-US"
+        );
+        let raw: RawLibraryResp = from_value(self.get_json_retry(&url)?)?;
+        let tracks = raw.data.iter().map(|r| r.to_track()).collect();
+        Ok((tracks, raw.next.as_deref().and_then(parse_next_offset)))
+    }
+
+    /// User library albums (id may be a library id — playable ids resolved
+    /// per item via playParams.catalogId).
+    pub fn library_albums(&self, limit: u32, offset: u32) -> Result<Vec<AlbumHit>> {
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/me/library/albums?limit={limit}&offset={offset}&l=en-US"
+        );
+        let raw: RawLibraryResp = from_value(self.get_json_retry(&url)?)?;
+        Ok(raw.data.iter().map(|r| r.to_album()).collect())
+    }
+
+    /// Tracks of a library album (id starting with `i.`) or a catalog album.
+    pub fn album_tracks_any(&self, id: &str) -> Result<Vec<Track>> {
+        if id.starts_with("i.") {
+            let url = format!(
+                "https://amp-api.music.apple.com/v1/me/library/albums/{id}/tracks?limit=300&l=en-US"
+            );
+            let raw: RawGroup = from_value(self.get_json_retry(&url)?)?;
+            Ok(raw.data.iter().map(|r| r.to_track()).collect())
+        } else {
+            self.album_tracks(id)
+        }
+    }
+
+    /// Tracks of a library playlist.
+    pub fn playlist_tracks(&self, id: &str) -> Result<Vec<Track>> {
+        let url = format!(
+            "https://amp-api.music.apple.com/v1/me/library/playlists/{id}/tracks?limit=300&l=en-US"
+        );
+        let raw: RawGroup = from_value(self.get_json_retry(&url)?)?;
+        Ok(raw.data.iter().map(|r| r.to_track()).collect())
     }
 
     /// 90-second unencrypted preview URL for a track (anonymous playback).

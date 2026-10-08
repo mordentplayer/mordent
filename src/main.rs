@@ -73,6 +73,7 @@ fn run() -> Result<()> {
                 None => println!("{data}"),
             }
         }
+        "library" => cmd_library(&cfg, &rest)?,
         _ => {
             usage();
             bail!("unknown command {cmd:?}");
@@ -162,6 +163,61 @@ fn cmd_wrapper(cfg: &config::Config) -> Result<()> {
         }
         Err(e) => {
             println!("wrapper at {} unreachable: {e:#}", cfg.wrapper_url);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_library(cfg: &config::Config, rest: &[String]) -> Result<()> {
+    let api = api::Api::new(cfg.clone())?;
+    if cfg.media_user_token.as_deref().unwrap_or("").is_empty() {
+        bail!("no media_user_token in ~/.config/amc/config.toml");
+    }
+    let sub = rest.first().map(String::as_str).unwrap_or("songs");
+    match sub {
+        "songs" => {
+            let (songs, next) = api.library_songs(50, 0)?;
+            for (i, t) in songs.iter().enumerate() {
+                println!(
+                    "{:>3}. {:<40} {:<26} {:>5} {}",
+                    i + 1,
+                    trunc(&t.name, 40),
+                    trunc(&t.artist, 26),
+                    fmt_dur(t.duration_ms),
+                    t.id
+                );
+            }
+            if next.is_some() {
+                println!("    … more pages available (offset {:?})", next);
+            }
+        }
+        "albums" => {
+            for (i, a) in api.library_albums(50, 0)?.iter().enumerate() {
+                println!(
+                    "{:>3}. {:<40} {:<26} {:>3} tracks {}",
+                    i + 1,
+                    trunc(&a.name, 40),
+                    trunc(&a.artist, 26),
+                    a.track_count,
+                    a.id
+                );
+            }
+        }
+        term => {
+            let _ = term;
+            let q = rest.join(" ");
+            let res = api.library_search(&q, 25)?;
+            println!("library search {q:?}: {} songs", res.tracks.len());
+            for (i, t) in res.tracks.iter().enumerate() {
+                println!(
+                    "{:>3}. {:<40} {:<26} {:>5} {}",
+                    i + 1,
+                    trunc(&t.name, 40),
+                    trunc(&t.artist, 26),
+                    fmt_dur(t.duration_ms),
+                    t.id
+                );
+            }
         }
     }
     Ok(())

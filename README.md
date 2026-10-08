@@ -81,7 +81,7 @@ amc decode <file>         # verify a decrypted file decodes
 
 ## Status
 
-Working: search, ALAC/lossless streaming playback, previews fallback,
+Working: search, your library (songs/albums/search), ALAC/lossless streaming playback, previews fallback,
 lyrics endpoint, decrypt-to-file, dense search-first UI.
-Next: library & playlists (media-user-token), animated word-synced lyrics
+Next: animated word-synced lyrics
 view, queue UI, media keys, wrapper auto-spawn from the app.
