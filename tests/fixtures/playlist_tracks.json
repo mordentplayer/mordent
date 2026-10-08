@@ -1,0 +1,72 @@
+{
+ "next": "/v1/me/library/playlists/p.FIXTURE00000001/tracks?l=en-US&offset=3",
+ "meta": {
+  "total": 4
+ },
+ "data": [
+  {
+   "id": "i.FIXTURE00000001",
+   "type": "library-songs",
+   "attributes": {
+    "albumName": "Discovery",
+    "artistName": "Daft Punk",
+    "artwork": {
+     "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/aa/bb/cc/dd/image/{w}x{h}bb.jpg",
+     "width": 1400,
+     "height": 1400,
+     "hasP3": false
+    },
+    "audioTraits": [
+     "lossless",
+     "lossy-stereo"
+    ],
+    "discNumber": 1,
+    "durationInMillis": 224693,
+    "name": "One More Time",
+    "playParams": {
+     "catalogId": "69719099",
+     "id": "i.FIXTURE00000001",
+     "isLibrary": true,
+     "kind": "song"
+    },
+    "trackNumber": 1
+   }
+  },
+  {
+   "id": "i.FIXTURE00000002",
+   "type": "library-songs",
+   "attributes": {
+    "albumName": "Discovery",
+    "artistName": "Daft Punk",
+    "discNumber": 1,
+    "durationInMillis": 240000,
+    "name": "Aerodynamic",
+    "playParams": {
+     "catalogId": "69719100",
+     "id": "i.FIXTURE00000002",
+     "isLibrary": true,
+     "kind": "song"
+    },
+    "trackNumber": 2
+   }
+  },
+  {
+   "id": "i.FIXTURE00000003",
+   "type": "library-songs",
+   "attributes": {
+    "albumName": "Discovery",
+    "artistName": "Daft Punk",
+    "discNumber": 1,
+    "durationInMillis": 200000,
+    "name": "Digital Love",
+    "playParams": {
+     "catalogId": "69719101",
+     "id": "i.FIXTURE00000003",
+     "isLibrary": true,
+     "kind": "song"
+    },
+    "trackNumber": 3
+   }
+  }
+ ]
+}
