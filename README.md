@@ -85,7 +85,9 @@ queue; a favorite whose metadata has not been seen in the session (only its id
 is persisted) shows as a bare id until the track is played or searched.
 
 The queue panel (right side) has per-row favorites, ▲▼ reordering, ✕ remove,
-clear, and a shuffle toggle that restores the original order when switched off.
+drag-and-drop reordering by the ⠿ handle (the ↑↓ buttons stay as the keyboard
+path), clear, and a shuffle toggle that restores the original order when
+switched off.
 The player bar shows elapsed/remaining time, a click-to-seek progress bar, ⏮
 (restarts after 3 s, else previous track), shuffle, repeat off/all/one, and a
 compact volume slider. The window title mirrors the playing track. Errors
@@ -109,7 +111,7 @@ turns into a hand over clickable rows.
 | click progress bar | seek |
 
 `AMC_SELFTEST=1 amc ui` runs a deterministic headless state-machine test
-(play-now replaces current, queue ordering, ▲▼ reorder, shuffle
+(play-now replaces current, queue ordering, ▲▼ + drag reorder, shuffle
 restore, auto-advance) and prints `RESULT: PASS/FAIL`.
 `AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums|favorites|playlists`
 pre-seed the UI for headless screenshots; `AMC_DEMO_PLAYLIST=<n>` additionally

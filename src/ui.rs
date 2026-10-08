@@ -184,6 +184,10 @@ pub struct App {
     /// A worker is building the source for the current generation.
     preparing: bool,
     show_queue: bool,
+    /// Queue row currently being dragged by its ⠿ handle, and the slot it
+    /// would land in (index among the other rows) — both cleared on release.
+    queue_drag: Option<usize>,
+    queue_drop: Option<usize>,
     /// decode-only (no audio device): simulated playback window
     /// (clock start, remaining duration).
     fake_play: Option<(std::time::Instant, std::time::Duration)>,
@@ -265,6 +269,8 @@ impl App {
             generation: 0,
             preparing: false,
             show_queue: false,
+            queue_drag: None,
+            queue_drop: None,
             fake_play: None,
             fake_pause_at: None,
             play_offset: std::time::Duration::ZERO,
@@ -635,6 +641,12 @@ impl App {
             return;
         }
         self.queue.swap(i, j as usize);
+    }
+
+    /// Move queue row `from` to final index `to` (drag-and-drop drop handler).
+    /// Reuses the same neighbour-swap primitive as `queue_move`.
+    fn queue_move_to(&mut self, from: usize, to: usize) {
+        move_row_to(&mut self.queue, from, to);
     }
 
     fn toggle_shuffle(&mut self) {
@@ -1164,7 +1176,7 @@ impl App {
                     tracks[2].name.clone(),
                 )
             };
-            let (_id0, id1) = {
+            let (id0, id1) = {
                 let tracks = &self.results.as_ref().expect("checked").tracks;
                 (tracks[0].id.clone(), tracks[1].id.clone())
             };
@@ -1182,20 +1194,26 @@ impl App {
             let ok_up = self.queue.front().map(|t| t.id.as_str()) == Some(id1.as_str());
             self.queue_move(0, 1);
             let ok_down = self.queue.get(1).map(|t| t.id.as_str()) == Some(id1.as_str());
+            // drag-and-drop path: the exact method the drop handler calls
+            self.queue_move_to(0, 1);
+            let ok_drag_down = self.queue.front().map(|t| t.id.as_str()) == Some(id1.as_str());
+            self.queue_move_to(1, 0);
+            let ok_drag_up = self.queue.front().map(|t| t.id.as_str()) == Some(id0.as_str());
             // shuffle toggle must restore the original order deterministically
             let before: Vec<String> = self.queue.iter().map(|t| t.id.clone()).collect();
             self.toggle_shuffle();
             self.toggle_shuffle();
             let after: Vec<String> = self.queue.iter().map(|t| t.id.clone()).collect();
             let ok_shuffle = after == before;
-            if !ok_up || !ok_down || !ok_shuffle {
+            if !ok_up || !ok_down || !ok_drag_down || !ok_drag_up || !ok_shuffle {
                 eprintln!(
-                    "[selftest] stage0 FAIL (reorder up={ok_up} down={ok_down} shuffle_restore={ok_shuffle})"
+                    "[selftest] stage0 FAIL (reorder up={ok_up} down={ok_down} \
+                     drag_down={ok_drag_down} drag_up={ok_drag_up} shuffle_restore={ok_shuffle})"
                 );
                 eprintln!("[selftest] RESULT: FAIL");
                 std::process::exit(1);
             }
-            eprintln!("[selftest] stage0 reorder+shuffle PASS");
+            eprintln!("[selftest] stage0 reorder+drag+shuffle PASS");
             self.play_now(
                 self.results
                     .as_ref()
@@ -1942,9 +1960,47 @@ impl App {
                 let mut remove: Option<usize> = None;
                 let mut mv: Option<(usize, isize)> = None;
                 let mut fav: Option<Track> = None;
+                // drag-and-drop state collected this frame (applied after the loop)
+                let mut rows: Vec<(f32, f32)> = Vec::new();
+                let mut drag_from: Option<usize> = None;
+                let mut drag_y: Option<f32> = None;
+                let mut drag_end = false;
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     for (i, t) in self.queue.iter().enumerate() {
-                        ui.horizontal(|ui| {
+                        let row = ui.horizontal(|ui| {
+                            if self.queue_drag == Some(i) {
+                                ui.visuals_mut().override_text_color =
+                                    Some(ui.visuals().weak_text_color());
+                            }
+                            // ⠿ drag handle — its own rect with a pure drag
+                            // sense, so it never conflicts with the buttons'
+                            // click sense (and vice versa).
+                            let (hrect, hresp) = ui.allocate_exact_size(
+                                egui::vec2(11.0, 15.0),
+                                egui::Sense::drag(),
+                            );
+                            let hresp = if hresp.dragged() {
+                                hresp.on_hover_cursor(egui::CursorIcon::Grabbing)
+                            } else {
+                                hresp.on_hover_cursor(egui::CursorIcon::Grab)
+                            };
+                            let hcol = if hresp.dragged() || self.queue_drag == Some(i) {
+                                self.theme.accent
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            ui.painter().text(
+                                hrect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "⠿",
+                                egui::FontId::proportional(11.0),
+                                hcol,
+                            );
+                            if hresp.dragged() || hresp.drag_stopped() {
+                                drag_from = Some(i);
+                                drag_y = hresp.interact_pointer_pos().map(|p| p.y);
+                                drag_end |= hresp.drag_stopped();
+                            }
                             ui.monospace(format!("{:>2}", i + 1));
                             if fav_button(ui, self.favorites.contains(&t.id), self.theme.accent).clicked() {
                                 fav = Some(t.clone());
@@ -1965,8 +2021,40 @@ impl App {
                                 remove = Some(i);
                             }
                         });
+                        rows.push((row.response.rect.top(), row.response.rect.bottom()));
+                    }
+                    if let Some(i) = drag_from {
+                        self.queue_drag = Some(i);
+                        if let Some(y) = drag_y {
+                            self.queue_drop = Some(drop_slot(&rows, Some(i), y));
+                        }
+                    }
+                    // drop indicator: 2.5 px accent line at the landing gap
+                    if let (Some(i), Some(slot)) = (self.queue_drag, self.queue_drop) {
+                        let others: Vec<(f32, f32)> = rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(k, _)| *k != i)
+                            .map(|(_, r)| *r)
+                            .collect();
+                        let line_y = match others.get(slot) {
+                            Some(r) => r.0,
+                            None => others.last().map_or(0.0, |r| r.1),
+                        };
+                        ui.painter().hline(
+                            ui.max_rect().x_range(),
+                            line_y,
+                            egui::Stroke::new(2.5_f32, self.theme.accent),
+                        );
                     }
                 });
+                if drag_end {
+                    if let (Some(i), Some(slot)) = (drag_from, self.queue_drop) {
+                        self.queue_move_to(i, slot);
+                    }
+                    self.queue_drag = None;
+                    self.queue_drop = None;
+                }
                 if let Some(t) = fav {
                     self.toggle_favorite(&t);
                 }
@@ -2345,6 +2433,61 @@ fn hand(r: egui::Response) -> egui::Response {
     r.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Drop slot for a queue drag: with `rows` being the `(top, bottom)` y-bounds of
+/// every rendered row in visual order and `dragged` the row being moved (skipped),
+/// return the index the pointer at `pointer_y` would land on *among the other
+/// rows* — i.e. the final index after the dragged row is lifted out.
+///
+/// A pointer above a row's midpoint inserts before it, so the result is the
+/// count of non-dragged rows whose midpoint is above the pointer.
+fn drop_slot(rows: &[(f32, f32)], dragged: Option<usize>, pointer_y: f32) -> usize {
+    let mut slot = 0;
+    for (i, (top, bottom)) in rows.iter().enumerate() {
+        if dragged == Some(i) {
+            continue;
+        }
+        if pointer_y < (top + bottom) / 2.0 {
+            return slot;
+        }
+        slot += 1;
+    }
+    slot
+}
+
+/// Direction and number of neighbour swaps that move row `from` to final
+/// index `to` via the ▲▼ `queue_move` primitive.
+fn move_steps(from: usize, to: usize) -> (isize, usize) {
+    if to > from {
+        (1, to - from)
+    } else {
+        (-1, from - to)
+    }
+}
+
+/// Move `from` to final index `to` with successive neighbour swaps (no-op when
+/// the row would stay put; out-of-range indices are ignored).
+fn move_row_to<T>(q: &mut VecDeque<T>, from: usize, to: usize) {
+    if from >= q.len() || q.is_empty() {
+        return;
+    }
+    let to = to.min(q.len() - 1);
+    if from == to {
+        return;
+    }
+    let (dir, steps) = move_steps(from, to);
+    let mut i = from;
+    for _ in 0..steps {
+        let Some(j) = i.checked_add_signed(dir) else {
+            return;
+        };
+        if j >= q.len() {
+            return;
+        }
+        q.swap(i, j);
+        i = j;
+    }
+}
+
 /// Small ♥/♡ favorite toggle (both glyphs are covered by egui's bundled emoji
 /// fonts and the DejaVu fallback).
 fn fav_button(ui: &mut egui::Ui, fav: bool, accent: egui::Color32) -> egui::Response {
@@ -2458,4 +2601,103 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
+}
+
+#[cfg(test)]
+mod dnd_tests {
+    use super::*;
+
+    /// Three stacked rows: y 0-10, 10-20, 20-30 (midpoints 5, 15, 25).
+    const ROWS: [(f32, f32); 3] = [(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)];
+
+    fn q(s: &str) -> VecDeque<char> {
+        s.chars().collect()
+    }
+
+    fn s(v: &VecDeque<char>) -> String {
+        v.iter().collect()
+    }
+
+    #[test]
+    fn drop_slot_without_dragged_row() {
+        assert_eq!(drop_slot(&ROWS, None, 3.0), 0); // above first midpoint
+        assert_eq!(drop_slot(&ROWS, None, 12.0), 1); // between mid 5 and 15
+        assert_eq!(drop_slot(&ROWS, None, 22.0), 2);
+        assert_eq!(drop_slot(&ROWS, None, 99.0), 3); // past the end
+        assert_eq!(drop_slot(&ROWS, None, 5.0), 1); // exactly on a midpoint goes below
+    }
+
+    #[test]
+    fn drop_slot_skips_the_dragged_row() {
+        // dragging row 0: only rows 1 (mid 15) and 2 (mid 25) count
+        assert_eq!(drop_slot(&ROWS, Some(0), 3.0), 0);
+        assert_eq!(drop_slot(&ROWS, Some(0), 20.0), 1);
+        assert_eq!(drop_slot(&ROWS, Some(0), 99.0), 2);
+        // dragging row 1: rows 0 (mid 5) and 2 (mid 25) count
+        assert_eq!(drop_slot(&ROWS, Some(1), 3.0), 0);
+        assert_eq!(drop_slot(&ROWS, Some(1), 22.0), 1);
+        assert_eq!(drop_slot(&ROWS, Some(1), 99.0), 2);
+        // dragging row 2: rows 0 and 1 count
+        assert_eq!(drop_slot(&ROWS, Some(2), 3.0), 0);
+        assert_eq!(drop_slot(&ROWS, Some(2), 12.0), 1);
+        assert_eq!(drop_slot(&ROWS, Some(2), 99.0), 2);
+    }
+
+    #[test]
+    fn move_steps_direction_and_length() {
+        assert_eq!(move_steps(0, 2), (1, 2)); // down
+        assert_eq!(move_steps(3, 1), (-1, 2)); // up
+        assert_eq!(move_steps(1, 1), (-1, 0)); // no-op
+        assert_eq!(move_steps(0, 0), (-1, 0));
+    }
+
+    #[test]
+    fn move_row_to_both_directions() {
+        let mut v = q("abcde");
+        move_row_to(&mut v, 0, 2); // a down by two
+        assert_eq!(s(&v), "bcade");
+        move_row_to(&mut v, 2, 0); // a (now index 2) back to the top
+        assert_eq!(s(&v), "abcde");
+        move_row_to(&mut v, 4, 1); // multi-step upward move == remove+insert
+        assert_eq!(s(&v), "aebcd");
+        // unchanged idempotent cases
+        let mut w = q("abcde");
+        move_row_to(&mut w, 2, 2); // identity
+        assert_eq!(s(&w), "abcde");
+        move_row_to(&mut w, 1, 9); // clamped to the last index
+        assert_eq!(s(&w), "acdeb");
+        move_row_to(&mut w, 9, 0); // out of range: ignored
+        assert_eq!(s(&w), "acdeb");
+        let mut empty: VecDeque<char> = VecDeque::new();
+        move_row_to(&mut empty, 0, 0); // empty queue is a no-op
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn drag_down_reindexes_after_removal() {
+        // queue a,b,c; the user drags row 0 (a) below row 1's midpoint:
+        // drop_slot already reports the index among the *remaining* rows, so
+        // the drop handler can feed it straight to move_row_to.
+        let mut v = q("abc");
+        let slot = drop_slot(&ROWS, Some(0), 22.0);
+        assert_eq!(slot, 1);
+        move_row_to(&mut v, 0, slot);
+        assert_eq!(s(&v), "bac");
+    }
+
+    #[test]
+    fn drag_up_reindexes_after_removal() {
+        // queue a,b,c; the user drags row 2 (c) above the first midpoint.
+        let mut v = q("abc");
+        let slot = drop_slot(&ROWS, Some(2), 3.0);
+        assert_eq!(slot, 0);
+        move_row_to(&mut v, 2, slot);
+        assert_eq!(s(&v), "cab");
+        // and a downward drag of a middle row: b lands below c (and d)
+        let mut v = q("abcd");
+        let slot = drop_slot(&ROWS, Some(1), 99.0);
+        assert_eq!(slot, 2); // among a, c → after them
+        move_row_to(&mut v, 1, slot);
+        assert_eq!(s(&v), "acbd");
+    }
 }
