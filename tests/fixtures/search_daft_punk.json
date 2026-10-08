@@ -1,0 +1,133 @@
+{
+ "results": {
+  "songs": {
+   "data": [
+    {
+     "id": "617154366",
+     "type": "songs",
+     "attributes": {
+      "albumName": "Random Access Memories",
+      "artistName": "Daft Punk, Pharrell Williams & Nile Rodgers",
+      "artwork": {
+       "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e8/43/5f/e8435ffa-b6b9-b171-40ab-4ff3959ab661/886443919266.jpg/{w}x{h}bb.jpg",
+       "width": 1500,
+       "height": 1500,
+       "bgColor": "090d0e",
+       "hasP3": false
+      },
+      "audioTraits": [
+       "lossless",
+       "lossy-stereo"
+      ],
+      "discNumber": 1,
+      "durationInMillis": 369629,
+      "genreNames": [
+       "Pop",
+       "Music",
+       "Electronic"
+      ],
+      "name": "Get Lucky",
+      "playParams": {
+       "id": "617154366",
+       "kind": "song"
+      },
+      "releaseDate": "2013-04-19",
+      "trackNumber": 8
+     }
+    },
+    {
+     "id": "697195462",
+     "type": "songs",
+     "attributes": {
+      "albumName": "Discovery",
+      "artistName": "Daft Punk",
+      "artwork": {
+       "url": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/fd/4a/77/fd4a77db-0ebc-d043-41a2-f32fa1bb0fb4/dj.qrikkdwj.jpg/{w}x{h}bb.jpg",
+       "width": 4000,
+       "height": 4000,
+       "bgColor": "000002",
+       "hasP3": false
+      },
+      "audioTraits": [
+       "lossless",
+       "lossy-stereo"
+      ],
+      "discNumber": 1,
+      "durationInMillis": 320357,
+      "genreNames": [
+       "Dance",
+       "Music",
+       "House",
+       "Rock",
+       "Electronic",
+       "Electronica"
+      ],
+      "name": "One More Time",
+      "playParams": {
+       "id": "697195462",
+       "kind": "song"
+      },
+      "releaseDate": "2000-11-30",
+      "trackNumber": 1
+     }
+    }
+   ]
+  },
+  "albums": {
+   "data": [
+    {
+     "id": "1440871397",
+     "type": "albums",
+     "attributes": {
+      "artistName": "The Weeknd",
+      "artwork": {
+       "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e2/61/f8/e261f8c1-73db-9a7a-c89e-1068f19970e0/16UMGIM67863.rgb.jpg/{w}x{h}bb.jpg",
+       "width": 3000,
+       "height": 3000,
+       "bgColor": "121c42",
+       "hasP3": false
+      },
+      "audioTraits": [
+       "lossless",
+       "lossy-stereo"
+      ],
+      "genreNames": [
+       "R&B/Soul",
+       "Music",
+       "Dance",
+       "Electronic"
+      ],
+      "name": "Starboy",
+      "playParams": {
+       "id": "1440871397",
+       "kind": "album"
+      },
+      "releaseDate": "2016-11-25",
+      "trackCount": 18
+     }
+    }
+   ]
+  },
+  "artists": {
+   "data": [
+    {
+     "id": "5468295",
+     "type": "artists",
+     "attributes": {
+      "artwork": {
+       "url": "https://is1-ssl.mzstatic.com/image/thumb/AMCArtistImages221/v4/29/9e/38/299e3866-673a-4d36-376f-9274a0e45793/ami-identity-7b9f369855a542ba1bc836cd2766ca01-2025-09-01T10-34-14.349Z_cropped.png/{w}x{h}bb.jpg",
+       "width": 2909,
+       "height": 2909,
+       "bgColor": "1d1b1a",
+       "hasP3": false
+      },
+      "genreNames": [
+       "Dance"
+      ],
+      "name": "Daft Punk"
+     }
+    }
+   ]
+  }
+ }
+}

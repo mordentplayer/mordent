@@ -1,0 +1,132 @@
+{
+ "data": [
+  {
+   "id": "5468295",
+   "type": "artists",
+   "attributes": {
+    "artwork": {
+     "bgColor": "1d1b1a",
+     "defaultCropCode": "bb",
+     "hasP3": false,
+     "height": 2909,
+     "textColor1": "e9e9e9",
+     "textColor2": "cccccd",
+     "textColor3": "c0c0c0",
+     "textColor4": "a9a8a9",
+     "url": "https://is1-ssl.mzstatic.com/image/thumb/AMCArtistImages221/v4/29/9e/38/299e3866-673a-4d36-376f-9274a0e45793/ami-identity-7b9f369855a542ba1bc836cd2766ca01-2025-09-01T10-34-14.349Z_cropped.png/{w}x{h}bb.jpg",
+     "width": 2909
+    },
+    "genreNames": [
+     "Dance"
+    ],
+    "name": "Daft Punk"
+   },
+   "views": {
+    "top-songs": {
+     "data": [
+      {
+       "id": "1440871420",
+       "type": "songs",
+       "attributes": {
+        "albumName": "Starboy",
+        "artistName": "The Weeknd",
+        "artwork": {
+         "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e2/61/f8/e261f8c1-73db-9a7a-c89e-1068f19970e0/16UMGIM67863.rgb.jpg/{w}x{h}bb.jpg",
+         "width": 3000,
+         "height": 3000,
+         "bgColor": "121c42",
+         "hasP3": false
+        },
+        "audioTraits": [
+         "atmos",
+         "lossless",
+         "lossy-stereo",
+         "spatial"
+        ],
+        "discNumber": 1,
+        "durationInMillis": 230461,
+        "genreNames": [
+         "R&B/Soul",
+         "Music"
+        ],
+        "name": "Starboy (feat. Daft Punk)",
+        "playParams": {
+         "id": "1440871420",
+         "kind": "song"
+        },
+        "releaseDate": "2016-09-21",
+        "trackNumber": 1
+       }
+      },
+      {
+       "id": "617154366",
+       "type": "songs",
+       "attributes": {
+        "albumName": "Random Access Memories",
+        "artistName": "Daft Punk, Pharrell Williams & Nile Rodgers",
+        "artwork": {
+         "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e8/43/5f/e8435ffa-b6b9-b171-40ab-4ff3959ab661/886443919266.jpg/{w}x{h}bb.jpg",
+         "width": 1500,
+         "height": 1500,
+         "bgColor": "090d0e",
+         "hasP3": false
+        },
+        "audioTraits": [
+         "lossless",
+         "lossy-stereo"
+        ],
+        "discNumber": 1,
+        "durationInMillis": 369629,
+        "genreNames": [
+         "Pop",
+         "Music",
+         "Electronic"
+        ],
+        "name": "Get Lucky",
+        "playParams": {
+         "id": "617154366",
+         "kind": "song"
+        },
+        "releaseDate": "2013-04-19",
+        "trackNumber": 8
+       }
+      },
+      {
+       "id": "1440872309",
+       "type": "songs",
+       "attributes": {
+        "albumName": "Starboy",
+        "artistName": "The Weeknd",
+        "artwork": {
+         "url": "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/e2/61/f8/e261f8c1-73db-9a7a-c89e-1068f19970e0/16UMGIM67863.rgb.jpg/{w}x{h}bb.jpg",
+         "width": 3000,
+         "height": 3000,
+         "bgColor": "121c42",
+         "hasP3": false
+        },
+        "audioTraits": [
+         "lossless",
+         "lossy-stereo"
+        ],
+        "discNumber": 1,
+        "durationInMillis": 269177,
+        "genreNames": [
+         "R&B/Soul",
+         "Music"
+        ],
+        "name": "I Feel It Coming (feat. Daft Punk)",
+        "playParams": {
+         "id": "1440872309",
+         "kind": "song"
+        },
+        "releaseDate": "2016-11-18",
+        "trackNumber": 18
+       }
+      }
+     ],
+     "next": "/v1/catalog/us/artists/5468295/view/top-songs?l=en-US&offset=10"
+    }
+   }
+  }
+ ]
+}
