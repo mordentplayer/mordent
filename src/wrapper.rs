@@ -48,21 +48,6 @@ impl Wrapper {
         Ok(env.data)
     }
 
-    pub fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-        let url = format!("{}{}", self.base, path);
-        let env: Envelope = self
-            .agent
-            .post(&url)
-            .send_json(body)
-            .with_context(|| format!("wrapper POST {path}"))?
-            .into_json()
-            .with_context(|| format!("wrapper POST {path} body"))?;
-        if env.code != 0 {
-            anyhow::bail!("wrapper POST {path} failed (code {}): {}", env.code, env.msg);
-        }
-        Ok(env.data)
-    }
-
     /// Storefront codes this wrapper can serve (empty = not logged in).
     pub fn regions(&self) -> Result<Vec<String>> {
         let data = self.get("/status", &[])?;

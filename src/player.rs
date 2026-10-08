@@ -4,6 +4,7 @@
 use crate::fairplay;
 use anyhow::{anyhow, Result};
 use std::io::Read;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// Decodes a *decrypted, fragmented* MP4 stream (e.g. the live output of
@@ -72,35 +73,34 @@ impl PacketSource {
 
     fn decode_more(&mut self) -> bool {
         use symphonia::core::formats::Packet;
-        loop {
-            let frag = match fairplay::read_fragment(&mut self.reader) {
-                Ok(Some(f)) => f,
-                Ok(None) => return false, // clean EOF
-                Err(_) => return false,   // treat stream errors as end
-            };
-            let mut ts = frag.base_time;
-            for (i, sample) in frag.samples.iter().enumerate() {
-                let dur = (*frag.durations.get(i).unwrap_or(&0)).max(1) as u64;
-                let pkt =
-                    Packet::new_from_boxed_slice(1, ts, dur, sample.clone().into_boxed_slice());
-                ts += dur;
-                match self.decoder.decode(&pkt) {
-                    Ok(decoded) => {
-                        let frames = decoded.frames().max(1);
-                        let spec = *decoded.spec();
-                        let cap = frames as usize * spec.channels.count();
-                        let mut buf =
-                            symphonia::core::audio::SampleBuffer::<f32>::new(cap as u64, spec);
-                        buf.copy_interleaved_ref(decoded);
-                        self.pending.extend_from_slice(buf.samples());
-                        self.frames_decoded += frames as u64;
-                    }
-                    Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-                    Err(_) => return false,
+        // Reads exactly one fragment: `read_fragment` returns None at EOF, so a
+        // single pass feeds one packet batch (the old `loop` never iterated).
+        let frag = match fairplay::read_fragment(&mut self.reader) {
+            Ok(Some(f)) => f,
+            Ok(None) => return false, // clean EOF
+            Err(_) => return false,   // treat stream errors as end
+        };
+        let mut ts = frag.base_time;
+        for (i, sample) in frag.samples.iter().enumerate() {
+            let dur = (*frag.durations.get(i).unwrap_or(&0)).max(1) as u64;
+            let pkt = Packet::new_from_boxed_slice(1, ts, dur, sample.clone().into_boxed_slice());
+            ts += dur;
+            match self.decoder.decode(&pkt) {
+                Ok(decoded) => {
+                    let frames = decoded.frames().max(1);
+                    let spec = *decoded.spec();
+                    let cap = frames * spec.channels.count();
+                    let mut buf =
+                        symphonia::core::audio::SampleBuffer::<f32>::new(cap as u64, spec);
+                    buf.copy_interleaved_ref(decoded);
+                    self.pending.extend_from_slice(buf.samples());
+                    self.frames_decoded += frames as u64;
                 }
+                Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+                Err(_) => return false,
             }
-            return true;
         }
+        true
     }
 }
 
@@ -144,14 +144,17 @@ impl rodio::Source for PacketSource {
 
 /// Owns the audio output. Falls back to decode-only mode (progress to
 /// stdout) when no device is available — e.g. a headless VPS.
-/// Cheaply cloneable handle for UI + worker threads.
+/// Cheaply cloneable handle (single-threaded; rodio's `OutputStream` is `!Send`).
 #[derive(Clone)]
 pub struct Player {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
     pub decode_only: bool,
 }
 
 struct Inner {
+    // Held only to keep the audio device open: dropping the `OutputStream`
+    // tears the device down and stops playback, so it is kept though unread.
+    #[allow(dead_code)]
     stream: Option<rodio::OutputStream>,
     sink: Option<rodio::Sink>,
 }
@@ -162,7 +165,7 @@ impl Player {
             Ok((stream, handle)) => {
                 let sink = rodio::Sink::try_new(&handle).ok();
                 Self {
-                    inner: Arc::new(Inner {
+                    inner: Rc::new(Inner {
                         stream: Some(stream),
                         sink,
                     }),
@@ -170,17 +173,13 @@ impl Player {
                 }
             }
             Err(_) => Self {
-                inner: Arc::new(Inner {
+                inner: Rc::new(Inner {
                     stream: None,
                     sink: None,
                 }),
                 decode_only: true,
             },
         }
-    }
-
-    pub fn has_output(&self) -> bool {
-        self.inner.sink.is_some()
     }
 
     pub fn sink(&self) -> Option<&rodio::Sink> {

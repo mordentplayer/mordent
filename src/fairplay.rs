@@ -11,49 +11,8 @@ use std::collections::HashMap;
 
 // ---- low-level box walker ----
 
-#[derive(Debug, Clone)]
-pub struct BoxHeader {
-    /// Full box size including header.
-    pub size: u64,
-    pub kind: [u8; 4],
-    /// Bytes consumed by the header itself.
-    pub hdr_len: u64,
-}
-
-fn read_box_header(r: &mut impl std::io::Read) -> std::io::Result<BoxHeader> {
-    let mut b8 = [0u8; 8];
-    r.read_exact(&mut b8)?;
-    let mut size = u32::from_be_bytes([b8[0], b8[1], b8[2], b8[3]]) as u64;
-    let mut hdr = 8u64;
-    if size == 1 {
-        let mut b16 = [0u8; 8];
-        r.read_exact(&mut b16)?;
-        size = u64::from_be_bytes(b16);
-        hdr = 16;
-    }
-    Ok(BoxHeader {
-        size,
-        kind: [b8[4], b8[5], b8[6], b8[7]],
-        hdr_len: hdr,
-    })
-}
-
 fn kind_str(k: &[u8]) -> String {
     k.iter().map(|&c| c as char).collect()
-}
-
-/// Read one full box (header + payload) from a stream.
-fn read_box(r: &mut impl std::io::Read) -> std::io::Result<(BoxHeader, Vec<u8>)> {
-    let h = read_box_header(r)?;
-    if h.size < h.hdr_len || h.size > 1 << 30 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("absurd box size {} ({})", h.size, kind_str(&h.kind)),
-        ));
-    }
-    let mut payload = vec![0u8; (h.size - h.hdr_len) as usize];
-    r.read_exact(&mut payload)?;
-    Ok((h, payload))
 }
 
 struct BoxView<'a> {
@@ -109,6 +68,7 @@ pub struct TrackDecryptInfo {
     pub track_id: u32,
     /// `cbcs` crypt/skip byte-block counts from tenc (Apple uses full-sample
     /// encryption, i.e. skip == 0).
+    #[allow(dead_code)] // parsed tenc field kept for format completeness; the CBC path only reads skip/iv size
     pub crypt_byte_block: u8,
     pub skip_byte_block: u8,
     pub default_iv_size: u8,
@@ -152,11 +112,10 @@ fn transform_moov(moov: &[u8], tracks: &mut HashMap<u32, TrackDecryptInfo>) -> R
             "mvex" => {
                 // capture trex track id so tenc info is keyed correctly
                 for c in walk_children(payload(&b)) {
-                    if c.kind == "trex" {
-                        if let Some(p) = payload(&c).get(4..8) {
-                            trex_track_id =
-                                Some(u32::from_be_bytes(p.try_into().unwrap()));
-                        }
+                    if c.kind == "trex"
+                        && let Some(p) = payload(&c).get(4..8)
+                    {
+                        trex_track_id = Some(u32::from_be_bytes(p.try_into().unwrap()));
                     }
                 }
                 children.push(b.raw.to_vec());
@@ -164,10 +123,10 @@ fn transform_moov(moov: &[u8], tracks: &mut HashMap<u32, TrackDecryptInfo>) -> R
             _ => children.push(b.raw.to_vec()),
         }
     }
-    if let Some(t) = trex_track_id {
-        if let Some(info) = tracks.remove(&1) {
-            tracks.insert(t, TrackDecryptInfo { track_id: t, ..info });
-        }
+    if let Some(t) = trex_track_id
+        && let Some(info) = tracks.remove(&1)
+    {
+        tracks.insert(t, TrackDecryptInfo { track_id: t, ..info });
     }
     Ok(build_box("moov", children.iter().map(|v| v.as_slice())))
 }
@@ -527,7 +486,7 @@ pub fn read_fragment(r: &mut impl std::io::Read) -> Result<Option<FragmentSample
             }
         }
     }
-    if sizes.iter().any(|&s| s == 0) {
+    if sizes.contains(&0) {
         bail!("fragment trun has no sizes");
     }
 
@@ -602,11 +561,6 @@ fn build_box<'a>(kind: &str, children: impl Iterator<Item = &'a [u8]>) -> Vec<u8
 
 // ---- fragment decryption ----
 
-pub struct Fragment {
-    /// Rewritten fragment bytes (encryption removed).
-    pub bytes: Vec<u8>,
-}
-
 /// Decrypt one fragment (moof…mdat) with the given template.
 ///
 /// `info` must come from [`parse_init`]. `tmpl` is the key template for this
@@ -654,10 +608,6 @@ pub fn decrypt_fragment(
             }
             if flags & 0x10 != 0 {
                 default_size = Some(u32::from_be_bytes(p[i..i + 4].try_into()?));
-                i += 4;
-            }
-            if flags & 0x20 != 0 {
-                i += 4; // default sample flags
             }
         }
     }
@@ -671,7 +621,6 @@ pub fn decrypt_fragment(
     // senc: sample count + optional per-sample IV/subsample patterns
     let senc = walk_children(payload(traf)).into_iter().find(|b| b.kind == "senc");
     let mut subsamples: Vec<Vec<(u16, u32)>> = Vec::new();
-    let mut iv_total = 0usize;
     if let Some(s) = &senc {
         let (p, flags) = full_payload(s)?;
         let count = u32::from_be_bytes(p[0..4].try_into()?) as usize;
@@ -694,8 +643,6 @@ pub fn decrypt_fragment(
             }
             subsamples.push(pats);
         }
-        iv_total = i - 4 - (if per_sample_sub { 0 } else { 0 });
-        let _ = iv_total;
     }
 
     // trun: sample sizes
@@ -734,7 +681,7 @@ pub fn decrypt_fragment(
             }
         }
     }
-    if sizes.iter().any(|&s| s == 0) {
+    if sizes.contains(&0) {
         bail!("trun missing per-sample sizes and no default size");
     }
 

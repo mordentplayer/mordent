@@ -65,10 +65,11 @@ pub fn pick_variant(master: &str, base_url: &str) -> Result<String> {
             } else {
                 0
             };
-        } else if !line.is_empty() && !line.starts_with('#') {
-            if best.as_ref().map_or(true, |(s, _)| pending_score > *s) {
-                best = Some((pending_score, resolve_relative(base_url, line)));
-            }
+        } else if !line.is_empty()
+            && !line.starts_with('#')
+            && best.as_ref().is_none_or(|(s, _)| pending_score > *s)
+        {
+            best = Some((pending_score, resolve_relative(base_url, line)));
         }
     }
     best.take().map(|(_, u)| u).ok_or_else(|| anyhow!("no variants in master manifest"))
@@ -84,7 +85,6 @@ fn attr(line: &str, name: &str) -> Option<String> {
 /// Manifest texts + the URLs they came from — the material the audio cache
 /// stores, and what `MediaPlan` is reduced from.
 pub struct Manifests {
-    pub master_url: String,
     /// Master manifest text, when the wrapper URL was a master.
     pub master: Option<String>,
     pub media_url: String,
@@ -108,7 +108,6 @@ pub fn fetch_manifests(wrapper: &Wrapper, agent: &ureq::Agent, adam_id: &str) ->
     if !text.contains("#EXT-X-STREAM-INF") {
         // The wrapper URL was already a media manifest.
         return Ok(Manifests {
-            master_url: manifest_url.clone(),
             master: None,
             media_url: manifest_url,
             media: text,
@@ -120,7 +119,6 @@ pub fn fetch_manifests(wrapper: &Wrapper, agent: &ureq::Agent, adam_id: &str) ->
     }
     let media = fetch_text(agent, &media_url)?;
     Ok(Manifests {
-        master_url: manifest_url,
         master: Some(text),
         media_url,
         media,
@@ -297,10 +295,8 @@ impl ProgressiveSource {
         let mut g = self.sh.lock();
         loop {
             if g.downloaded >= need || g.eof {
-                if g.downloaded < need {
-                    if let Some(e) = &g.err {
-                        bail!("stream error: {e}");
-                    }
+                if g.downloaded < need && let Some(e) = &g.err {
+                    bail!("stream error: {e}");
                 }
                 return Ok(g.downloaded >= need);
             }
@@ -496,11 +492,9 @@ impl ProgressiveSource {
         // The resolver borrows the wrapper; the worker thread needs 'static.
         // Templates are Arc'd and cloned out up front for every distinct key.
         let mut templates: Vec<(String, Arc<temari::rounds::Template>)> = Vec::new();
-        for k in &plan.keys {
-            if let Some(uri) = k {
-                if !templates.iter().any(|(u, _)| u == uri) {
-                    templates.push((uri.clone(), resolver.template(uri)?));
-                }
+        for uri in plan.keys.iter().flatten() {
+            if !templates.iter().any(|(u, _)| u == uri) {
+                templates.push((uri.clone(), resolver.template(uri)?));
             }
         }
         let default_key = plan.keys.iter().flatten().next().cloned();
@@ -716,6 +710,7 @@ impl std::fmt::Display for SourceMode {
 /// 1. complete audio-cache entry → decrypt locally, zero network;
 /// 2. otherwise wrapper plan + CDN fetch, populating the cache;
 /// 3. wrapper unreachable / not logged in → uncached preview fallback.
+///
 /// Cache I/O problems never fail the call — they degrade to the network
 /// path (logged once per process).
 pub fn open_track(cfg: &Config, adam_id: &str) -> Result<(ProgressiveSource, SourceMode)> {

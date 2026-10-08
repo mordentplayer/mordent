@@ -166,12 +166,12 @@ impl Mpris {
 /// Connect to the session bus, take the player name and serve both
 /// interfaces. All failures (no bus, name taken) land here as one error.
 fn build_conn(shared: &Arc<Shared>, tx: Sender<Command>) -> zbus::Result<zbus::blocking::Connection> {
-    Ok(zbus::blocking::connection::Builder::session()?
+    zbus::blocking::connection::Builder::session()?
         .name(NAME)?
         .replace_existing_names(true)
         .serve_at(PATH, Root { tx: tx.clone() })?
         .serve_at(PATH, Player { tx, shared: shared.clone() })?
-        .build()?)
+        .build()
 }
 
 fn run(shared: Arc<Shared>, tx: Sender<Command>) {

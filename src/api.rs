@@ -28,9 +28,9 @@ pub struct AlbumHit {
     pub id: String,
     pub name: String,
     pub artist: String,
+    /// Concrete 600×600 artwork URL from the catalog payload.
+    #[allow(dead_code)] // hit payload field; currently only read by unit tests
     pub artwork: Option<String>,
-    /// Raw artwork object (template + palette metadata) for size-aware renders.
-    pub artwork_obj: Option<Artwork>,
     pub track_count: u32,
     pub release_date: String,
     /// Library resources only: when the item was added to the library
@@ -40,10 +40,10 @@ pub struct AlbumHit {
 
 #[derive(Clone, Debug)]
 pub struct ArtistHit {
-    pub id: String,
     pub name: String,
     pub genres: String,
     /// Raw artwork object (template + palette metadata) for size-aware renders.
+    #[allow(dead_code)] // hit payload field; currently only read by unit tests
     pub artwork_obj: Option<Artwork>,
 }
 
@@ -79,12 +79,14 @@ impl Artwork {
     /// `.../600x600bb.jpg`). Placeholder and pre-rendered URLs both work. A
     /// template with a literal crop code keeps it; `{c}` uses the API's
     /// `defaultCropCode` (else `bb`).
+    #[allow(dead_code)] // public render API for hit payloads; app renders via Track::artwork_url
     pub fn url(&self, w: u32, h: u32) -> String {
         render_artwork(&self.url, w, h, self.default_crop_code.as_deref(), None)
     }
 
     /// Square letterbox "fit" render at `size`×`size` (jam/shared-listening
     /// style: image fitted inside the box, background filled).
+    #[allow(dead_code)] // public render API for hit payloads; see `Artwork::url`
     pub fn fit_url(&self, size: u32) -> String {
         render_artwork(&self.url, size, size, Some("bb"), None)
     }
@@ -113,6 +115,7 @@ pub struct LibraryPlaylist {
 
 /// Catalog artist with top songs (`/v1/catalog/{sf}/artists/{id}?views=top-songs`).
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // catalog-artist payload returned by `Api::artist`; no reader yet
 pub struct Artist {
     pub id: String,
     pub name: String,
@@ -141,6 +144,7 @@ struct RawAttrs {
     disc_number: u32,
     artwork: Option<RawArtwork>,
     audio_traits: Vec<String>,
+    #[allow(dead_code)] // wire field kept for payload completeness (previews unused)
     #[serde(default)]
     previews: Vec<RawPreview>,
     #[serde(default)]
@@ -209,6 +213,7 @@ impl RawArtwork {
 
 #[derive(Deserialize, Default)]
 struct RawPreview {
+    #[allow(dead_code)] // wire field kept for payload completeness
     url: String,
 }
 
@@ -266,7 +271,6 @@ impl RawResource {
             name: self.attributes.name.clone(),
             artist: self.attributes.artist_name.clone(),
             artwork: self.artwork_templated(),
-            artwork_obj: self.artwork_obj(),
             track_count: self.attributes.track_count,
             release_date: self.attributes.release_date.clone(),
             date_added: self.attributes.date_added.clone(),
@@ -275,7 +279,6 @@ impl RawResource {
 
     fn to_artist(&self) -> ArtistHit {
         ArtistHit {
-            id: self.id.clone(),
             name: self.attributes.name.clone(),
             genres: self.attributes.genre_names.join(", "),
             artwork_obj: self.artwork_obj(),
@@ -404,13 +407,13 @@ impl Api {
             return Ok(t.clone());
         }
         let cache = cache_path(&self.cfg, "bearer.jwt")?;
-        if fresh(&cache, 12 * 3600) {
-            if let Ok(t) = std::fs::read_to_string(&cache) {
-                let t = t.trim().to_string();
-                if !t.is_empty() {
-                    *self.bearer.borrow_mut() = Some(t.clone());
-                    return Ok(t);
-                }
+        if fresh(&cache, 12 * 3600)
+            && let Ok(t) = std::fs::read_to_string(&cache)
+        {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                *self.bearer.borrow_mut() = Some(t.clone());
+                return Ok(t);
             }
         }
         let t = scrape_bearer(&self.agent, &self.cfg.storefront)?;
@@ -434,10 +437,10 @@ impl Api {
             .get(url)
             .set("Authorization", &format!("Bearer {bearer}"))
             .set("Origin", "https://music.apple.com");
-        if let Some(t) = &self.cfg.media_user_token {
-            if !t.is_empty() {
-                req = req.set("Media-User-Token", t);
-            }
+        if let Some(t) = &self.cfg.media_user_token
+            && !t.is_empty()
+        {
+            req = req.set("Media-User-Token", t);
         }
         let resp = req.call().with_context(|| format!("GET {url}"))?;
         resp.into_json().with_context(|| format!("body of {url}"))
@@ -635,11 +638,6 @@ impl Api {
         }
     }
 
-    /// Tracks of a library playlist (first page only, up to 300).
-    pub fn playlist_tracks(&self, id: &str) -> Result<Vec<Track>> {
-        self.playlist_tracks_page(id, 300, 0).map(|(t, _)| t)
-    }
-
     /// One page of a library playlist's tracks. Returns the tracks plus the
     /// offset for the next page (None = end), mirroring `library_songs`.
     pub fn playlist_tracks_page(
@@ -668,6 +666,7 @@ impl Api {
 
     /// Catalog artist with top songs. Fetches the `top-songs` view and follows
     /// its pagination (capped at 100 songs).
+    #[allow(dead_code)] // catalog-artist API kept complete; no artist view yet (fixture-tested)
     pub fn artist(&self, id: &str) -> Result<Artist> {
         let url = format!(
             "https://amp-api.music.apple.com/v1/catalog/{}/artists/{id}?views=top-songs&l=en-US",
@@ -771,10 +770,10 @@ impl Api {
             .set("Authorization", &format!("Bearer {bearer}"))
             .set("origin", "https://music.apple.com")
             .set("referer", "https://music.apple.com/");
-        if let Some(t) = &self.cfg.media_user_token {
-            if !t.is_empty() {
-                req = req.set("media-user-token", t);
-            }
+        if let Some(t) = &self.cfg.media_user_token
+            && !t.is_empty()
+        {
+            req = req.set("media-user-token", t);
         }
         req.send_json(JsPlayBody {
             client_id: "JSCLIENT",
@@ -1218,10 +1217,11 @@ fn replace_crop_code(s: &str, crop: &str) -> String {
 
 /// Extract a catalog id from an Apple Music URL or return the input as-is.
 pub fn id_from_arg(arg: &str) -> Result<String> {
-    if let Some(id) = arg.split('?').next().unwrap_or(arg).rsplit('/').next() {
-        if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
-            return Ok(id.to_string());
-        }
+    if let Some(id) = arg.split('?').next().unwrap_or(arg).rsplit('/').next()
+        && id.chars().all(|c| c.is_ascii_digit())
+        && !id.is_empty()
+    {
+        return Ok(id.to_string());
     }
     if arg.chars().all(|c| c.is_ascii_digit()) {
         return Ok(arg.to_string());
@@ -1282,7 +1282,7 @@ mod tests {
         // stale → lookup declines but the stale fallback still serves it
         let p = api.meta_path(url).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
-        let (head, body) = raw.split_once('\n').unwrap();
+        let (_, body) = raw.split_once('\n').unwrap();
         let old = format!("{{\"stored\":0,\"ttl\":{}}}\n{body}", META_TTL_CATALOG);
         std::fs::write(&p, old).unwrap();
         assert!(api.meta_lookup(url).is_none());

@@ -455,10 +455,10 @@ impl App {
     }
 
     fn spawn_playlist_tracks(&mut self, id: String, offset: u32) {
-        if let Some(m) = &mut self.playlist_modal {
-            if m.playlist.id == id {
-                m.loading_more = offset > 0;
-            }
+        if let Some(m) = &mut self.playlist_modal
+            && m.playlist.id == id
+        {
+            m.loading_more = offset > 0;
         }
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
@@ -644,7 +644,9 @@ impl App {
         self.fake_play = None;
         self.fake_pause_at = None;
         self.resume_paused = self.player.sink().is_some_and(|s| s.is_paused());
-        self.player.sink().map(|s| s.clear());
+        if let Some(s) = self.player.sink() {
+            s.clear();
+        }
         self.generation += 1;
         let generation = self.generation;
         let tx = self.tx.clone();
@@ -942,7 +944,9 @@ impl App {
         self.fake_play = None;
         self.fake_pause_at = None;
         self.play_offset = std::time::Duration::ZERO;
-        self.player.sink().map(|s| s.clear());
+        if let Some(s) = self.player.sink() {
+            s.clear();
+        }
     }
 
     /// ⏮: restart current if >3s elapsed, else the previous entry (pointer-1);
@@ -1012,7 +1016,11 @@ impl App {
                 self.fake_pause_at = Some(std::time::Instant::now());
             }
         } else {
-            self.player.sink().map(|s| if !s.is_paused() { s.pause(); });
+            if let Some(s) = self.player.sink()
+                && !s.is_paused()
+            {
+                s.pause();
+            }
         }
         if playing {
             let pos = self.report_pos_ms();
@@ -1286,24 +1294,24 @@ impl App {
                     self.playlists.get_or_insert_with(Vec::new).extend(lists);
                     self.playlists_next = next;
                     self.playlists_loading = false;
-                    if let Some(n) = self.demo_playlist.take() {
-                        if let Some(p) = self.playlists.as_ref().and_then(|v| v.get(n)).cloned() {
-                            self.open_playlist(p);
-                        }
+                    if let Some(n) = self.demo_playlist.take()
+                        && let Some(p) = self.playlists.as_ref().and_then(|v| v.get(n)).cloned()
+                    {
+                        self.open_playlist(p);
                     }
                 }
                 Msg::PlaylistTracks { id, tracks, next } => {
                     self.remember_tracks(&tracks);
-                    if let Some(m) = &mut self.playlist_modal {
-                        if m.playlist.id == id {
-                            if m.loading_more {
-                                m.tracks.get_or_insert_with(Vec::new).extend(tracks);
-                            } else {
-                                m.tracks = Some(tracks);
-                            }
-                            m.next = next;
-                            m.loading_more = false;
+                    if let Some(m) = &mut self.playlist_modal
+                        && m.playlist.id == id
+                    {
+                        if m.loading_more {
+                            m.tracks.get_or_insert_with(Vec::new).extend(tracks);
+                        } else {
+                            m.tracks = Some(tracks);
                         }
+                        m.next = next;
+                        m.loading_more = false;
                     }
                 }
                 Msg::Source(g, src) => {
@@ -1311,20 +1319,23 @@ impl App {
                         self.player.enqueue(*src);
                         self.preparing = false;
                         if self.resume_paused {
-                            self.player.sink().map(|s| s.pause());
+                            if let Some(s) = self.player.sink() {
+                                s.pause();
+                            }
                             self.resume_paused = false;
                         }
                         // start the decode-only fake clock (keep a seek target);
                         // tuple = (clock start, elapsed-at-end)
-                        if self.player.decode_only && self.fake_play.is_none() {
-                            if let Some(t) = &self.now {
-                                let end =
-                                    std::time::Duration::from_millis(t.duration_ms.min(8_000));
-                                let start = std::time::Instant::now()
-                                    .checked_sub(self.play_offset)
-                                    .unwrap_or_else(std::time::Instant::now);
-                                self.fake_play = Some((start, end));
-                            }
+                        if self.player.decode_only
+                            && self.fake_play.is_none()
+                            && let Some(t) = &self.now
+                        {
+                            let end =
+                                std::time::Duration::from_millis(t.duration_ms.min(8_000));
+                            let start = std::time::Instant::now()
+                                .checked_sub(self.play_offset)
+                                .unwrap_or_else(std::time::Instant::now);
+                            self.fake_play = Some((start, end));
                         }
                     } // stale: dropping src also cancels its download
                 }
@@ -1345,10 +1356,10 @@ impl App {
                     if modal_want {
                         self.album_job = None;
                         self.remember_tracks(&tracks);
-                        if let Some(m) = &mut self.album_modal {
-                            if m.album.id == id {
-                                m.tracks = Some(tracks);
-                            }
+                        if let Some(m) = &mut self.album_modal
+                            && m.album.id == id
+                        {
+                            m.tracks = Some(tracks);
                         }
                     } else if queue_want {
                         self.album_job = None;
@@ -1597,10 +1608,10 @@ impl App {
         // First call happens on the first frame: apply even if the file is
         // absent, so the built-in defaults are the ones actually in use.
         let first_frame = self.theme_poll.is_none();
-        if let Some(t) = self.theme_poll {
-            if t.elapsed() < std::time::Duration::from_millis(1000) {
-                return;
-            }
+        if let Some(t) = self.theme_poll
+            && t.elapsed() < std::time::Duration::from_millis(1000)
+        {
+            return;
         }
         self.theme_poll = Some(std::time::Instant::now());
         let path = crate::theme::theme_path();
@@ -1637,19 +1648,19 @@ impl eframe::App for App {
         self.drain_mpris(ctx);
 
         // ---- debounced state.toml write (favorite toggles) ----
-        if let Some(t) = self.state_dirty {
-            if t.elapsed() >= std::time::Duration::from_millis(1000) {
-                self.save_ui_state();
-            }
+        if let Some(t) = self.state_dirty
+            && t.elapsed() >= std::time::Duration::from_millis(1000)
+        {
+            self.save_ui_state();
         }
 
         // ---- sleep timer ----
-        if let Some((t0, d)) = self.sleep_at {
-            if t0.elapsed() >= d {
-                self.sleep_at = None;
-                self.pause_now();
-                self.fail("sleep timer expired — playback paused".into());
-            }
+        if let Some((t0, d)) = self.sleep_at
+            && t0.elapsed() >= d
+        {
+            self.sleep_at = None;
+            self.pause_now();
+            self.fail("sleep timer expired — playback paused".into());
         }
 
         // ---- auto-advance ----
@@ -1944,10 +1955,10 @@ impl App {
                 });
                 if self.library_next.is_some() && !loading {
                     ui.add_space(4.0);
-                    if ui.small_button("load more").clicked() {
-                        if let Some(next) = self.library_next {
-                            self.spawn_library(next);
-                        }
+                    if ui.small_button("load more").clicked()
+                        && let Some(next) = self.library_next
+                    {
+                        self.spawn_library(next);
                     }
                 }
             }
@@ -2175,10 +2186,10 @@ impl App {
                         }
                     }
                 });
-                if load_more {
-                    if let Some(next) = self.playlists_next {
-                        self.spawn_playlists(next);
-                    }
+                if load_more
+                    && let Some(next) = self.playlists_next
+                {
+                    self.spawn_playlists(next);
                 }
             }
         }
@@ -2957,13 +2968,13 @@ fn seek_bar_ui(
         accent,
     );
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    if resp.clicked() {
-        if let Some(p) = resp.interact_pointer_pos() {
-            let f = ((p.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) as f64;
-            *act = Some(BarIntent::Seek(std::time::Duration::from_secs_f64(
-                f * total.as_secs_f64(),
-            )));
-        }
+    if resp.clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let f = ((p.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        *act = Some(BarIntent::Seek(std::time::Duration::from_secs_f64(
+            f * total.as_secs_f64(),
+        )));
     }
 }
 
