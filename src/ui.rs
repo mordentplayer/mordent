@@ -384,7 +384,7 @@ impl eframe::App for App {
                     self.spawn_search();
                     resp.request_focus();
                 }
-                if ui.button("⌕").clicked() {
+                if ui.small_button("go").clicked() {
                     self.view = View::Search;
                     self.spawn_search();
                 }
@@ -406,16 +406,9 @@ impl eframe::App for App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                if ui
-                    .button(
-                        if self.player.sink().is_some_and(|s| s.is_paused()) {
-                            "▶"
-                        } else {
-                            "⏸"
-                        },
-                    )
-                    .clicked()
-                {
+                let paused = self.now.is_none()
+                    || self.player.sink().is_some_and(|s| s.is_paused());
+                if ui.button(if paused { "▶" } else { "⏸" }).clicked() {
                     self.player.toggle_pause();
                 }
                 if ui.button("⏭").clicked() {
@@ -543,13 +536,14 @@ impl eframe::App for App {
                 return;
             }
             ui.add_space(2.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show_rows(ui, 24.0, rows.len(), |ui, range| {
-                    for i in range {
-                        let t = rows[i].clone();
-                        let playing = self.now.as_ref().is_some_and(|n| n.id == t.id);
-                        ui.horizontal(|ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                egui::Grid::new("rows")
+                    .num_columns(7)
+                    .spacing([10.0, 2.0])
+                    .min_col_width(0.0)
+                    .show(ui, |ui| {
+                        for (i, t) in rows.iter().enumerate() {
+                            let playing = self.now.as_ref().is_some_and(|n| n.id == t.id);
                             let mark = if playing {
                                 "▶".to_string()
                             } else {
@@ -557,56 +551,48 @@ impl eframe::App for App {
                             };
                             ui.monospace(format!("{mark:>3}"));
                             let name = egui::RichText::new(&t.name).size(13.0).strong();
-                            if ui
-                                .add_sized(
-                                    [280.0, 18.0],
-                                    egui::Label::new(name)
-                                        .sense(egui::Sense::click())
-                                        .halign(egui::Align::LEFT)
-                                        .truncate(),
-                                )
-                                .clicked()
-                            {
+                            if cell(ui, 280.0, 18.0, name, true).clicked() {
                                 self.play_now(t.clone());
                             }
-                            ui.add_sized(
-                                [160.0, 18.0],
-                                egui::Label::new(
-                                    egui::RichText::new(&t.artist).weak().size(12.0),
-                                )
-                                .halign(egui::Align::LEFT)
-                                .truncate(),
+                            cell(
+                                ui,
+                                250.0,
+                                18.0,
+                                egui::RichText::new(&t.artist).weak().size(12.0),
+                                false,
                             );
-                            ui.add_sized(
-                                [190.0, 18.0],
-                                egui::Label::new(
-                                    egui::RichText::new(if t.album.is_empty() {
-                                        ""
-                                    } else {
-                                        &t.album
-                                    })
-                                    .weak()
-                                    .size(11.0),
-                                )
-                                .halign(egui::Align::LEFT)
-                                .truncate(),
+                            cell(
+                                ui,
+                                230.0,
+                                18.0,
+                                egui::RichText::new(if t.album.is_empty() {
+                                    ""
+                                } else {
+                                    &t.album
+                                })
+                                .weak()
+                                .size(11.0),
+                                false,
                             );
                             if ui.small_button("+").clicked() {
                                 self.enqueue(t.clone());
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.monospace(fmt_ms(t.duration_ms));
-                                if t.lossless {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(0x6a, 0xd1, 0xa8),
-                                        egui::RichText::new("lossless").size(10.0),
-                                    );
-                                }
-                            });
-                        });
-                        ui.separator();
-                    }
-                });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(fmt_ms(t.duration_ms));
+                                    if t.lossless {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(0x6a, 0xd1, 0xa8),
+                                            egui::RichText::new("lossless").size(10.0),
+                                        );
+                                    }
+                                },
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
 
             // ---- albums (search view only) ----
             if self.view == View::Search {
@@ -651,6 +637,28 @@ impl eframe::App for App {
 
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
+}
+
+/// Left-aligned fixed-width text cell (add_sized centres content, which made
+/// columns look ragged).
+fn cell(
+    ui: &mut egui::Ui,
+    w: f32,
+    h: f32,
+    text: egui::RichText,
+    clickable: bool,
+) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let mut label = egui::Label::new(text).truncate();
+            if clickable {
+                label = label.sense(egui::Sense::click());
+            }
+            ui.add(label)
+        },
+    ).inner
 }
 
 fn fmt_ms(ms: u64) -> String {
