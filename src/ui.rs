@@ -1,39 +1,77 @@
-//! Dense egui UI: search-first, albums, explicit queue, player bar.
-//! Keyboard: `/` or Ctrl+F focus search · Enter search · Space pause ·
-//! N or ⏭ skip · Ctrl+Q quit.
+//! Dense egui UI: search / albums / library tabs, album detail modal,
+//! explicit queue, upgraded player bar.
 //!
 //! Playback model: clicking a row plays it NOW (replacing current; the stale
 //! async source is dropped, which also cancels its download). `+` appends to
-//! the queue. Album rows queue their tracks and start the first one.
+//! the queue. Album rows open a detail modal; album `+` enqueues the whole
+//! album (tracks fetched on click).
+//!
+//! In decode-only mode (no audio device) a fake playback clock simulates the
+//! running track so queue/auto-advance behaves like a real player.
 
-use crate::api::{Api, SearchResults, Track};
+use crate::api::{AlbumHit, Api, SearchResults, Track};
 use crate::config::Config;
 use crate::player::{PacketSource, Player};
 use crate::{stream, wrapper};
 use eframe::egui;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
+
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xfa, 0x4d, 0x6a);
+const LOSSLESS: egui::Color32 = egui::Color32::from_rgb(0x6a, 0xd1, 0xa8);
 
 enum Msg {
     Results(Box<SearchResults>),
     Library(Vec<Track>, Option<u32>),
     /// Fully prepared decoder for the given playback generation.
     Source(u64, Box<PacketSource>),
-    /// Tracks of a clicked album, in order.
-    AlbumTracks(Vec<Track>),
+    /// Tracks of an album, in order, tagged with the album they belong to.
+    AlbumTracks {
+        id: String,
+        #[allow(dead_code)]
+        name: String,
+        tracks: Vec<Track>,
+    },
     Error(String),
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     Search,
+    Albums,
     Library,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Repeat {
+    Off,
+    All,
+    One,
+}
+
+/// Why an album is being fetched: to open the detail modal or to enqueue.
+enum AlbumJob {
+    Modal { id: String },
+    Queue { id: String },
+}
+
+/// Open album detail modal.
+struct AlbumModal {
+    album: AlbumHit,
+    tracks: Option<Vec<Track>>,
+}
+
+/// Clicks gathered during widget rendering, applied after borrow ends.
+enum CentralAction {
+    Play(Track),
+    Enqueue(Track),
+    OpenAlbum(AlbumHit),
+    QueueAlbum(AlbumHit),
 }
 
 struct SelftestState {
     stage: u8,
-    expect: [String; 3],
+    expect: [String; 2],
     started: std::time::Instant,
 }
 
@@ -41,6 +79,8 @@ pub struct App {
     cfg: Config,
     player: Player,
     search: String,
+    /// Last executed search term (for empty-state copy).
+    last_term: String,
     results: Option<SearchResults>,
     searching: bool,
     view: View,
@@ -55,14 +95,34 @@ pub struct App {
     /// A worker is building the source for the current generation.
     preparing: bool,
     show_queue: bool,
-    /// decode-only (no audio device): simulated playback window so the
-    /// queue/auto-advance state machine behaves like a real player
+    /// decode-only (no audio device): simulated playback window
+    /// (clock start, remaining duration).
     fake_play: Option<(std::time::Instant, std::time::Duration)>,
+    /// decode-only pause point (frozen clock).
+    fake_pause_at: Option<std::time::Instant>,
+    /// Sink-mode playback starts at this offset (pre-seek samples were
+    /// discarded by the worker).
+    play_offset: std::time::Duration,
+    /// Re-pause the sink when a seek restart lands.
+    resume_paused: bool,
+    /// Tracks finished or replaced (for ⏮), newest last.
+    history: VecDeque<Track>,
+    repeat: Repeat,
+    shuffle: bool,
+    /// Queue order before shuffle was enabled.
+    shuffle_saved: Option<VecDeque<Track>>,
+    /// Album being fetched, and what to do with its tracks.
+    album_job: Option<AlbumJob>,
+    /// Album id whose `+` is pending (shows "adding…").
+    album_busy: Option<String>,
+    album_modal: Option<AlbumModal>,
+    cheatsheet: bool,
     /// AMC_SELFTEST=1: drive play_now/queue/auto-advance deterministically
     /// and print SELFTEST PASS/FAIL (headless CI aid).
     selftest: Option<SelftestState>,
     volume: f32,
-    error: Option<String>,
+    error: Option<(String, std::time::Instant)>,
+    last_title: String,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
 }
@@ -76,6 +136,7 @@ impl App {
             cfg,
             player,
             search: String::new(),
+            last_term: String::new(),
             results: None,
             searching: false,
             view: View::Search,
@@ -88,6 +149,17 @@ impl App {
             preparing: false,
             show_queue: false,
             fake_play: None,
+            fake_pause_at: None,
+            play_offset: std::time::Duration::ZERO,
+            resume_paused: false,
+            history: VecDeque::new(),
+            repeat: Repeat::Off,
+            shuffle: false,
+            shuffle_saved: None,
+            album_job: None,
+            album_busy: None,
+            album_modal: None,
+            cheatsheet: false,
             selftest: std::env::var("AMC_SELFTEST").is_ok().then(|| SelftestState {
                 stage: 0,
                 expect: Default::default(),
@@ -95,20 +167,23 @@ impl App {
             }),
             volume: 0.8,
             error: None,
+            last_title: "amc".into(),
             rx,
             tx,
         };
         if app.selftest.is_some() {
             eprintln!("[selftest] armed");
         }
-        // headless verification hook: AMC_DEMO_TERM=<query> auto-searches,
-        // AMC_DEMO_VIEW=library opens the library view
+        // headless verification hooks: AMC_DEMO_TERM=<query> auto-searches,
+        // AMC_DEMO_VIEW=library|albums opens that view
         if let Ok(term) = std::env::var("AMC_DEMO_TERM") {
             app.search = term;
             app.spawn_search();
         }
-        if std::env::var("AMC_DEMO_VIEW").as_deref() == Ok("library") {
-            app.switch_view(View::Library);
+        match std::env::var("AMC_DEMO_VIEW").as_deref() {
+            Ok("library") => app.switch_view(View::Library),
+            Ok("albums") => app.view = View::Albums,
+            _ => {}
         }
         app
     }
@@ -121,6 +196,7 @@ impl App {
             return;
         }
         self.searching = true;
+        self.last_term = term.clone();
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
@@ -142,35 +218,55 @@ impl App {
         });
     }
 
+    fn spawn_library(&mut self, offset: u32) {
+        self.library_loading = true;
+        let tx = self.tx.clone();
+        let cfg = self.cfg.clone();
+        std::thread::spawn(move || {
+            match Api::new(cfg).and_then(|api| api.library_songs(100, offset)) {
+                Ok((songs, next)) => {
+                    let _ = tx.send(Msg::Library(songs, next));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
     fn switch_view(&mut self, v: View) {
         self.view = v;
         if v == View::Library && self.library.is_none() && !self.library_loading {
-            self.library_loading = true;
-            let tx = self.tx.clone();
-            let cfg = self.cfg.clone();
-            std::thread::spawn(move || {
-                match Api::new(cfg).and_then(|api| api.library_songs(100, 0)) {
-                    Ok((songs, next)) => {
-                        let _ = tx.send(Msg::Library(songs, next));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Msg::Error(format!("{e:#}")));
-                    }
-                }
-            });
+            self.spawn_library(0);
         }
     }
 
-    /// Play a track immediately: cancels whatever is current/preparing.
-    fn play_now(&mut self, track: Track) {
+    fn fail(&mut self, e: String) {
+        self.error = Some((e, std::time::Instant::now()));
+    }
+
+    /// Play a track immediately at `offset`: cancels whatever is
+    /// current/preparing by bumping the generation.
+    fn play_now_at(&mut self, track: Track, offset: std::time::Duration, record: bool) {
         eprintln!("[play] {} — {}", track.name, track.artist);
+        if record {
+            if let Some(old) = self.now.take() {
+                self.push_history(old);
+            }
+        } else {
+            self.now = None;
+        }
         self.preparing = true;
         self.now = Some(track.clone());
+        self.play_offset = offset;
         self.fake_play = None;
+        self.fake_pause_at = None;
+        self.resume_paused = self.player.sink().is_some_and(|s| s.is_paused());
         self.player.sink().map(|s| s.clear());
+        self.generation += 1;
+        let generation = self.generation;
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
-        let generation = self.generation;
         let t = track;
         std::thread::Builder::new().name("play-worker".into()).spawn(move || {
             let res = (|| -> anyhow::Result<()> {
@@ -187,7 +283,16 @@ impl App {
                     stream::ProgressiveSource::start_plain(&url, cache, agent)?
                 };
                 let cancel = prog.cancel_flag();
-                let src = PacketSource::with_cancel(Box::new(prog), cancel)?;
+                let mut src = PacketSource::with_cancel(Box::new(prog), cancel)?;
+                // Seek = restart the stream and discard output before the
+                // offset (decode is ~100x realtime, so this is cheap).
+                if offset.as_nanos() > 0 {
+                    let per_sec = src.sample_rate as u64 * src.channels.max(1) as u64;
+                    let mut left = (offset.as_secs_f64() * per_sec as f64) as u64;
+                    while left > 0 && src.next().is_some() {
+                        left -= 1;
+                    }
+                }
                 tx.send(Msg::Source(generation, Box::new(src)))
                     .map_err(|_| anyhow::anyhow!("channel closed"))
             })();
@@ -197,21 +302,39 @@ impl App {
         });
     }
 
+    fn play_now(&mut self, track: Track) {
+        self.play_now_at(track, std::time::Duration::ZERO, true);
+    }
+
+    fn push_history(&mut self, t: Track) {
+        self.history.push_back(t);
+        while self.history.len() > 100 {
+            self.history.pop_front();
+        }
+    }
+
     fn enqueue(&mut self, track: Track) {
         self.queue.push_back(track);
     }
 
-    fn play_album(&mut self, album_id: String, name: String) {
+    /// Play album tracks: first plays now, the rest are appended to the
+    /// queue in order.
+    fn play_album_tracks(&mut self, tracks: Vec<Track>) {
+        let mut it = tracks.into_iter();
+        if let Some(first) = it.next() {
+            self.queue.extend(it);
+            self.play_now(first);
+        }
+    }
+
+    fn spawn_album_fetch(&mut self, id: String, name: String) {
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            let res = Api::new(cfg).and_then(|api| api.album_tracks_any(&album_id));
+            let res = Api::new(cfg).and_then(|api| api.album_tracks_any(&id));
             match res {
-                Ok(tracks) if tracks.is_empty() => {
-                    let _ = tx.send(Msg::Error(format!("album {name}: no tracks")));
-                }
                 Ok(tracks) => {
-                    let _ = tx.send(Msg::AlbumTracks(tracks));
+                    let _ = tx.send(Msg::AlbumTracks { id, name, tracks });
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Error(format!("{e:#}")));
@@ -220,37 +343,280 @@ impl App {
         });
     }
 
-    fn play_next(&mut self) {
-        if let Some(t) = self.queue.pop_front() {
-            self.play_now(t);
-        } else {
-            self.now = None;
-            self.generation += 1; // invalidate any in-flight source
-            self.preparing = false;
-            self.fake_play = None;
+    /// Open the album detail modal (fetches tracks).
+    fn open_album(&mut self, album: AlbumHit) {
+        self.cheatsheet = false;
+        self.album_modal = Some(AlbumModal {
+            tracks: None,
+            album: album.clone(),
+        });
+        self.album_job = Some(AlbumJob::Modal { id: album.id.clone() });
+        self.spawn_album_fetch(album.id, album.name);
+    }
+
+    /// Enqueue a whole album (fetches tracks; `+` shows "adding…" meanwhile).
+    fn queue_album(&mut self, album: AlbumHit) {
+        if self.album_busy.is_some() {
+            return;
+        }
+        self.album_busy = Some(album.id.clone());
+        self.album_job = Some(AlbumJob::Queue { id: album.id.clone() });
+        self.spawn_album_fetch(album.id, album.name);
+    }
+
+    fn close_album_modal(&mut self) {
+        self.album_modal = None;
+        self.album_job = None;
+    }
+
+    /// Swap queue row `i` with its neighbour (`delta` -1 = up, +1 = down).
+    fn queue_move(&mut self, i: usize, delta: isize) {
+        let Some(j) = (i as isize).checked_add(delta) else {
+            return;
+        };
+        if j < 0 || j as usize >= self.queue.len() {
+            return;
+        }
+        self.queue.swap(i, j as usize);
+    }
+
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        if self.shuffle {
+            self.shuffle_saved = Some(self.queue.drain(..).collect());
+            let mut v: Vec<Track> = self
+                .shuffle_saved
+                .as_ref()
+                .expect("just saved")
+                .iter()
+                .cloned()
+                .collect();
+            let mut seed = std::time::Instant::now().elapsed().as_nanos() as u64 | 1;
+            let mut rnd = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            for i in (1..v.len()).rev() {
+                let j = (rnd() % (i as u64 + 1)) as usize;
+                v.swap(i, j);
+            }
+            self.queue = v.into();
+        } else if let Some(saved) = self.shuffle_saved.take() {
+            // restore the pre-shuffle order minus anything since removed
+            let keep: HashSet<String> = self.queue.iter().map(|t| t.id.clone()).collect();
+            self.queue = saved.into_iter().filter(|t| keep.contains(&t.id)).collect();
         }
     }
-}
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut focus_search = false;
+    /// Elapsed time of the current track (fake clock in decode-only mode).
+    fn playback_position(&self) -> std::time::Duration {
+        match (&self.fake_play, &self.fake_pause_at) {
+            (Some((start, cap)), Some(p)) => p
+                .checked_duration_since(*start)
+                .unwrap_or_default()
+                .min(*cap),
+            (Some((start, cap)), None) => start.elapsed().min(*cap),
+            _ => self.player.position().unwrap_or_default() + self.play_offset,
+        }
+    }
 
-        // ---- global keyboard ----
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && !ctx.wants_keyboard_input() {
+    fn is_paused(&self) -> bool {
+        if self.now.is_none() {
+            return true;
+        }
+        if self.player.decode_only {
+            self.fake_play.is_some() && self.fake_pause_at.is_some()
+        } else {
+            self.player.sink().is_some_and(|s| s.is_paused())
+        }
+    }
+
+    fn toggle_pause_now(&mut self) {
+        if self.now.is_none() {
+            return;
+        }
+        if self.player.decode_only {
+            if let Some((start, _)) = &mut self.fake_play {
+                if let Some(p) = self.fake_pause_at.take() {
+                    if let Some(frozen) = p.checked_duration_since(*start) {
+                        *start += frozen;
+                    }
+                } else {
+                    self.fake_pause_at = Some(std::time::Instant::now());
+                }
+            }
+        } else {
             self.player.toggle_pause();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::N)) && !ctx.wants_keyboard_input() {
-            self.player.skip();
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Q)) && !ctx.wants_keyboard_input() {
-            self.show_queue = !self.show_queue;
-        }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Q)) {
-            std::process::exit(0);
-        }
+    }
 
-        // ---- poll worker messages ----
+    /// Skip to the next queued track (manual).
+    fn skip_current(&mut self) {
+        if self.now.is_none() {
+            return;
+        }
+        self.player.skip();
+        self.advance(true);
+    }
+
+    /// Advance to the next track; `manual` = user-initiated (⏭ / N), which
+    /// ignores repeat-one/repeat-all wrapping.
+    fn advance(&mut self, manual: bool) {
+        let Some(finished) = self.now.take() else {
+            return;
+        };
+        if !manual && self.repeat == Repeat::One {
+            self.push_history(finished.clone());
+            self.play_now_at(finished, std::time::Duration::ZERO, false);
+            return;
+        }
+        if let Some(next) = self.queue.pop_front() {
+            self.push_history(finished);
+            self.play_now_at(next, std::time::Duration::ZERO, true);
+            return;
+        }
+        if !manual && self.repeat == Repeat::All {
+            // replay the session history in order
+            let hist: Vec<Track> = self.history.drain(..).collect();
+            if let Some(first) = hist.first() {
+                let first = first.clone();
+                self.queue.extend(hist.into_iter().skip(1));
+                self.play_now_at(first, std::time::Duration::ZERO, true);
+                return;
+            }
+        }
+        // stop
+        self.push_history(finished);
+        self.generation += 1; // invalidate any in-flight source
+        self.preparing = false;
+        self.fake_play = None;
+        self.fake_pause_at = None;
+        self.play_offset = std::time::Duration::ZERO;
+    }
+
+    /// ⏮: restart current if >3s elapsed, else previous track.
+    fn prev_track(&mut self) {
+        if self.now.is_some() && self.playback_position().as_secs_f64() > 3.0 {
+            self.seek_to(std::time::Duration::ZERO);
+        } else if let Some(t) = self.history.pop_back() {
+            self.play_now_at(t, std::time::Duration::ZERO, false);
+        } else if self.now.is_some() {
+            self.seek_to(std::time::Duration::ZERO);
+        }
+    }
+
+    /// Click-to-seek / ±5s. Sink mode restarts the stream at the offset;
+    /// decode-only shifts the fake clock.
+    fn seek_to(&mut self, target: std::time::Duration) {
+        let Some(t) = self.now.as_ref().map(|t| t.duration_ms) else {
+            return;
+        };
+        let total = std::time::Duration::from_millis(t);
+        let target = target.min(total);
+        if self.player.decode_only {
+            let now = std::time::Instant::now();
+            self.fake_play = Some((
+                now.checked_sub(target).unwrap_or(now),
+                total.saturating_sub(target),
+            ));
+            if self.fake_pause_at.is_some() {
+                self.fake_pause_at = Some(now);
+            }
+            self.play_offset = target;
+        } else if self.now.is_some() {
+            self.play_now_at(
+                self.now.clone().expect("checked above"),
+                target,
+                false, // don't push the restarted track onto history
+            );
+        }
+    }
+
+    fn change_volume(&mut self, delta: f32) {
+        self.volume = (self.volume + delta).clamp(0.0, 1.0);
+        self.player.volume(self.volume);
+    }
+
+    // ---- keyboard ----
+
+    fn handle_keys(&mut self, ctx: &egui::Context) -> bool {
+        let mut focus_search = false;
+        let typing = ctx.wants_keyboard_input();
+        ctx.input(|i| {
+            // Esc works even while a text field has focus
+            if i.key_pressed(egui::Key::Escape) {
+                if self.cheatsheet {
+                    self.cheatsheet = false;
+                } else if self.album_modal.is_some() {
+                    self.close_album_modal();
+                } else if self.show_queue {
+                    self.show_queue = false;
+                }
+            }
+            if typing {
+                return;
+            }
+            if i.key_pressed(egui::Key::Space) {
+                self.toggle_pause_now();
+            }
+            if i.key_pressed(egui::Key::N) {
+                self.skip_current();
+            }
+            if i.key_pressed(egui::Key::P) {
+                self.prev_track();
+            }
+            if i.key_pressed(egui::Key::Q) {
+                self.show_queue = !self.show_queue;
+            }
+            if i.key_pressed(egui::Key::Slash) && i.modifiers.shift {
+                self.cheatsheet = !self.cheatsheet;
+            }
+            if i.key_pressed(egui::Key::Slash) && !i.modifiers.shift {
+                focus_search = true;
+            }
+            let total_ms = self.now.as_ref().map(|t| t.duration_ms).unwrap_or(0);
+            if total_ms > 0 {
+                let step = std::time::Duration::from_secs(5);
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    let t = self.playback_position() + step;
+                    self.seek_to(t);
+                }
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    self.seek_to(self.playback_position().saturating_sub(step));
+                }
+            }
+            if i.key_pressed(egui::Key::ArrowUp) {
+                self.change_volume(0.05);
+            }
+            if i.key_pressed(egui::Key::ArrowDown) {
+                self.change_volume(-0.05);
+            }
+            if i.modifiers.command {
+                if i.key_pressed(egui::Key::Num1) {
+                    self.switch_view(View::Search);
+                }
+                if i.key_pressed(egui::Key::Num2) {
+                    self.switch_view(View::Albums);
+                }
+                if i.key_pressed(egui::Key::Num3) {
+                    self.switch_view(View::Library);
+                }
+                if i.key_pressed(egui::Key::Q) {
+                    std::process::exit(0);
+                }
+                if i.key_pressed(egui::Key::F) {
+                    focus_search = true;
+                }
+            }
+        });
+        focus_search
+    }
+
+    // ---- worker messages ----
+
+    fn poll_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Results(r) => {
@@ -266,38 +632,112 @@ impl eframe::App for App {
                     if g == self.generation {
                         self.player.enqueue(*src);
                         self.preparing = false;
+                        if self.resume_paused {
+                            self.player.sink().map(|s| s.pause());
+                            self.resume_paused = false;
+                        }
+                        // start the decode-only fake clock (keep a seek target)
+                        if self.player.decode_only && self.fake_play.is_none() {
+                            if let Some(t) = &self.now {
+                                let start = std::time::Instant::now() + self.play_offset;
+                                let rem = std::time::Duration::from_millis(
+                                    t.duration_ms.min(8_000),
+                                )
+                                .saturating_sub(self.play_offset);
+                                self.fake_play = Some((start, rem));
+                            }
+                        }
                     } // stale: dropping src also cancels its download
                 }
-                Msg::AlbumTracks(tracks) => {
-                    let mut it = tracks.into_iter();
-                    if let Some(first) = it.next() {
-                        self.queue = it.collect();
-                        self.play_now(first);
+                Msg::AlbumTracks { id, tracks, .. } => {
+                    let modal_want =
+                        matches!(&self.album_job, Some(AlbumJob::Modal { id: w }) if w.as_str() == id.as_str());
+                    let queue_want =
+                        matches!(&self.album_job, Some(AlbumJob::Queue { id: w }) if w.as_str() == id.as_str());
+                    if modal_want {
+                        self.album_job = None;
+                        if let Some(m) = &mut self.album_modal {
+                            if m.album.id == id {
+                                m.tracks = Some(tracks);
+                            }
+                        }
+                    } else if queue_want {
+                        self.album_job = None;
+                        self.album_busy = None;
+                        self.queue.extend(tracks);
                     }
                 }
                 Msg::Error(e) => {
-                    self.error = Some(e);
+                    self.fail(e);
                     self.searching = false;
                     self.preparing = false;
+                    self.album_job = None;
+                    self.album_busy = None;
+                    self.library_loading = false;
                 }
             }
         }
-        // ---- deterministic selftest (AMC_SELFTEST=1) ----
+    }
+
+    // ---- deterministic selftest (AMC_SELFTEST=1) ----
+
+    fn selftest_step(&mut self) {
         if self
             .selftest
             .as_ref()
             .is_some_and(|st| st.stage == 0 && self.results.as_ref().is_some_and(|r| r.tracks.len() >= 3))
         {
-            let tracks = &self.results.as_ref().unwrap().tracks;
-            let expect = [
-                tracks[2].name.clone(),
-                tracks[0].name.clone(),
-                tracks[1].name.clone(),
-            ];
-            self.queue = [tracks[0].clone(), tracks[1].clone()].into();
-            self.play_now(tracks[2].clone());
+            let (n0, _n1, n2) = {
+                let tracks = &self.results.as_ref().expect("checked").tracks;
+                (
+                    tracks[0].name.clone(),
+                    tracks[1].name.clone(),
+                    tracks[2].name.clone(),
+                )
+            };
+            let (_id0, id1) = {
+                let tracks = &self.results.as_ref().expect("checked").tracks;
+                (tracks[0].id.clone(), tracks[1].id.clone())
+            };
+            self.queue = self
+                .results
+                .as_ref()
+                .expect("checked")
+                .tracks
+                .iter()
+                .take(2)
+                .cloned()
+                .collect();
+            // reorder assertion: same method the ▲▼ buttons call
+            self.queue_move(1, -1);
+            let ok_up = self.queue.front().map(|t| t.id.as_str()) == Some(id1.as_str());
+            self.queue_move(0, 1);
+            let ok_down = self.queue.get(1).map(|t| t.id.as_str()) == Some(id1.as_str());
+            // shuffle toggle must restore the original order deterministically
+            let before: Vec<String> = self.queue.iter().map(|t| t.id.clone()).collect();
+            self.toggle_shuffle();
+            self.toggle_shuffle();
+            let after: Vec<String> = self.queue.iter().map(|t| t.id.clone()).collect();
+            let ok_shuffle = after == before;
+            if !ok_up || !ok_down || !ok_shuffle {
+                eprintln!(
+                    "[selftest] stage0 FAIL (reorder up={ok_up} down={ok_down} shuffle_restore={ok_shuffle})"
+                );
+                eprintln!("[selftest] RESULT: FAIL");
+                std::process::exit(1);
+            }
+            eprintln!("[selftest] stage0 reorder+shuffle PASS");
+            self.play_now(
+                self.results
+                    .as_ref()
+                    .expect("checked")
+                    .tracks
+                    .get(2)
+                    .expect("len>=3")
+                    .clone(),
+            );
             if let Some(st) = &mut self.selftest {
-                st.expect = expect;
+                st.expect = [n2, n0];
                 st.stage = 1;
                 st.started = std::time::Instant::now();
             }
@@ -339,6 +779,14 @@ impl eframe::App for App {
                 }
             }
         }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut focus_search = self.handle_keys(ctx);
+        self.poll_messages();
+        self.selftest_step();
 
         // ---- auto-advance ----
         let idle = if self.player.decode_only {
@@ -350,7 +798,17 @@ impl eframe::App for App {
             self.player.is_idle()
         };
         if self.now.is_some() && !self.preparing && idle {
-            self.play_next();
+            self.advance(false);
+        }
+
+        // ---- window title ----
+        let title = match &self.now {
+            Some(t) => format!("amc — {} — {}", t.name, t.artist),
+            None => "amc".to_string(),
+        };
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
         }
 
         // ---- top: tabs + search ----
@@ -364,7 +822,13 @@ impl eframe::App for App {
                     .selectable_label(self.view == View::Search, "Search")
                     .clicked()
                 {
-                    self.view = View::Search;
+                    self.switch_view(View::Search);
+                }
+                if ui
+                    .selectable_label(self.view == View::Albums, "Albums")
+                    .clicked()
+                {
+                    self.switch_view(View::Albums);
                 }
                 if ui
                     .selectable_label(self.view == View::Library, "Library")
@@ -376,12 +840,15 @@ impl eframe::App for App {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Search  ( / )")
-                        .desired_width(380.0)
+                        .desired_width(340.0)
                         .font(egui::TextStyle::Body),
                 );
-                if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.view = View::Search;
                     self.spawn_search();
+                    resp.request_focus();
+                }
+                if focus_search {
                     resp.request_focus();
                 }
                 if ui.small_button("go").clicked() {
@@ -391,251 +858,648 @@ impl eframe::App for App {
                 if ui.small_button("/").clicked() {
                     focus_search = true;
                 }
+                if ui.small_button("?").clicked() {
+                    self.cheatsheet = !self.cheatsheet;
+                }
                 if self.searching {
                     ui.spinner();
-                }
-                if let Some(e) = &self.error {
-                    ui.colored_label(egui::Color32::RED, egui::RichText::new(e).small());
                 }
             });
             ui.add_space(2.0);
         });
 
         // ---- bottom: player bar ----
+        self.player_bar(ctx);
+
+        // ---- right: queue panel ----
+        if self.show_queue {
+            self.queue_panel(ctx);
+        }
+
+        // ---- central: rows ----
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.player.volume(self.volume);
+            let mut act: Option<CentralAction> = None;
+            match self.view {
+                View::Search => self.search_central(ui, &mut act),
+                View::Albums => self.albums_central(ui, &mut act),
+                View::Library => self.library_central(ui, &mut act),
+            }
+            match act {
+                Some(CentralAction::Play(t)) => self.play_now(t),
+                Some(CentralAction::Enqueue(t)) => self.enqueue(t),
+                Some(CentralAction::OpenAlbum(a)) => self.open_album(a),
+                Some(CentralAction::QueueAlbum(a)) => self.queue_album(a),
+                None => {}
+            }
+        });
+
+        // ---- overlays ----
+        if self.album_modal.is_some() {
+            self.album_modal_ui(ctx);
+        }
+        if self.cheatsheet {
+            self.cheatsheet_ui(ctx);
+        }
+        self.toast_ui(ctx);
+
+        let repaint = if self.now.is_some() { 100 } else { 250 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(repaint));
+    }
+}
+
+// ---- central views (all gather clicks into `act`; applied by caller) ----
+
+impl App {
+    fn search_central(&self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
+        match self.results.as_ref() {
+            None => self.empty_state(
+                ui,
+                if self.searching {
+                    "searching…".to_string()
+                } else {
+                    "type to search · enter plays · + queues · Q queue · ? shortcuts".to_string()
+                },
+                self.searching,
+            ),
+            Some(r) if r.tracks.is_empty() => {
+                if self.searching {
+                    self.empty_state(ui, "searching…".to_string(), true);
+                } else {
+                    self.empty_state(
+                        ui,
+                        format!("no results for \u{201c}{}\u{201d}", self.last_term),
+                        false,
+                    );
+                }
+            }
+            Some(r) => self.track_grid(ui, &r.tracks, act),
+        }
+    }
+
+    fn library_central(&mut self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
+        let loading = self.library_loading;
+        match self.library.as_ref() {
+            None => self.empty_state(ui, "loading library…".to_string(), loading),
+            Some(v) if v.is_empty() => {
+                if loading {
+                    self.empty_state(ui, "loading library…".to_string(), true);
+                } else {
+                    self.empty_state(
+                        ui,
+                        "library is empty (or not signed in)".to_string(),
+                        false,
+                    );
+                }
+            }
+            Some(v) => {
+                self.track_grid(ui, v, act);
+                if self.library_next.is_some() && !loading {
+                    ui.add_space(4.0);
+                    if ui.small_button("load more").clicked() {
+                        if let Some(next) = self.library_next {
+                            self.spawn_library(next);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn albums_central(&self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
+        let albums: &[AlbumHit] = match self.results.as_ref() {
+            Some(r) => &r.albums,
+            None => &[],
+        };
+        if albums.is_empty() {
+            let msg = if self.searching {
+                "searching…".to_string()
+            } else if self.results.is_some() {
+                "no albums in the last search — try another term".to_string()
+            } else {
+                "albums from your last search appear here — run a search first".to_string()
+            };
+            self.empty_state(ui, msg, self.searching);
+            return;
+        }
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            egui::Grid::new("albums")
+                .num_columns(6)
+                .spacing([10.0, 2.0])
+                .min_col_width(0.0)
+                .show(ui, |ui| {
+                    for a in albums {
+                        ui.monospace(" ♫ ");
+                        let name = egui::RichText::new(&a.name).size(13.0).strong();
+                        if cell(ui, 340.0, 20.0, name, true).clicked() {
+                            *act = Some(CentralAction::OpenAlbum(a.clone()));
+                        }
+                        cell(
+                            ui,
+                            220.0,
+                            20.0,
+                            egui::RichText::new(&a.artist).weak().size(12.0),
+                            false,
+                        );
+                        ui.weak(format!("{} tracks", a.track_count));
+                        ui.weak(&a.release_date);
+                        if self.album_busy.as_deref() == Some(a.id.as_str()) {
+                            ui.weak("adding…");
+                        } else if hand(ui.small_button("+")).clicked() {
+                            *act = Some(CentralAction::QueueAlbum(a.clone()));
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn track_grid(&self, ui: &mut egui::Ui, rows: &[Track], act: &mut Option<CentralAction>) {
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            egui::Grid::new("rows")
+                .num_columns(7)
+                .spacing([10.0, 2.0])
+                .min_col_width(0.0)
+                .show(ui, |ui| {
+                    for (i, t) in rows.iter().enumerate() {
+                        let playing = self.now.as_ref().is_some_and(|n| n.id == t.id);
+                        let mark = if playing {
+                            "▶".to_string()
+                        } else {
+                            format!("{:>2}", i + 1)
+                        };
+                        ui.monospace(mark);
+                        let name = egui::RichText::new(&t.name).size(13.0).strong();
+                        if cell(ui, 280.0, 18.0, name, true).clicked() {
+                            *act = Some(CentralAction::Play(t.clone()));
+                        }
+                        cell(
+                            ui,
+                            250.0,
+                            18.0,
+                            egui::RichText::new(&t.artist).weak().size(12.0),
+                            false,
+                        );
+                        cell(
+                            ui,
+                            230.0,
+                            18.0,
+                            egui::RichText::new(if t.album.is_empty() {
+                                ""
+                            } else {
+                                &t.album
+                            })
+                            .weak()
+                            .size(11.0),
+                            false,
+                        );
+                        if hand(ui.small_button("+")).clicked() {
+                            *act = Some(CentralAction::Enqueue(t.clone()));
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.monospace(fmt_ms(t.duration_ms));
+                                if t.lossless {
+                                    ui.colored_label(
+                                        LOSSLESS,
+                                        egui::RichText::new("lossless").size(10.0),
+                                    );
+                                }
+                            },
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn empty_state(&self, ui: &mut egui::Ui, msg: String, busy: bool) {
+        ui.add_space(24.0);
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                if busy {
+                    ui.spinner();
+                }
+                ui.add_space(6.0);
+                ui.weak(msg);
+            });
+        });
+    }
+}
+
+// ---- panels & overlays ----
+
+/// Click intents gathered while drawing the player bar; applied after
+/// rendering (the bar borrows `self.now` while drawing).
+enum BarIntent {
+    Toggle,
+    Prev,
+    Next,
+    Queue,
+    CycleRepeat,
+    ToggleShuffle,
+    Seek(f64),
+}
+
+impl App {
+    fn player_bar(&mut self, ctx: &egui::Context) {
+        let mut act: Option<BarIntent> = None;
+        let mut vol = self.volume;
         egui::TopBottomPanel::bottom("player").show(ctx, |ui| {
-            ui.add_space(6.0);
+            let paused = self.is_paused();
+            ui.add_space(5.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let paused = self.now.is_none()
-                    || self.player.sink().is_some_and(|s| s.is_paused());
-                if ui.button(if paused { "▶" } else { "⏸" }).clicked() {
-                    self.player.toggle_pause();
+                if hand(ui.button(if paused { "▶" } else { "⏸" })).clicked() {
+                    act = Some(BarIntent::Toggle);
                 }
-                if ui.button("⏭").clicked() {
-                    self.player.skip();
+                if hand(ui.button("⏮")).clicked() {
+                    act = Some(BarIntent::Prev);
                 }
-                match &self.now {
-                    Some(t) => {
-                        ui.vertical(|ui| {
+                if hand(ui.button("⏭")).clicked() {
+                    act = Some(BarIntent::Next);
+                }
+                ui.add_space(6.0);
+                if self.now.is_some() {
+                    ui.vertical(|ui| {
+                        if let Some(t) = &self.now {
                             ui.add_sized(
-                                [240.0, 14.0],
+                                [280.0, 14.0],
                                 egui::Label::new(
                                     egui::RichText::new(&t.name).strong().size(13.0),
                                 )
                                 .halign(egui::Align::LEFT)
                                 .truncate(),
                             );
-                            ui.add_sized(
-                                [240.0, 12.0],
-                                egui::Label::new(
-                                    egui::RichText::new(&t.artist).weak().size(11.0),
-                                )
-                                .halign(egui::Align::LEFT)
-                                .truncate(),
-                            );
+                        }
+                        let pos = self.playback_position();
+                        let total_ms =
+                            self.now.as_ref().map(|t| t.duration_ms).unwrap_or(0);
+                        let total = std::time::Duration::from_millis(total_ms);
+                        let remain = total.saturating_sub(pos);
+                        ui.horizontal(|ui| {
+                            ui.monospace(fmt_pos(pos));
+                            seek_bar_ui(ui, 300.0, pos, total, &mut act);
+                            ui.monospace(fmt_pos(remain));
                         });
-                        let pos = self.player.position().unwrap_or_default();
-                        let total = std::time::Duration::from_millis(t.duration_ms);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(fmt_pos(total));
-                            ui.add(
-                                egui::ProgressBar::new(
-                                    (pos.as_secs_f32()
-                                        / total.as_secs_f32().max(0.001))
-                                    .clamp(0.0, 1.0),
-                                )
-                                .desired_height(6.0)
-                                .desired_width(200.0)
-                                .show_percentage(),
-                            );
-                            ui.label(fmt_pos(pos));
-                            ui.separator();
-                            ui.add_sized(
-                                [90.0, 16.0],
-                                egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false),
-                            );
-                            if ui.button("queue").clicked() {
-                                self.show_queue = !self.show_queue;
-                            }
-                        });
-                    }
-                    None => {
-                        ui.weak("nothing playing");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("queue").clicked() {
-                                self.show_queue = !self.show_queue;
-                            }
-                        });
-                    }
+                    });
+                } else {
+                    ui.weak("nothing playing");
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if hand(ui.small_button("queue")).clicked() {
+                        act = Some(BarIntent::Queue);
+                    }
+                    ui.add_sized(
+                        [90.0, 16.0],
+                        egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false),
+                    );
+                    self.repeat_shuffle_buttons(ui, &mut act);
+                });
                 ui.add_space(8.0);
             });
-            ui.add_space(6.0);
+            ui.add_space(5.0);
         });
+        if vol != self.volume {
+            self.volume = vol;
+            self.player.volume(vol);
+        }
+        match act {
+            Some(BarIntent::Toggle) => self.toggle_pause_now(),
+            Some(BarIntent::Prev) => self.prev_track(),
+            Some(BarIntent::Next) => self.skip_current(),
+            Some(BarIntent::Queue) => self.show_queue = !self.show_queue,
+            Some(BarIntent::CycleRepeat) => {
+                self.repeat = match self.repeat {
+                    Repeat::Off => Repeat::All,
+                    Repeat::All => Repeat::One,
+                    Repeat::One => Repeat::Off,
+                };
+            }
+            Some(BarIntent::ToggleShuffle) => self.toggle_shuffle(),
+            Some(BarIntent::Seek(f)) => {
+                let total = self
+                    .now
+                    .as_ref()
+                    .map(|t| t.duration_ms as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                self.seek_to(std::time::Duration::from_secs_f64(f * total));
+            }
+            None => {}
+        }
+    }
 
-        // ---- right: queue panel ----
-        if self.show_queue {
-            egui::SidePanel::right("queue")
-                .exact_width(250.0)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("Queue");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("clear").clicked() {
-                                self.queue.clear();
-                            }
-                        });
+    fn repeat_shuffle_buttons(&self, ui: &mut egui::Ui, act: &mut Option<BarIntent>) {
+        let repeat_txt = match self.repeat {
+            Repeat::Off => "repeat",
+            Repeat::All => "repeat all",
+            Repeat::One => "repeat 1",
+        };
+        let col = if self.repeat == Repeat::Off {
+            ui.visuals().weak_text_color()
+        } else {
+            ACCENT
+        };
+        if hand(ui.small_button(egui::RichText::new(repeat_txt).size(11.0).color(col)))
+            .clicked()
+        {
+            *act = Some(BarIntent::CycleRepeat);
+        }
+        let col = if self.shuffle {
+            ACCENT
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        if hand(ui.small_button(egui::RichText::new("shuffle").size(11.0).color(col)))
+            .clicked()
+        {
+            *act = Some(BarIntent::ToggleShuffle);
+        }
+    }
+
+    fn queue_panel(&mut self, ctx: &egui::Context) {
+        let mut clear = false;
+        let mut shuf = false;
+        egui::SidePanel::right("queue")
+            .exact_width(290.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(format!("Queue · {}", self.queue.len()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if hand(ui.small_button("clear")).clicked() {
+                            clear = true;
+                        }
+                        if hand(ui.small_button("shuf")).clicked() {
+                            shuf = true;
+                        }
                     });
-                    ui.separator();
-                    if self.queue.is_empty() {
-                        ui.weak("empty — add with +");
-                    }
-                    let mut remove: Option<usize> = None;
-                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                        for (i, t) in self.queue.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [168.0, 16.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(&t.name).size(12.0),
-                                    )
+                });
+                ui.separator();
+                if self.queue.is_empty() {
+                    self.empty_state(ui, "queue empty — add with +".to_string(), false);
+                }
+                let mut remove: Option<usize> = None;
+                let mut mv: Option<(usize, isize)> = None;
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    for (i, t) in self.queue.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("{:>2}", i + 1));
+                            ui.add_sized(
+                                [130.0, 16.0],
+                                egui::Label::new(egui::RichText::new(&t.name).size(12.0))
                                     .halign(egui::Align::LEFT)
                                     .truncate(),
-                                );
-                                if ui.small_button("✕").clicked() {
-                                    remove = Some(i);
-                                }
-                            });
-                        }
-                    });
-                    if let Some(i) = remove {
-                        self.queue.remove(i);
+                            );
+                            if hand(ui.small_button("▲")).clicked() {
+                                mv = Some((i, -1));
+                            }
+                            if hand(ui.small_button("▼")).clicked() {
+                                mv = Some((i, 1));
+                            }
+                            if hand(ui.small_button("✕")).clicked() {
+                                remove = Some(i);
+                            }
+                        });
                     }
                 });
-        }
+                if let Some((i, d)) = mv {
+                    self.queue_move(i, d);
+                }
+                if let Some(i) = remove {
+                    self.queue.remove(i);
+                }
+                if clear {
+                    self.queue.clear();
+                }
+                if shuf {
+                    self.toggle_shuffle();
+                }
+            });
+    }
 
-        // ---- central: rows ----
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if focus_search {
-                ctx.memory_mut(|m| m.request_focus(egui::Id::new("search")));
+    fn album_modal_ui(&mut self, ctx: &egui::Context) {
+        // dim backdrop; click outside closes
+        let screen = ctx.screen_rect();
+        let backdrop = egui::Area::new(egui::Id::new("album_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min);
+        let mut close = false;
+        backdrop.show(ctx, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
+            if resp.clicked() {
+                close = true;
             }
-            self.player.volume(self.volume);
-
-            let rows: Vec<Track> = match self.view {
-                View::Search => self.results.clone().map(|r| r.tracks).unwrap_or_default(),
-                View::Library => self.library.clone().unwrap_or_default(),
-            };
-            if rows.is_empty() && self.view == View::Library && self.library_loading {
-                ui.spinner();
-                return;
-            }
-            if rows.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("type to search · enter to play · + queues · space pauses");
-                });
-                return;
-            }
-            ui.add_space(2.0);
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                egui::Grid::new("rows")
-                    .num_columns(7)
-                    .spacing([10.0, 2.0])
-                    .min_col_width(0.0)
+        });
+        egui::Area::new(egui::Id::new("album_modal"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(ui.visuals().panel_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                    .inner_margin(14.0)
+                    .corner_radius(8.0_f32)
                     .show(ui, |ui| {
-                        for (i, t) in rows.iter().enumerate() {
-                            let playing = self.now.as_ref().is_some_and(|n| n.id == t.id);
-                            let mark = if playing {
-                                "▶".to_string()
-                            } else {
-                                format!("{:>2}", i + 1)
-                            };
-                            ui.monospace(format!("{mark:>3}"));
-                            let name = egui::RichText::new(&t.name).size(13.0).strong();
-                            if cell(ui, 280.0, 18.0, name, true).clicked() {
-                                self.play_now(t.clone());
-                            }
-                            cell(
-                                ui,
-                                250.0,
-                                18.0,
-                                egui::RichText::new(&t.artist).weak().size(12.0),
-                                false,
-                            );
-                            cell(
-                                ui,
-                                230.0,
-                                18.0,
-                                egui::RichText::new(if t.album.is_empty() {
-                                    ""
-                                } else {
-                                    &t.album
-                                })
-                                .weak()
-                                .size(11.0),
-                                false,
-                            );
-                            if ui.small_button("+").clicked() {
-                                self.enqueue(t.clone());
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.monospace(fmt_ms(t.duration_ms));
-                                    if t.lossless {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(0x6a, 0xd1, 0xa8),
-                                            egui::RichText::new("lossless").size(10.0),
-                                        );
-                                    }
-                                },
-                            );
-                            ui.end_row();
-                        }
+                        self.album_modal_body(ui);
                     });
             });
+        if close {
+            self.close_album_modal();
+        }
+    }
 
-            // ---- albums (search view only) ----
-            if self.view == View::Search {
-                let albums = self.results.as_ref().map(|r| r.albums.clone()).unwrap_or_default();
-                if !albums.is_empty() {
+    fn album_modal_body(&mut self, ui: &mut egui::Ui) {
+        let Some(m) = &mut self.album_modal else { return };
+        let mut close = false;
+        let mut act: Option<CentralAction> = None;
+        let mut play_all: Option<Vec<Track>> = None;
+        let mut queue_all: Option<Vec<Track>> = None;
+        {
+            let album = &m.album;
+            ui.horizontal(|ui| {
+                ui.strong(egui::RichText::new(&album.name).size(18.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if hand(ui.small_button("✕")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.weak(format!(
+                "{} · {} tracks · {}",
+                album.artist, album.track_count, album.release_date
+            ));
+            match m.tracks.as_deref() {
+                None => {
                     ui.add_space(8.0);
-                    ui.strong("ALBUMS  (click to play)");
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("loading tracks…");
+                    });
+                }
+                Some(tracks) => {
+                    let total_min = tracks.iter().map(|t| t.duration_ms).sum::<u64>() / 60_000;
+                    ui.weak(format!("{total_min} min"));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if hand(ui.button("Play")).clicked() {
+                            play_all = Some(tracks.to_vec());
+                        }
+                        if hand(ui.button("Queue All")).clicked() {
+                            queue_all = Some(tracks.to_vec());
+                        }
+                    });
                     ui.separator();
-                    for a in albums.iter().take(12) {
+                    egui::ScrollArea::vertical()
+                        .max_height(360.0)
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            egui::Grid::new("album_tracks")
+                                .num_columns(4)
+                                .spacing([10.0, 2.0])
+                                .min_col_width(0.0)
+                                .show(ui, |ui| {
+                                    for t in tracks {
+                                        ui.monospace(format!("{:>2}", t.track_no));
+                                        let name = egui::RichText::new(&t.name).size(13.0);
+                                        if cell(ui, 380.0, 18.0, name, true).clicked() {
+                                            act = Some(CentralAction::Play(t.clone()));
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.monospace(fmt_ms(t.duration_ms));
+                                                if t.lossless {
+                                                    ui.colored_label(
+                                                        LOSSLESS,
+                                                        egui::RichText::new("lossless").size(10.0),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                        if hand(ui.small_button("+")).clicked() {
+                                            act = Some(CentralAction::Enqueue(t.clone()));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            }
+        }
+        if let Some(tracks) = play_all {
+            self.play_album_tracks(tracks);
+            close = true;
+        }
+        if let Some(tracks) = queue_all {
+            self.queue.extend(tracks);
+        }
+        match act {
+            Some(CentralAction::Play(t)) => self.play_now(t),
+            Some(CentralAction::Enqueue(t)) => self.enqueue(t),
+            _ => {}
+        }
+        if close {
+            self.close_album_modal();
+        }
+    }
+
+    fn cheatsheet_ui(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        egui::Area::new(egui::Id::new("cheatsheet"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(ui.visuals().panel_fill)
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        ui.visuals().widgets.noninteractive.bg_stroke.color,
+                    ))
+                    .inner_margin(14.0)
+                    .corner_radius(8.0_f32)
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.monospace("  ♫ ");
-                            let label = egui::RichText::new(&a.name).size(13.0);
-                            if ui
-                                .add_sized(
-                                    [300.0, 18.0],
-                                    egui::Label::new(label)
-                                        .sense(egui::Sense::click())
-                                        .halign(egui::Align::LEFT)
-                                        .truncate(),
-                                )
-                                .clicked()
-                            {
-                                self.play_album(a.id.clone(), a.name.clone());
-                            }
-                            ui.add_sized(
-                                [170.0, 18.0],
-                                egui::Label::new(
-                                    egui::RichText::new(&a.artist).weak().size(12.0),
-                                )
-                                .halign(egui::Align::LEFT)
-                                .truncate(),
-                            );
+                            ui.strong(egui::RichText::new("keyboard shortcuts").size(15.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.weak(format!("{} tracks", a.track_count));
+                                if hand(ui.small_button("✕")).clicked() {
+                                    close = true;
+                                }
                             });
                         });
                         ui.separator();
-                    }
-                }
-            }
-        });
+                        egui::Grid::new("cheats")
+                            .num_columns(2)
+                            .spacing([18.0, 3.0])
+                            .show(ui, |ui| {
+                                for (k, v) in [
+                                    ("space", "play / pause"),
+                                    ("→ / ←", "seek ±5 s"),
+                                    ("↑ / ↓", "volume"),
+                                    ("N / P", "next / previous track"),
+                                    ("Q", "toggle queue panel"),
+                                    ("/ or ctrl+F", "focus search"),
+                                    ("ctrl+1 / 2 / 3", "search / albums / library"),
+                                    ("esc", "close modal / panel"),
+                                    ("?", "this cheatsheet"),
+                                    ("click progress bar", "seek"),
+                                ] {
+                                    ui.monospace(egui::RichText::new(k).color(ACCENT));
+                                    ui.weak(v);
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+        if close {
+            self.cheatsheet = false;
+        }
+    }
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    fn toast_ui(&mut self, ctx: &egui::Context) {
+        let expired = matches!(&self.error, Some((_, at)) if at.elapsed() > std::time::Duration::from_secs(8));
+        if expired {
+            self.error = None;
+        }
+        if self.error.is_none() {
+            return;
+        }
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new("toast"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-14.0, -60.0])
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(0x3a, 0x1a, 0x1e))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xa0, 0x40, 0x50)))
+                    .inner_margin(8.0)
+                    .corner_radius(6.0_f32)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some((msg, _)) = &self.error {
+                                ui.add_sized(
+                                    [420.0, 16.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(msg)
+                                            .size(12.0)
+                                            .color(egui::Color32::from_rgb(0xff, 0x9a, 0xa0)),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                            if hand(ui.small_button("✕")).clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+            });
+        if dismiss {
+            self.error = None;
+        }
     }
 }
 
@@ -656,9 +1520,44 @@ fn cell(
             if clickable {
                 label = label.sense(egui::Sense::click());
             }
-            ui.add(label)
+            hand(ui.add(label))
         },
     ).inner
+}
+
+fn hand(r: egui::Response) -> egui::Response {
+    r.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Click-to-seek progress bar; reports the clicked fraction (0..1) via `act`.
+fn seek_bar_ui(
+    ui: &mut egui::Ui,
+    width: f32,
+    pos: std::time::Duration,
+    total: std::time::Duration,
+    act: &mut Option<BarIntent>,
+) {
+    let frac = if total.as_secs_f64() > 0.0 {
+        (pos.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let h = 8.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
+    ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(64));
+    let w = (rect.width() as f64 * frac) as f32;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(w, h)),
+        4.0,
+        ACCENT,
+    );
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let f = ((p.x - rect.min.x) / rect.width().max(1.0)).clamp(0.0, 1.0) as f64;
+            *act = Some(BarIntent::Seek(f));
+        }
+    }
 }
 
 fn fmt_ms(ms: u64) -> String {
