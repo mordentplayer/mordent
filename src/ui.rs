@@ -12,14 +12,12 @@
 use crate::api::{AlbumHit, Api, SearchResults, Track};
 use crate::config::Config;
 use crate::player::{PacketSource, Player};
+use crate::theme::Theme;
 use crate::{stream, wrapper};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
-
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xfa, 0x4d, 0x6a);
-const LOSSLESS: egui::Color32 = egui::Color32::from_rgb(0x6a, 0xd1, 0xa8);
 
 enum Msg {
     Results(Box<SearchResults>),
@@ -164,6 +162,12 @@ pub struct App {
     /// and print SELFTEST PASS/FAIL (headless CI aid).
     selftest: Option<SelftestState>,
     volume: f32,
+    /// Active theme (built-in defaults + `~/.config/amc/theme.toml`).
+    theme: Theme,
+    /// (mtime, size) of theme.toml at last load; `None` when the file is absent.
+    theme_stamp: Option<(std::time::SystemTime, u64)>,
+    /// Throttles the once-per-second hot-reload poll; `None` = not polled yet.
+    theme_poll: Option<std::time::Instant>,
     error: Option<(String, std::time::Instant)>,
     last_title: String,
     rx: Receiver<Msg>,
@@ -174,6 +178,10 @@ impl App {
     fn new(cfg: Config) -> Self {
         let player = Player::new();
         let state = load_state();
+        let (theme, theme_warns) = Theme::load();
+        for w in &theme_warns {
+            eprintln!("[theme] {w}");
+        }
         let volume = state.volume.unwrap_or(0.8).clamp(0.0, 1.0);
         player.volume(volume);
         let (tx, rx) = channel();
@@ -216,7 +224,13 @@ impl App {
                 started: std::time::Instant::now(),
             }),
             volume,
-            error: None,
+            theme,
+            theme_stamp: Theme::stamp(&crate::theme::theme_path()),
+            theme_poll: None,
+            // invalid theme keys are surfaced once through the toast
+            error: theme_warns
+                .first()
+                .map(|w| (w.clone(), std::time::Instant::now())),
             last_title: "amc".into(),
             rx,
             tx,
@@ -869,10 +883,44 @@ impl App {
             }
         }
     }
+
+    /// Re-apply the theme when `~/.config/amc/theme.toml` changes. The poll is
+    /// throttled to about once a second (a stat, not a parse) so it stays cheap
+    /// even though `update` runs every frame; the theme is (re)applied on the
+    /// first frame and whenever the file's identity changes.
+    fn poll_theme(&mut self, ctx: &egui::Context) {
+        // First call happens on the first frame: apply even if the file is
+        // absent, so the built-in defaults are the ones actually in use.
+        let first_frame = self.theme_poll.is_none();
+        if let Some(t) = self.theme_poll {
+            if t.elapsed() < std::time::Duration::from_millis(1000) {
+                return;
+            }
+        }
+        self.theme_poll = Some(std::time::Instant::now());
+        let path = crate::theme::theme_path();
+        let stamp = Theme::stamp(&path);
+        if !first_frame && stamp == self.theme_stamp {
+            return;
+        }
+        self.theme_stamp = stamp;
+        let (theme, warns) = Theme::load();
+        for w in &warns {
+            eprintln!("[theme] {w}");
+        }
+        if let Some(w) = warns.first() {
+            // warn once per edit via the existing toast
+            self.error = Some((w.clone(), std::time::Instant::now()));
+        }
+        self.theme = theme;
+        self.theme.apply(ctx);
+        ctx.request_repaint();
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_theme(ctx);
         let mut focus_search = self.handle_keys(ctx);
         self.poll_messages();
         self.selftest_step();
@@ -1020,6 +1068,12 @@ impl eframe::App for App {
 
         let repaint = if self.now.is_some() { 100 } else { 250 };
         ctx.request_repaint_after(std::time::Duration::from_millis(repaint));
+    }
+
+    /// Transparent-viewport clear color: the theme background at the theme's
+    /// opacity. See `theme.rs` for the compositor caveat.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        self.theme.clear_color()
     }
 }
 
@@ -1179,7 +1233,7 @@ impl App {
                                 ui.monospace(fmt_ms(t.duration_ms));
                                 if t.lossless {
                                     ui.colored_label(
-                                        LOSSLESS,
+                                        self.theme.lossless,
                                         egui::RichText::new("lossless").size(10.0),
                                     );
                                 }
@@ -1265,7 +1319,7 @@ impl App {
                         let remain = total.saturating_sub(pos);
                         ui.horizontal(|ui| {
                             ui.monospace(fmt_pos(pos));
-                            seek_bar_ui(ui, 300.0, pos, total, &mut act);
+                            seek_bar_ui(ui, 300.0, pos, total, self.theme.accent, &mut act);
                             ui.monospace(fmt_pos(remain));
                         });
                     });
@@ -1319,7 +1373,7 @@ impl App {
         let col = if self.repeat == Repeat::Off {
             ui.visuals().weak_text_color()
         } else {
-            ACCENT
+            self.theme.accent
         };
         if hand(ui.small_button(egui::RichText::new(repeat_txt).size(11.0).color(col)))
             .clicked()
@@ -1327,7 +1381,7 @@ impl App {
             *act = Some(BarIntent::CycleRepeat);
         }
         let col = if self.shuffle {
-            ACCENT
+            self.theme.accent
         } else {
             ui.visuals().weak_text_color()
         };
@@ -1477,7 +1531,7 @@ impl App {
                                                 ui.monospace(fmt_ms(t.duration_ms));
                                                 if t.lossless {
                                                     ui.colored_label(
-                                                        LOSSLESS,
+                                                        self.theme.lossless,
                                                         egui::RichText::new("lossless").size(10.0),
                                                     );
                                                 }
@@ -1533,7 +1587,7 @@ impl App {
                             ("?", "this cheatsheet"),
                             ("click progress bar", "seek"),
                         ] {
-                            ui.monospace(egui::RichText::new(k).color(ACCENT));
+                            ui.monospace(egui::RichText::new(k).color(self.theme.accent));
                             ui.weak(v);
                             ui.end_row();
                         }
@@ -1619,6 +1673,7 @@ fn seek_bar_ui(
     width: f32,
     pos: std::time::Duration,
     total: std::time::Duration,
+    accent: egui::Color32,
     act: &mut Option<BarIntent>,
 ) {
     let frac = if total.as_secs_f64() > 0.0 {
@@ -1636,7 +1691,7 @@ fn seek_bar_ui(
     ui.painter().rect_filled(
         egui::Rect::from_min_size(bar.min, egui::vec2(w, h)),
         4.0,
-        ACCENT,
+        accent,
     );
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.clicked() {
@@ -1659,10 +1714,19 @@ fn fmt_pos(d: std::time::Duration) -> String {
 }
 
 pub fn launch(cfg: Config) -> anyhow::Result<()> {
+    // Transparent viewport: the window background comes from the theme's
+    // `bg` color at `opacity` (see `App::clear_color` / theme.rs).
+    //
+    // Caveat: see-through only works when a compositor is running (X11
+    // compositing manager / Wayland). On a bare X server (or a headless Xvfb
+    // like the selftest uses) there is nothing to blend against, so the window
+    // just renders solid at full alpha. That is a silent degradation — no
+    // error, no panic, and playback/UI behave identically either way.
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([760.0, 420.0]),
+            .with_min_inner_size([760.0, 420.0])
+            .with_transparent(true),
         ..Default::default()
     };
     eframe::run_native(

@@ -4,6 +4,7 @@ mod player;
 mod ui;
 mod fairplay;
 mod stream;
+mod theme;
 mod wrapper;
 
 use anyhow::{anyhow, bail, Result};

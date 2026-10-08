@@ -107,6 +107,35 @@ restore, auto-advance) and prints `RESULT: PASS/FAIL`.
 `AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums` pre-seed the UI for
 headless screenshots.
 
+## Theming
+
+Optional `~/.config/amc/theme.toml`; a missing file (or missing keys) falls
+back to the built-in dark defaults. It is read at startup and hot-reloaded
+(polled about once a second), so editing it recolors the running window — no
+restart. Bad values are ignored with a one-off warning (toast + stderr) and the
+default for that key is kept.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `accent` | `#fa4d6a` | selection, hyperlinks, progress bar, active toggles |
+| `lossless` | `#6ad1a8` | `lossless` badge |
+| `bg` | `#1b1b1b` | window background / clear color |
+| `panel` | `#1b1b1b` | panel background |
+| `text` | `#969696` | normal text |
+| `weak` | `#5a5a5a` | secondary text |
+| `opacity` | `1.0` | background alpha, `0.0`–`1.0` |
+
+Colors accept `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`.
+
+```toml
+accent = "#4dd0fa"
+opacity = 0.9
+```
+
+Transparency caveat: the window is created transparent, but see-through only
+works with a running compositor (X11 compositing manager / Wayland). On a bare
+X server it simply renders solid — neither case errors.
+
 ## Measured (VPS, download-throttled Apple CDN)
 
 | Metric | Value |
