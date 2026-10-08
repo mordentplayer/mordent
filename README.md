@@ -196,7 +196,10 @@ player uses (PLAY_START / PLAY_END per pause, resume, seek, skip, natural
 end, stop; one best-effort POST per event on a background thread, failures
 ignored). Reporting needs a real audio sink: on a headless decode-only host
 (VPS/CI) nothing is ever sent. Private sessions are not supported by the
-client, so no private-session handling exists.
+client, so no private-session handling exists. A seek while playing reports
+END 12 (old position) + END 13 (new position) with no new START — the
+segment continues; a seek while paused reports nothing, and the resume START
+carries the seeked position.
 
 ## Caching
 
