@@ -32,6 +32,9 @@ pub struct AlbumHit {
     pub artwork_obj: Option<Artwork>,
     pub track_count: u32,
     pub release_date: String,
+    /// Library resources only: when the item was added to the library
+    /// (ISO-8601). None for catalog results.
+    pub date_added: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +146,8 @@ struct RawAttrs {
     play_params: Option<RawPlayParams>,
     track_count: u32,
     release_date: String,
+    /// Library resources only (`dateAdded`).
+    date_added: Option<String>,
     genre_names: Vec<String>,
     /// Library playlists only: `{ "standard": "..." }`.
     description: Option<RawDescription>,
@@ -263,6 +268,7 @@ impl RawResource {
             artwork_obj: self.artwork_obj(),
             track_count: self.attributes.track_count,
             release_date: self.attributes.release_date.clone(),
+            date_added: self.attributes.date_added.clone(),
         }
     }
 
@@ -515,11 +521,22 @@ impl Api {
     /// User library albums (id may be a library id — playable ids resolved
     /// per item via playParams.catalogId).
     pub fn library_albums(&self, limit: u32, offset: u32) -> Result<Vec<AlbumHit>> {
+        self.library_albums_page(limit, offset).map(|(albums, _)| albums)
+    }
+
+    /// One page of the user's library albums. Returns the albums plus the
+    /// offset for the next page (None = end), mirroring `library_songs`.
+    pub fn library_albums_page(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<AlbumHit>, Option<u32>)> {
         let url = format!(
             "https://amp-api.music.apple.com/v1/me/library/albums?limit={limit}&offset={offset}&l=en-US"
         );
         let raw: RawLibraryResp = from_value(self.get_json_retry(&url)?)?;
-        Ok(raw.data.iter().map(|r| r.to_album()).collect())
+        let albums = raw.data.iter().map(|r| r.to_album()).collect();
+        Ok((albums, raw.next.as_deref().and_then(parse_next_offset)))
     }
 
     /// User library playlists (requires media-user-token). `extend` asks the
@@ -1192,6 +1209,27 @@ mod tests {
         assert_eq!(lists[1].track_count, 3);
         assert_eq!(lists[1].description, "");
         assert!(lists[1].artwork.is_none());
+
+        assert_eq!(raw.next.as_deref().and_then(parse_next_offset), Some(2));
+    }
+
+    #[test]
+    fn library_albums_fixture_parses_date_added_and_paginates() {
+        let raw: RawLibraryResp = decoded("library_albums.json");
+        let albums: Vec<AlbumHit> = raw.data.iter().map(|r| r.to_album()).collect();
+        assert_eq!(albums.len(), 2);
+
+        assert_eq!(albums[0].id, "528ismsiL5S2WByYmm6b-9v"); // catalog id
+        assert_eq!(albums[0].name, "Discovery");
+        assert_eq!(albums[0].track_count, 14);
+        assert_eq!(albums[0].release_date, "2001-03-07");
+        assert_eq!(albums[0].date_added.as_deref(), Some("2026-01-15T09:30:00Z"));
+        assert!(albums[0].artwork.is_some());
+
+        // dateAdded/artwork absent → None, not a parse failure.
+        assert_eq!(albums[1].name, "No Date, No Artwork");
+        assert_eq!(albums[1].date_added, None);
+        assert!(albums[1].artwork.is_none());
 
         assert_eq!(raw.next.as_deref().and_then(parse_next_offset), Some(2));
     }

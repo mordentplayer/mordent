@@ -72,13 +72,19 @@ amc decode <file>         # verify a decrypted file decodes
 
 ## UI (`amc ui`)
 
-Five tabs — **Search**, **Albums**, **Library**, **Favorites**, **Playlists**.
+Four tabs — **Search**, **Library**, **Favorites**, **Playlists**.
 Clicking a track plays it immediately (replacing the current track and
 cancelling its download); `+` appends to the queue; the `♡`/`♥` button toggles
-a favorite (instant, persisted). The Albums tab lists the albums of the
-current/last search; clicking one opens an album detail page (per-track
-play/enqueue, **Play** = play from the top and queue the rest, **Queue All**,
-esc/outside click closes). The Playlists tab lists your library playlists
+a favorite (instant, persisted). The Search tab has a segmented sub-bar —
+**Songs** (the track results grid) | **Albums** (the album results of the
+current/last search); switching sub-views does not re-query, and clicking an
+album row opens an album detail page (per-track play/enqueue, **Play** = play
+from the top and queue the rest, **Queue All**, esc/outside click closes;
+`+` on an album row queues the whole album). The Library tab lists your
+library **albums** (name, artist, track count, release date) with a sort
+toggle in the header — **add date** (newest first) or **name** — plus a
+**load more** button when the list paginates; clicks and `+` behave like
+album rows in search. The Playlists tab lists your library playlists
 (name, track count, description; click one for its tracks with per-track
 play/enqueue, **Play**/**Queue All** and a **load more** button when the list
 paginates). The Favorites tab lists favorited tracks — click to play, `+` to
@@ -115,8 +121,8 @@ are explicit, and the pointer turns into a hand over clickable rows.
 | `N` / `P` | next / previous track |
 | `Q` | toggle queue panel |
 | `/` or `ctrl+F` | focus search |
-| `ctrl+1` / `2` / `3` | switch to Search / Albums / Library |
-| `ctrl+4` / `5` | switch to Favorites / Playlists |
+| `ctrl+1` / `2` / `3` | switch to Search / Library / Favorites |
+| `ctrl+4` | switch to Playlists |
 | `esc` | close modal / panel |
 | `?` | shortcut cheatsheet overlay |
 | click progress bar | seek |
@@ -127,7 +133,8 @@ reorder and shuffle bookkeeping, prev/next, ✕ of the current row,
 auto-advance, stop-at-end and resume-on-append) and prints
 `RESULT: PASS/FAIL`.
 `AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums|favorites|playlists`
-pre-seed the UI for headless screenshots; `AMC_DEMO_PLAYLIST=<n>` additionally
+pre-seed the UI for headless screenshots (`albums` opens the Search tab's
+Albums sub-view); `AMC_DEMO_PLAYLIST=<n>` additionally
 opens the n-th library playlist (0-based) once the list loads.
 
 ## Theming
@@ -200,9 +207,10 @@ client, so no private-session handling exists.
 
 ## Status
 
-Working: search, your library (songs/albums/search), ALAC/lossless streaming playback, previews fallback,
-lyrics endpoint, decrypt-to-file, dense search-first UI with albums tab +
-album detail modal, library playlists tab with playlist detail modal, persisted
+Working: search, your library (albums/songs/search), ALAC/lossless streaming playback, previews fallback,
+lyrics endpoint, decrypt-to-file, dense search-first UI with a Songs/Albums
+search sub-bar + album detail modal, library albums view with add-date/name
+sort, library playlists tab with playlist detail modal, persisted
 track favorites with a favorites tab, queue with reorder/shuffle, seekable
 player bar with shuffle/repeat, keyboard shortcuts.
 Next: animated word-synced lyrics
