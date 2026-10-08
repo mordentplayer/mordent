@@ -538,8 +538,10 @@ mod tests {
     fn shuffle_restore_survives_removals_and_retracks_current() {
         let mut q = mkq(&["A", "B", "C", "D"], Some(1));
         q.toggle_shuffle();
-        // remove an up-next row while shuffled
-        q.remove(3);
+        // remove an up-next row while shuffled — by id, since the shuffle
+        // permuted the up-next region
+        let d = q.tracks.iter().position(|t| t.id == "D").expect("D present");
+        q.remove(d);
         q.toggle_shuffle();
         assert_eq!(ids(&q), ["A", "B", "C"]);
         assert_eq!(q.pos, Some(1), "pointer re-tracks the current track");
