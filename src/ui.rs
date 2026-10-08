@@ -137,6 +137,71 @@ struct SelftestState {
     started: std::time::Instant,
 }
 
+/// Auto-dismiss timeout of the collapsed error toast.
+const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long the detail view shows its "Copied" confirmation.
+const COPIED_FEEDBACK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Error toast. The detail view (`expanded`) pauses auto-expiry: closing it
+/// resumes with the *remaining* time (not a full reset), so a toast that was
+/// about to expire still goes away promptly after a quick look.
+struct ErrorToast {
+    /// Full error text (HTTP status lines can be long).
+    msg: String,
+    /// Instant the toast auto-dismisses at; frozen while `paused_at` is set.
+    expires_at: std::time::Instant,
+    /// When the detail view was opened, or `None` while collapsing/collapsed.
+    paused_at: Option<std::time::Instant>,
+    /// Detail view open (also freezes expiry via `paused_at`).
+    expanded: bool,
+    /// When "Copy" was last pressed (drives the transient "Copied ✓" label).
+    copied_at: Option<std::time::Instant>,
+}
+
+impl ErrorToast {
+    fn new(msg: String) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            msg,
+            expires_at: now + TOAST_TTL,
+            paused_at: None,
+            expanded: false,
+            copied_at: None,
+        }
+    }
+
+    /// Open/close the detail view. Opening freezes the countdown; closing
+    /// rebases `expires_at` so the remaining time is preserved.
+    fn set_expanded(&mut self, expanded: bool, now: std::time::Instant) {
+        match (expanded, self.paused_at) {
+            (true, None) => self.paused_at = Some(now),
+            (false, Some(t)) => {
+                self.expires_at = now + self.expires_at.saturating_duration_since(t);
+                self.paused_at = None;
+            }
+            _ => {}
+        }
+        self.expanded = expanded;
+    }
+
+    /// Time until auto-dismiss (frozen while paused).
+    fn remaining(&self, now: std::time::Instant) -> std::time::Duration {
+        match self.paused_at {
+            Some(t) => self.expires_at.saturating_duration_since(t),
+            None => self.expires_at.saturating_duration_since(now),
+        }
+    }
+
+    fn is_expired(&self, now: std::time::Instant) -> bool {
+        self.paused_at.is_none() && now >= self.expires_at
+    }
+
+    /// True while the "Copied ✓" confirmation should be shown.
+    fn copied_feedback(&self, now: std::time::Instant) -> bool {
+        matches!(self.copied_at, Some(t) if now.saturating_duration_since(t) < COPIED_FEEDBACK)
+    }
+}
+
 /// UI settings persisted to ~/.config/amc/state.toml (atomic write).
 #[derive(Serialize, Deserialize, Default)]
 struct UiState {
@@ -265,7 +330,8 @@ pub struct App {
     /// Font set currently installed on the egui context; starts as egui's
     /// built-ins (which is what eframe sets up) and follows `theme.font`.
     font: FontChoice,
-    error: Option<(String, std::time::Instant)>,
+    /// Error toast (full text + expiry state); auto-dismisses after TOAST_TTL.
+    error: Option<ErrorToast>,
     last_title: String,
     /// Desktop media controls (MPRIS); `None` if D-Bus is unusable.
     mpris: Option<mpris::Mpris>,
@@ -365,9 +431,7 @@ impl App {
             // poll_theme installs the configured set.
             font: FontChoice::Default,
             // invalid theme keys are surfaced once through the toast
-            error: theme_warns
-                .first()
-                .map(|w| (w.clone(), std::time::Instant::now())),
+            error: theme_warns.first().map(|w| ErrorToast::new(w.clone())),
             last_title: "amc".into(),
             mpris: None,
             seek_epoch: 0,
@@ -539,7 +603,7 @@ impl App {
     }
 
     fn fail(&mut self, e: String) {
-        self.error = Some((e, std::time::Instant::now()));
+        self.error = Some(ErrorToast::new(e));
     }
 
     // ---- Apple play reporting ----
@@ -1269,7 +1333,9 @@ impl App {
         ctx.input(|i| {
             // Esc works even while a text field has focus
             if i.key_pressed(egui::Key::Escape) {
-                if self.cheatsheet {
+                if self.error.as_ref().is_some_and(|e| e.expanded) {
+                    self.close_error_detail();
+                } else if self.cheatsheet {
                     self.cheatsheet = false;
                 } else if self.album_modal.is_some() {
                     self.close_album_modal();
@@ -1759,7 +1825,7 @@ impl App {
         }
         if let Some(w) = warns.first() {
             // warn once per edit via the existing toast
-            self.error = Some((w.clone(), std::time::Instant::now()));
+            self.error = Some(ErrorToast::new(w.clone()));
         }
         self.theme = theme;
         self.theme.apply(ctx);
@@ -2970,44 +3036,144 @@ impl App {
     }
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
-        let expired = matches!(&self.error, Some((_, at)) if at.elapsed() > std::time::Duration::from_secs(8));
-        if expired {
+        let now = std::time::Instant::now();
+        if self.error.as_ref().is_some_and(|e| e.is_expired(now)) {
             self.error = None;
         }
-        if self.error.is_none() {
+        let Some(expanded) = self.error.as_ref().map(|e| e.expanded) else {
+            return;
+        };
+        if expanded {
+            self.error_detail_ui(ctx);
             return;
         }
+        // Keep the collapsed countdown ticking (playback usually repaints, but
+        // not while idle, e.g. an error raised from a fired search).
+        if let Some(t) = &self.error {
+            ctx.request_repaint_after(t.remaining(now));
+        }
         let mut dismiss = false;
+        let mut expand = false;
         egui::Area::new(egui::Id::new("toast"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_BOTTOM, [-14.0, -60.0])
             .show(ctx, |ui| {
-                egui::Frame::default()
+                let frame = egui::Frame::default()
                     .fill(egui::Color32::from_rgb(0x3a, 0x1a, 0x1e))
                     .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xa0, 0x40, 0x50)))
                     .inner_margin(8.0)
                     .corner_radius(6.0_f32)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if let Some((msg, _)) = &self.error {
+                            if let Some(e) = &self.error {
                                 ui.add_sized(
                                     [420.0, 16.0],
                                     egui::Label::new(
-                                        egui::RichText::new(msg)
+                                        egui::RichText::new(&e.msg)
                                             .size(12.0)
                                             .color(egui::Color32::from_rgb(0xff, 0x9a, 0xa0)),
                                     )
                                     .truncate(),
-                                );
+                                )
+                                .on_hover_text("click to expand");
                             }
                             if hand(ui.small_button("×")).clicked() {
                                 dismiss = true;
                             }
                         });
                     });
+                // The whole toast (except the ✕, which wins) opens the detail view.
+                if ui
+                    .interact(
+                        frame.response.rect,
+                        egui::Id::new("toast_click"),
+                        egui::Sense::click(),
+                    )
+                    .clicked()
+                {
+                    expand = true;
+                }
+                if frame.response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
             });
         if dismiss {
             self.error = None;
+        } else if expand && let Some(t) = &mut self.error {
+            t.set_expanded(true, std::time::Instant::now());
+        }
+    }
+
+    /// Expanded error view: full text, selectable, with a Copy button.
+    fn error_detail_ui(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let (msg, copied) = match &self.error {
+            Some(e) => (e.msg.clone(), e.copied_feedback(now)),
+            None => return,
+        };
+        let mut close = false;
+        let mut copy = false;
+        let resp = egui::Modal::new(egui::Id::new("error_detail"))
+            .backdrop_color(egui::Color32::from_black_alpha(150))
+            .show(ctx, |ui| {
+                ui.set_width(560.0);
+                ui.horizontal(|ui| {
+                    ui.strong(egui::RichText::new("Error").size(16.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if hand(ui.small_button("×")).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // selectable → the text can also be dragged over and
+                        // copied with Ctrl+C; the button below copies it whole.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&msg)
+                                    .size(12.5)
+                                    .color(self.theme.text)
+                                    .monospace(),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let label = if copied { "Copied ✓" } else { "Copy" };
+                    if hand(ui.button(egui::RichText::new(label).color(self.theme.accent))).clicked() {
+                        copy = true;
+                    }
+                    ui.weak("Esc closes");
+                });
+            });
+        if resp.should_close() {
+            close = true;
+        }
+        if copy {
+            ctx.copy_text(msg);
+            if let Some(e) = &mut self.error {
+                e.copied_at = Some(std::time::Instant::now());
+            }
+            ctx.request_repaint_after(COPIED_FEEDBACK);
+        } else if copied {
+            // repaint so "Copied ✓" clears even without further input
+            ctx.request_repaint_after(COPIED_FEEDBACK);
+        }
+        if close {
+            self.close_error_detail();
+        }
+    }
+
+    /// Collapse the detail view, resuming auto-expiry with the remaining time.
+    fn close_error_detail(&mut self) {
+        if let Some(e) = &mut self.error {
+            e.set_expanded(false, std::time::Instant::now());
         }
     }
 }
@@ -3342,5 +3508,83 @@ mod pause_state_tests {
         // no open segment (gates closed, or nothing reported yet): nothing
         assert_eq!(seek_scrub_events(false, true, 0, 1_000), None);
         assert_eq!(seek_scrub_events(false, false, 0, 1_000), None);
+    }
+}
+
+#[cfg(test)]
+mod toast_state_tests {
+    use super::{COPIED_FEEDBACK, ErrorToast, TOAST_TTL};
+    use std::time::{Duration, Instant};
+
+    /// Synthetic instant `secs` after `base` (keeps the tests deterministic).
+    fn at(base: Instant, secs: f64) -> Instant {
+        base + Duration::from_secs_f64(secs)
+    }
+
+    fn toast(base: Instant) -> ErrorToast {
+        ErrorToast {
+            msg: "boom".into(),
+            expires_at: base + TOAST_TTL,
+            paused_at: None,
+            expanded: false,
+            copied_at: None,
+        }
+    }
+
+    #[test]
+    fn collapsed_toast_expires_after_ttl() {
+        let t0 = Instant::now();
+        let t = toast(t0);
+        assert!(!t.is_expired(at(t0, 7.9)));
+        assert_eq!(t.remaining(at(t0, 3.0)), Duration::from_secs(5));
+        assert!(t.is_expired(at(t0, 8.0)));
+        assert_eq!(t.remaining(at(t0, 9.0)), Duration::ZERO);
+    }
+
+    #[test]
+    fn expanded_toast_pauses_expiry() {
+        let t0 = Instant::now();
+        let mut t = toast(t0);
+        t.set_expanded(true, at(t0, 2.0));
+        // far past the original deadline: still alive, remaining frozen
+        assert!(!t.is_expired(at(t0, 100.0)));
+        assert_eq!(t.remaining(at(t0, 100.0)), Duration::from_secs(6));
+        assert!(t.expanded);
+    }
+
+    #[test]
+    fn closing_detail_resumes_with_remaining_time() {
+        let t0 = Instant::now();
+        let mut t = toast(t0);
+        t.set_expanded(true, at(t0, 2.0));
+        assert!(!t.is_expired(at(t0, 100.0)));
+        t.set_expanded(false, at(t0, 100.0));
+        // 2 s were consumed before the pause → 6 s remain from t0+100
+        assert_eq!(t.remaining(at(t0, 100.0)), Duration::from_secs(6));
+        assert!(!t.is_expired(at(t0, 105.9)));
+        assert!(t.is_expired(at(t0, 106.0)));
+    }
+
+    #[test]
+    fn repeated_open_close_only_consumes_unpaused_time() {
+        let t0 = Instant::now();
+        let mut t = toast(t0);
+        t.set_expanded(true, at(t0, 1.0));
+        t.set_expanded(false, at(t0, 3.0)); // consumed 1 s → 7 s left from t0+3
+        t.set_expanded(true, at(t0, 5.0)); // paused again; 2 more s consumed → 5 s left
+        t.set_expanded(false, at(t0, 50.0));
+        assert_eq!(t.remaining(at(t0, 50.0)), Duration::from_secs(5));
+        assert!(!t.is_expired(at(t0, 54.9)));
+        assert!(t.is_expired(at(t0, 55.0)));
+    }
+
+    #[test]
+    fn copied_feedback_lasts_one_second() {
+        let t0 = Instant::now();
+        let mut t = toast(t0);
+        assert!(!t.copied_feedback(t0));
+        t.copied_at = Some(t0);
+        assert!(t.copied_feedback(at(t0, 0.5)));
+        assert!(!t.copied_feedback(t0 + COPIED_FEEDBACK));
     }
 }
