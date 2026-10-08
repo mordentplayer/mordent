@@ -11,6 +11,7 @@
 
 use crate::api::{AlbumHit, Api, SearchResults, Track};
 use crate::config::Config;
+use crate::mpris;
 use crate::player::{PacketSource, Player};
 use crate::theme::Theme;
 use crate::{stream, wrapper};
@@ -170,6 +171,10 @@ pub struct App {
     theme_poll: Option<std::time::Instant>,
     error: Option<(String, std::time::Instant)>,
     last_title: String,
+    /// Desktop media controls (MPRIS); `None` if D-Bus is unusable.
+    mpris: Option<mpris::Mpris>,
+    /// Bumped on every explicit seek so MPRIS emits `Seeked`.
+    seek_epoch: u64,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
 }
@@ -232,6 +237,8 @@ impl App {
                 .first()
                 .map(|w| (w.clone(), std::time::Instant::now())),
             last_title: "amc".into(),
+            mpris: None,
+            seek_epoch: 0,
             rx,
             tx,
         };
@@ -583,6 +590,7 @@ impl App {
         let Some(t) = self.now.as_ref().map(|t| t.duration_ms) else {
             return;
         };
+        self.seek_epoch += 1; // MPRIS emits Seeked
         let total = std::time::Duration::from_millis(t);
         let target = target.min(total);
         if self.player.decode_only {
@@ -616,6 +624,136 @@ impl App {
         } else {
             self.player.sink().map(|s| if !s.is_paused() { s.pause(); });
         }
+    }
+
+    /// MPRIS Stop: clear the queue (the queue panel's "clear") and drop the
+    /// current track, cancelling any in-flight source.
+    fn stop_all(&mut self) {
+        self.queue.clear();
+        self.shuffle_saved = None;
+        self.generation += 1;
+        self.preparing = false;
+        self.now = None;
+        self.fake_play = None;
+        self.fake_pause_at = None;
+        self.play_offset = std::time::Duration::ZERO;
+        self.player.sink().map(|s| s.clear());
+    }
+
+    /// Drain remote MPRIS commands and dispatch them onto the same code
+    /// paths as clicks/shortcuts.
+    fn drain_mpris(&mut self, ctx: &egui::Context) {
+        let cmds: Vec<mpris::Command> = match self.mpris.as_ref() {
+            Some(m) => {
+                let mut v = Vec::new();
+                while let Ok(c) = m.rx.try_recv() {
+                    v.push(c);
+                }
+                v
+            }
+            None => return,
+        };
+        for cmd in cmds {
+            match cmd {
+                mpris::Command::Play => {
+                    if self.now.is_some() && self.is_paused() {
+                        self.toggle_pause_now();
+                    }
+                }
+                mpris::Command::Pause => self.pause_now(),
+                mpris::Command::TogglePause => self.toggle_pause_now(),
+                mpris::Command::Next => self.skip_current(),
+                mpris::Command::Previous => self.prev_track(),
+                mpris::Command::Stop => self.stop_all(),
+                mpris::Command::Seek(us) => {
+                    let step = std::time::Duration::from_micros(us.unsigned_abs());
+                    let target = if us >= 0 {
+                        self.playback_position() + step
+                    } else {
+                        self.playback_position().saturating_sub(step)
+                    };
+                    self.seek_to(target);
+                }
+                mpris::Command::SetPosition(us) => {
+                    self.seek_to(std::time::Duration::from_micros(us))
+                }
+                mpris::Command::SetLoop(l) => {
+                    self.repeat = match l {
+                        mpris::LoopStatus::None => Repeat::Off,
+                        mpris::LoopStatus::Track => Repeat::One,
+                        mpris::LoopStatus::Playlist => Repeat::All,
+                    };
+                    self.save_ui_state();
+                }
+                mpris::Command::SetShuffle(want) => {
+                    if self.shuffle != want {
+                        self.toggle_shuffle();
+                    }
+                }
+                mpris::Command::SetVolume(v) => {
+                    self.volume = v.clamp(0.0, 1.0);
+                    self.player.volume(self.volume);
+                    self.save_ui_state();
+                }
+                mpris::Command::Raise => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+                mpris::Command::Quit => std::process::exit(0), // same as ctrl+Q
+            }
+        }
+    }
+
+    /// Publish a playback snapshot for the MPRIS thread (per frame; the
+    /// D-Bus side diffs and emits only on change).
+    fn publish_mpris(&self) {
+        let Some(m) = self.mpris.as_ref() else {
+            return;
+        };
+        let (title, artist, album, art_url, track_id, length) = match &self.now {
+            Some(t) => (
+                t.name.clone(),
+                t.artist.clone(),
+                t.album.clone(),
+                t.artwork_url(616, 616),
+                t.id.clone(),
+                std::time::Duration::from_millis(t.duration_ms),
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+                String::new(),
+                std::time::Duration::ZERO,
+            ),
+        };
+        let position = self.playback_position();
+        m.publish(mpris::Snapshot {
+            status: if self.now.is_none() {
+                mpris::PlaybackStatus::Stopped
+            } else if self.is_paused() {
+                mpris::PlaybackStatus::Paused
+            } else {
+                mpris::PlaybackStatus::Playing
+            },
+            title,
+            artist,
+            album,
+            art_url,
+            track_id,
+            length,
+            position,
+            volume: self.volume,
+            shuffle: self.shuffle,
+            loop_status: match self.repeat {
+                Repeat::Off => mpris::LoopStatus::None,
+                Repeat::One => mpris::LoopStatus::Track,
+                Repeat::All => mpris::LoopStatus::Playlist,
+            },
+            has_track: self.now.is_some(),
+            can_next: self.now.is_some() && (!self.queue.is_empty() || self.repeat != Repeat::Off),
+            can_prev: self.now.is_some()
+                && (!self.history.is_empty() || position.as_secs_f64() > 3.0),
+            seek_epoch: self.seek_epoch,
+        });
     }
 
     fn save_ui_state(&self) {
@@ -921,9 +1059,15 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_theme(ctx);
+        // Lazy MPRIS startup: after the window is up, never blocking the
+        // first frame (spawn() only starts a thread).
+        if self.mpris.is_none() {
+            self.mpris = mpris::Mpris::spawn();
+        }
         let mut focus_search = self.handle_keys(ctx);
         self.poll_messages();
         self.selftest_step();
+        self.drain_mpris(ctx);
 
         // ---- sleep timer ----
         if let Some((t0, d)) = self.sleep_at {
@@ -1065,6 +1209,8 @@ impl eframe::App for App {
             self.cheatsheet_ui(ctx);
         }
         self.toast_ui(ctx);
+
+        self.publish_mpris();
 
         let repaint = if self.now.is_some() { 100 } else { 250 };
         ctx.request_repaint_after(std::time::Duration::from_millis(repaint));

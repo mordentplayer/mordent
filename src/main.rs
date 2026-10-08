@@ -3,6 +3,7 @@ mod config;
 mod player;
 mod ui;
 mod fairplay;
+mod mpris;
 mod stream;
 mod theme;
 mod wrapper;

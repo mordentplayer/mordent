@@ -136,6 +136,24 @@ Transparency caveat: the window is created transparent, but see-through only
 works with a running compositor (X11 compositing manager / Wayland). On a bare
 X server it simply renders solid — neither case errors.
 
+=======
+## Media keys / MPRIS
+
+`amc ui` registers `org.mpris.MediaPlayer2.amc` on the session bus: it shows
+up in the GNOME/KDE media bar and lock screen with cover, title/artist and
+working controls (play/pause, next/prev, seek, stop, shuffle, repeat,
+volume). No session bus → MPRIS silently stays off; the app is unchanged.
+
+```sh
+playerctl --player=amc status
+playerctl --player=amc metadata
+playerctl --player=amc play-pause        # media keys: playerctl -a play-pause
+playerctl --player=amc next              # also: previous, stop, position 1:23
+playerctl --player=amc volume 0.5
+playerctl --player=amc loop Track        # None / Track / Playlist
+playerctl --player=amc shuffle On
+```
+
 ## Measured (VPS, download-throttled Apple CDN)
 
 | Metric | Value |
@@ -153,4 +171,4 @@ lyrics endpoint, decrypt-to-file, dense search-first UI with albums tab +
 album detail modal, queue with reorder/shuffle, seekable player bar with
 shuffle/repeat, keyboard shortcuts.
 Next: animated word-synced lyrics
-view, media keys, wrapper auto-spawn from the app.
+view, wrapper auto-spawn from the app.
