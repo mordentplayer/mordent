@@ -52,6 +52,13 @@ pub struct Queue {
     shuffle_saved: Option<Vec<Track>>,
 }
 
+/// `Some` for a playable catalog (adam) id; library rows are prefixed
+/// (`i.`/`p.`) and can only ever play as previews — the wrapper streams
+/// numeric ids exclusively.
+pub fn is_catalog_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl Queue {
     pub fn len(&self) -> usize {
         self.tracks.len()
@@ -237,6 +244,34 @@ impl Queue {
         self.tracks.clear();
         self.pos = None;
         self.shuffle_saved = None;
+    }
+
+    /// Sequential prefetch order: `(id, name)` of the entries strictly
+    /// AFTER the pointer, nearest first — or the whole queue from 0 while
+    /// nothing has ever started (fresh launch / fully stopped session).
+    /// Non-catalog rows are skipped: they cannot stream as full tracks, so
+    /// there is nothing to cache.
+    pub fn prefetch_list(&self) -> Vec<(String, String)> {
+        let start = self.pos.map_or(0, |p| p + 1).min(self.tracks.len());
+        self.tracks[start..]
+            .iter()
+            .filter(|t| is_catalog_id(&t.id))
+            .map(|t| (t.id.clone(), t.name.clone()))
+            .collect()
+    }
+
+    /// Cache dirs eviction must protect: the current entry (its download
+    /// may be in flight) plus every up-next id, so prune never evicts
+    /// near-term music — neither played-before-played history nor the
+    /// output of an in-flight prefetch.
+    pub fn eviction_keep(&self) -> Vec<String> {
+        let start = self.pos.map_or(0, |p| p + 1).min(self.tracks.len());
+        let mut v = Vec::with_capacity(1 + self.tracks.len() - start);
+        if let Some(c) = self.current() {
+            v.push(c.id.clone());
+        }
+        v.extend(self.tracks[start..].iter().map(|t| t.id.clone()));
+        v
     }
 }
 
@@ -558,5 +593,49 @@ mod tests {
         assert_eq!(q.pos, None);
         q.toggle_shuffle(); // must be a fresh shuffle (no stale saved state)
         assert!(q.is_empty());
+    }
+
+    // ---- prefetch order / eviction keep-set ----
+
+    #[test]
+    fn prefetch_list_walks_after_the_pointer() {
+        let q = mkq(&["11", "22", "33"], Some(0));
+        assert_eq!(q.prefetch_list(), vec![("22".into(), "22".into()), ("33".into(), "33".into())]);
+        // pointer on the last entry: nothing up-next
+        let q = mkq(&["11", "22"], Some(1));
+        assert!(q.prefetch_list().is_empty());
+    }
+
+    #[test]
+    fn prefetch_list_without_pointer_starts_from_zero() {
+        let q = mkq(&["11", "22"], None);
+        assert_eq!(q.prefetch_list().len(), 2);
+        assert_eq!(q.prefetch_list()[0].0, "11");
+    }
+
+    #[test]
+    fn prefetch_list_skips_non_catalog_rows() {
+        let mut q = mkq(&["1440801913", "i.123", "p.9", "1"], Some(0));
+        q.tracks[1].name = "library track".into();
+        let ids: Vec<String> = q.prefetch_list().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["1"]);
+        assert!(is_catalog_id("1440801913"));
+        assert!(!is_catalog_id("i.123") && !is_catalog_id("") && !is_catalog_id("1a"));
+    }
+
+    #[test]
+    fn eviction_keep_covers_current_and_up_next() {
+        let q = mkq(&["A", "B", "C"], Some(0));
+        assert_eq!(q.eviction_keep(), ["A", "B", "C"]);
+        let q = mkq(&["A", "B", "C"], Some(1));
+        assert_eq!(q.eviction_keep(), ["B", "C"]);
+        // finished session: the pointer's entry is still the current one
+        let q = mkq(&["A", "B"], Some(1));
+        assert_eq!(q.eviction_keep(), ["B"]);
+        // nothing current → whole queue protected (idle prefetch case)
+        let q = mkq(&["A", "B"], None);
+        assert_eq!(q.eviction_keep(), ["A", "B"]);
+        let q = mkq(&[], None);
+        assert!(q.eviction_keep().is_empty());
     }
 }

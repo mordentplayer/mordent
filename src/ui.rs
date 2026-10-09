@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::fonts::FontChoice;
 use crate::mpris;
 use crate::player::{PacketSource, Player};
+use crate::prefetch::Prefetcher;
 use crate::report;
 use crate::theme::Theme;
 use crate::stream;
@@ -135,6 +136,10 @@ struct SelftestState {
     /// stage1 / stage2 / stage4 audible targets (now-playing names).
     expect: [String; 3],
     started: std::time::Instant,
+    /// Wrapper can serve cacheable CDN streams (regions non-empty) — gates
+    /// the stage1 up-next-prefetch assertion; preview-only environments
+    /// have nothing to cache.
+    wrapper_cacheable: bool,
 }
 
 /// Auto-dismiss timeout of the collapsed error toast.
@@ -351,6 +356,9 @@ pub struct App {
     /// from an album context (album modal fetch / Queue All) so STARTs keep
     /// their album attribution across queue auto-advance and shuffle.
     album_ids: HashMap<String, String>,
+    /// Background sequential prefetch of the up-next queue (inert when the
+    /// audio cache is disabled).
+    prefetch: Prefetcher,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
 }
@@ -373,6 +381,7 @@ impl App {
             None
         };
         let (tx, rx) = channel();
+        let prefetch = Prefetcher::new(&cfg);
         let mut app = Self {
             cfg,
             player,
@@ -422,6 +431,7 @@ impl App {
                 stage: 0,
                 expect: Default::default(),
                 started: std::time::Instant::now(),
+                wrapper_cacheable: false,
             }),
             volume,
             theme,
@@ -440,6 +450,7 @@ impl App {
             report_seg_start_ms: 0,
             report_last_container: None,
             album_ids: HashMap::new(),
+            prefetch,
             rx,
             tx,
         };
@@ -769,10 +780,12 @@ impl App {
         let generation = self.generation;
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
+        // prune keep set for the play fetch: current + up-next stay cached
+        let keep = self.queue.eviction_keep();
         let t = track;
         let _ = std::thread::Builder::new().name("play-worker".into()).spawn(move || {
             let res = (|| -> anyhow::Result<()> {
-                let (prog, _mode) = stream::open_track(&cfg, &t.id)?;
+                let (prog, _mode) = stream::open_track(&cfg, &t.id, &keep)?;
                 let cancel = prog.cancel_flag();
                 let mut src = PacketSource::with_cancel(Box::new(prog), cancel)?;
                 // Seek = restart the stream and discard output before the
@@ -791,6 +804,8 @@ impl App {
                 let _ = tx.send(Msg::Error(format!("{e:#}")));
             }
         });
+        // every play moved the pointer → re-target the up-next prefetch
+        self.prefetch.scan(&self.queue);
     }
 
     fn play_now(&mut self, track: Track) {
@@ -873,6 +888,9 @@ impl App {
         if let Some(idx) = self.queue.append(new, idle_finished) {
             let t = self.queue.tracks[idx].clone();
             self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
+        } else {
+            // append only (no auto-start): the up-next set grew
+            self.prefetch.scan(&self.queue);
         }
     }
 
@@ -943,11 +961,13 @@ impl App {
             return;
         }
         self.queue.move_row(i, j as usize);
+        self.prefetch.scan(&self.queue);
     }
 
     /// Move queue row `from` to final index `to` (drag-and-drop drop handler).
     fn queue_move_to(&mut self, from: usize, to: usize) {
         self.queue.move_row(from, to);
+        self.prefetch.scan(&self.queue);
     }
 
     /// Shuffle keeps the played region + current intact and reorders only the
@@ -955,6 +975,7 @@ impl App {
     fn toggle_shuffle(&mut self) {
         self.shuffle = !self.shuffle;
         self.queue.toggle_shuffle();
+        self.prefetch.scan(&self.queue);
     }
 
     /// Elapsed time of the current track (fake clock in decode-only mode).
@@ -1166,6 +1187,7 @@ impl App {
         self.report_end(PlayEvent::END_SUSPENDED, pos);
         self.queue.clear();
         self.stop_playback();
+        self.prefetch.scan(&self.queue);
     }
 
     /// Drain remote MPRIS commands and dispatch them onto the same code
@@ -1642,6 +1664,10 @@ impl App {
             eprintln!("[selftest] stage0 queue-model PASS");
             if let Some(st) = &mut self.selftest {
                 st.expect = [n4, n2, n0];
+                st.wrapper_cacheable = crate::wrapper::Wrapper::new(&self.cfg.wrapper_url)
+                    .regions()
+                    .map(|r| !r.is_empty())
+                    .unwrap_or(false);
                 st.stage = 1;
                 st.started = std::time::Instant::now();
             }
@@ -1651,13 +1677,36 @@ impl App {
             let now_name = self.now.as_ref().map(|t| t.name.clone()).unwrap_or_default();
             let matches = |want: &str| now_name == *want;
             match st.stage {
-                // stage 1: the play_now target must eventually play (≤ 15 s)
+                // stage 1: the play_now target must eventually play (≤ 15 s);
+                // on a wrapper-backed run the up-next entry must also be
+                // cache-complete by then (sequential prefetch proof).
                 1 => {
                     if matches(&st.expect[0]) && !self.preparing {
-                        eprintln!("[selftest] stage1 PASS (now={now_name:?}, queue={})", self.queue.len());
-                        st.stage = 2;
-                        st.started = std::time::Instant::now();
-                    } else if elapsed > std::time::Duration::from_secs(15) {
+                        let next_cached = match self
+                            .queue
+                            .current_index()
+                            .and_then(|p| self.queue.tracks.get(p + 1))
+                        {
+                            Some(t) if st.wrapper_cacheable => crate::acache::AudioCache::new(
+                                &self.cfg,
+                            )
+                            .lookup(&t.id)
+                            .is_some(),
+                            _ => true,
+                        };
+                        if next_cached {
+                            eprintln!("[selftest] stage1 PASS (now={now_name:?}, queue={})", self.queue.len());
+                            st.stage = 2;
+                            st.started = std::time::Instant::now();
+                        } else if elapsed > std::time::Duration::from_secs(30) {
+                            eprintln!(
+                                "[selftest] stage1 FAIL (prefetch: up-next not cache-complete, now={now_name:?}, queue={})",
+                                self.queue.len()
+                            );
+                            eprintln!("[selftest] RESULT: FAIL");
+                            std::process::exit(1);
+                        }
+                    } else if elapsed > std::time::Duration::from_secs(30) {
                         eprintln!(
                             "[selftest] stage1 FAIL (now={now_name:?}, want {:?}, queue={})",
                             st.expect[0],
@@ -2704,6 +2753,7 @@ impl App {
                     self.report_end(PlayEvent::END_SUSPENDED, pos);
                     self.queue.clear();
                     self.stop_playback();
+                    self.prefetch.scan(&self.queue);
                 }
                 if shuf {
                     self.toggle_shuffle();
@@ -2742,6 +2792,8 @@ impl App {
             }
             RemoveEffect::Nothing => {}
         }
+        // the up-next set changed even when playback was untouched
+        self.prefetch.scan(&self.queue);
     }
 
     fn album_modal_ui(&mut self, ctx: &egui::Context) {

@@ -157,10 +157,11 @@ impl AudioCache {
         let _ = std::fs::remove_file(dir.join("meta.json"));
     }
 
-    /// Whole-dir LRU prune, once per play attempt, before any fetch. `keep`
-    /// (the track about to play) is exempt so an in-flight download can't
+    /// Whole-dir LRU prune, once per play attempt / prefetch step, before
+    /// any fetch. `keep` (the track about to play plus everything up-next)
+    /// is exempt so neither an in-flight download nor near-term music can
     /// be evicted from under itself.
-    pub fn prune(&self, keep: &str) {
+    pub fn prune(&self, keep: &[String]) {
         if !self.enabled() {
             return;
         }
@@ -262,9 +263,10 @@ pub struct EvictItem {
 
 /// Pure eviction decision: delete whole track dirs, oldest `last_played`
 /// first (unresolvable = 0 = first), until the total fits `budget`.
-/// `keep` is never selected. Returns the ids to delete.
-pub fn eviction_plan(items: &[EvictItem], budget: u64, keep: &str) -> Vec<String> {
-    let mut order: Vec<&EvictItem> = items.iter().filter(|i| i.id != keep).collect();
+/// Anything in `keep` (current + up-next) is never selected. Returns the
+/// ids to delete.
+pub fn eviction_plan(items: &[EvictItem], budget: u64, keep: &[String]) -> Vec<String> {
+    let mut order: Vec<&EvictItem> = items.iter().filter(|i| !keep.contains(&i.id)).collect();
     order.sort_by(|a, b| (a.last_played, &a.id).cmp(&(b.last_played, &b.id)));
     let mut total: u64 = items.iter().map(|i| i.size).sum();
     let mut out = Vec::new();
@@ -315,7 +317,7 @@ mod tests {
         // A played at t=100, B at t=200, A replayed at t=300 → A is newest.
         let items = vec![item("a", 300, 6), item("b", 200, 6)];
         // Budget fits one 6-byte track only.
-        let plan = eviction_plan(&items, 6, "");
+        let plan = eviction_plan(&items, 6, &[]);
         assert_eq!(plan, vec!["b".to_string()]);
     }
 
@@ -327,18 +329,56 @@ mod tests {
             item("x", 1, 3),
             item("y", 2, 4),
         ];
-        assert_eq!(eviction_plan(&items, 8, ""), vec!["x", "y"]);
+        assert_eq!(eviction_plan(&items, 8, &[]), vec!["x", "y"]);
         // Exactly at budget: nothing evicted.
-        assert_eq!(eviction_plan(&items, 12, ""), Vec::<String>::new());
+        assert_eq!(eviction_plan(&items, 12, &[]), Vec::<String>::new());
         // Oversized lone dir still evicts.
         let big = vec![item("big", 9, 100)];
-        assert_eq!(eviction_plan(&big, 8, ""), vec!["big"]);
+        assert_eq!(eviction_plan(&big, 8, &[]), vec!["big"]);
     }
 
     #[test]
     fn keep_exempts_current_track_from_eviction() {
         let items = vec![item("cur", 1, 6), item("old", 2, 6)];
-        assert_eq!(eviction_plan(&items, 6, "cur"), vec!["old"]);
+        assert_eq!(eviction_plan(&items, 6, &["cur".to_string()]), vec!["old"]);
+    }
+
+    /// Mixed play + prefetch: current and every up-next entry (prefetched
+    /// long ago, so older-stamped than fresh history) stay protected while
+    /// only played-out history is evicted.
+    #[test]
+    fn keep_set_protects_near_term_queue_over_history() {
+        // H: played out history (t=10) · X: current (t=20) · A/B/C:
+        // prefetched up-next earlier today (t=11..13, older than H's
+        // replay but near-term). Budget fits only two tracks.
+        let items = vec![
+            item("h", 10, 6),
+            item("x", 20, 6),
+            item("a", 11, 6),
+            item("b", 12, 6),
+            item("c", 13, 6),
+        ];
+        let keep: Vec<String> = vec!["x".to_string(), "a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(eviction_plan(&items, 12, &keep), vec!["h".to_string()]);
+    }
+
+    /// An up-next set larger than the whole budget cannot be made to fit:
+    /// everything outside the keep set goes, the protected near-term set
+    /// stays (over-budget until playback shrinks the queue — bounded by
+    /// the queue itself, and self-correcting as entries are played).
+    #[test]
+    fn oversized_keep_set_evicts_everything_else_and_stops() {
+        let items = vec![
+            item("old", 1, 6),
+            item("older", 2, 6),
+            item("n1", 3, 6),
+            item("n2", 4, 6),
+        ];
+        let keep: Vec<String> = vec!["n1".to_string(), "n2".to_string()];
+        assert_eq!(
+            eviction_plan(&items, 6, &keep),
+            vec!["old".to_string(), "older".to_string()]
+        );
     }
 
     fn seed_track(root: &Path, id: &str, last: u64, size: usize) {
@@ -365,7 +405,7 @@ mod tests {
         cache.touch("a", 400);
         let fit = dir_size(&root.join("a")) + dir_size(&root.join("c"));
         let cache = AudioCache { root: root.clone(), budget: fit };
-        cache.prune("");
+        cache.prune(&[]);
         assert!(!root.join("b").exists(), "B (oldest replay) evicted first");
         assert!(root.join("a").exists() && root.join("c").exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -385,7 +425,7 @@ mod tests {
         assert!(cache.lookup("part").is_none(), "no meta.json → incomplete");
 
         // Partial dirs have recency 0 → evicted before everything.
-        cache.prune("");
+        cache.prune(&[]);
         assert!(!pd.exists());
 
         // Truncated media fails the size check.
@@ -401,7 +441,7 @@ mod tests {
         assert!(!cache.enabled());
         assert!(cache.lookup("x").is_none());
         assert!(cache.populate_target("x", 1).is_none());
-        cache.prune("");
+        cache.prune(&[]);
         cache.touch("x", 1);
         cache.invalidate("x");
         assert!(!root.join("audio").exists(), "disabled cache must not create dirs");

@@ -223,6 +223,14 @@ at play time, so the cached files are inert without your device's license
 material. (The transient `tracks/<id>.m4a` decode buffer is separate
 machinery, not part of the cache budget.)
 
+Whenever the queue or the playing track changes, amc also prefetches the
+up-next queue sequentially in the background (one worker, nearest first,
+skipping already-cached tracks), so when a song ends the next one starts
+from the cache instead of waiting on a download. Queue edits re-target the
+walk, and eviction protects the current track plus everything up-next, so a
+long queued album never gets its near-term entries pruned. `cache_size_gb = 0`
+disables prefetch along with the cache.
+
 ## Measured (VPS, download-throttled Apple CDN)
 
 | Metric | Value |

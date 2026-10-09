@@ -3,6 +3,7 @@ mod api;
 mod config;
 mod fonts;
 mod player;
+mod prefetch;
 mod queuemodel;
 mod report;
 mod ui;
@@ -265,7 +266,7 @@ fn cmd_play(cfg: &config::Config, term: &str) -> Result<()> {
     println!("▶ {} — {} [{}]", track.name, track.artist, track.id);
 
     let t0 = std::time::Instant::now();
-    let (prog, _mode) = stream::open_track(cfg, &track.id)?;
+    let (prog, _mode) = stream::open_track(cfg, &track.id, std::slice::from_ref(&track.id))?;
 
     let player = player::Player::new();
     let mut src = player::PacketSource::new(Box::new(prog))?;

@@ -271,6 +271,33 @@ impl ProgressiveSource {
         })))
     }
 
+    /// Backing file for populate-only fetches (audio-cache prefetch): an
+    /// anonymous scratch file, unlinked right after open. The discarded
+    /// decrypted output never occupies a visible path and the OS reclaims
+    /// the space on close — even on a crash. (unlink-of-open-file is
+    /// POSIX; the only platform this client targets.)
+    fn shared_discard() -> Result<Arc<Mutex<Shared>>> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "amc-prefetch-{}-{}.m4a",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&p)?;
+        let _ = std::fs::remove_file(&p);
+        Ok(Arc::new(Mutex::new(Shared {
+            file,
+            downloaded: 0,
+            eof: false,
+            err: None,
+        })))
+    }
+
     fn append(sh: &Mutex<Shared>, cv: &Condvar, data: &[u8]) -> Result<()> {
         let mut s = sh.lock();
         use std::io::Write;
@@ -482,7 +509,29 @@ impl ProgressiveSource {
         agent: ureq::Agent,
         audio: Option<acache::Populate>,
     ) -> Result<Self> {
-        let sh = Self::shared(&cache_file)?;
+        Self::spawn_fairplay(plan, resolver, Self::shared(&cache_file)?, agent, audio)
+    }
+
+    /// Populate-only variant (audio-cache prefetch): the IDENTICAL
+    /// fetch/tee pipeline, but the in-line decrypted output is discarded
+    /// to an anonymous scratch file nobody reads — the point is the
+    /// ENCRYPTED tee, so no transient playback buffer is materialized.
+    pub fn start_fairplay_populate(
+        plan: MediaPlan,
+        resolver: &KeyResolver,
+        agent: ureq::Agent,
+        audio: acache::Populate,
+    ) -> Result<Self> {
+        Self::spawn_fairplay(plan, resolver, Self::shared_discard()?, agent, Some(audio))
+    }
+
+    fn spawn_fairplay(
+        plan: MediaPlan,
+        resolver: &KeyResolver,
+        sh: Arc<Mutex<Shared>>,
+        agent: ureq::Agent,
+        audio: Option<acache::Populate>,
+    ) -> Result<Self> {
         let cv = Arc::new(Condvar::new());
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wsh = sh.clone();
@@ -711,27 +760,39 @@ impl std::fmt::Display for SourceMode {
 /// 2. otherwise wrapper plan + CDN fetch, populating the cache;
 /// 3. wrapper unreachable / not logged in → uncached preview fallback.
 ///
+/// `keep` is the eviction-exempt id set (current + up-next — see
+/// [`Queue::eviction_keep`]); prune never deletes those dirs.
+///
 /// Cache I/O problems never fail the call — they degrade to the network
 /// path (logged once per process).
-pub fn open_track(cfg: &Config, adam_id: &str) -> Result<(ProgressiveSource, SourceMode)> {
+pub fn open_track(
+    cfg: &Config,
+    adam_id: &str,
+    keep: &[String],
+) -> Result<(ProgressiveSource, SourceMode)> {
     let started = std::time::Instant::now();
-    let r = open_track_inner(cfg, adam_id);
+    let r = open_track_inner(cfg, adam_id, keep);
     if let Ok((_, mode)) = &r {
         eprintln!("[play] source: {mode} (ready in {:.1?})", started.elapsed());
     }
     r
 }
 
-fn open_track_inner(cfg: &Config, adam_id: &str) -> Result<(ProgressiveSource, SourceMode)> {
+fn open_track_inner(
+    cfg: &Config,
+    adam_id: &str,
+    keep: &[String],
+) -> Result<(ProgressiveSource, SourceMode)> {
     let agent = ureq::AgentBuilder::new().build();
     let playback_file = crate::config::cache_path(cfg, &format!("tracks/{adam_id}.m4a"))?;
     let audio = acache::AudioCache::new(cfg);
     let now = crate::config::unix_now();
 
     if audio.enabled() {
-        // evict once per play attempt, before any fetch; the track about to
-        // play is exempt so an in-flight download can't be evicted
-        audio.prune(adam_id);
+        // evict once per play attempt, before any fetch; the keep set
+        // (current + up-next) protects near-term music and in-flight
+        // downloads — theirs and any prefetch running alongside
+        audio.prune(keep);
         if let Some(entry) = audio.lookup(adam_id) {
             match ProgressiveSource::start_fairplay_cached(&entry, playback_file.clone()) {
                 Ok(src) => {
@@ -750,19 +811,61 @@ fn open_track_inner(cfg: &Config, adam_id: &str) -> Result<(ProgressiveSource, S
 
     let w = Wrapper::new(&cfg.wrapper_url);
     if w.regions().map(|r| !r.is_empty()).unwrap_or(false) {
-        let m = fetch_manifests(&w, &agent, adam_id)?;
-        if let Some(p) = &populate {
-            acache::store_manifests(&p.dir, m.master.as_deref(), &m.media);
-        }
-        let plan = plan_of(&m)?;
-        let resolver =
-            KeyResolver::with_cache(&w, adam_id, populate.as_ref().map(|p| p.dir.clone()));
-        let src = ProgressiveSource::start_fairplay(plan, &resolver, playback_file, agent, populate)?;
+        let src = start_miss(&w, agent, adam_id, populate, Some(playback_file))?;
         return Ok((src, SourceMode::Stream));
     }
     let url = crate::api::Api::new(cfg.clone())?.preview_url(adam_id)?;
     let src = ProgressiveSource::start_plain(&url, playback_file, agent)?;
     Ok((src, SourceMode::Preview))
+}
+
+/// A cache miss: plan the track via the wrapper and start the CDN fetch,
+/// teeing raw ENCRYPTED bytes into `populate` when set. `playback` decides
+/// where the decrypted output goes — the transient seekable playback
+/// buffer (a path), or an anonymous discard file (`None`: populate-only).
+fn start_miss(
+    w: &Wrapper,
+    agent: ureq::Agent,
+    adam_id: &str,
+    populate: Option<acache::Populate>,
+    playback: Option<PathBuf>,
+) -> Result<ProgressiveSource> {
+    let m = fetch_manifests(w, &agent, adam_id)?;
+    if let Some(p) = &populate {
+        acache::store_manifests(&p.dir, m.master.as_deref(), &m.media);
+    }
+    let plan = plan_of(&m)?;
+    let resolver = KeyResolver::with_cache(w, adam_id, populate.as_ref().map(|p| p.dir.clone()));
+    match playback {
+        Some(file) => ProgressiveSource::start_fairplay(plan, &resolver, file, agent, populate),
+        None => ProgressiveSource::start_fairplay_populate(
+            plan,
+            &resolver,
+            agent,
+            populate.ok_or_else(|| anyhow!("populate-only fetch without a cache target"))?,
+        ),
+    }
+}
+
+/// Populate the audio cache for `adam_id` WITHOUT playing: the same
+/// wrapper plan + CDN fetch + ENCRYPTED tee as a cache-miss playback, but
+/// the decrypted output is discarded. The returned source's
+/// `cancel_flag()` aborts the fetch at the next fragment boundary (an
+/// aborted fetch never commits its cache entry), `is_done()` reports the
+/// outcome; the entry is complete once `AudioCache::lookup` finds it.
+///
+/// Fails when the cache is disabled or the wrapper is unusable — previews
+/// are not cacheable and are never prefetched.
+pub fn populate_track(cfg: &Config, adam_id: &str, last_played: u64) -> Result<ProgressiveSource> {
+    let audio = acache::AudioCache::new(cfg);
+    let populate = audio
+        .populate_target(adam_id, last_played)
+        .ok_or_else(|| anyhow!("audio cache disabled"))?;
+    let w = Wrapper::new(&cfg.wrapper_url);
+    if !w.regions().map(|r| !r.is_empty()).unwrap_or(false) {
+        bail!("wrapper has no regions — nothing cacheable to fetch");
+    }
+    start_miss(&w, ureq::AgentBuilder::new().build(), adam_id, Some(populate), None)
 }
 
 /// Read one top-level box: `(head, payload, exact header bytes as read)`
