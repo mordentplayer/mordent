@@ -1,6 +1,26 @@
+# Rust build output
 /target
+
+# Third-party wrapper (built locally by users; never vendored here)
 wrapper/build/
 wrapper/android-ndk-r23b/
 wrapper/rootfs/data/
 wrapper/ndk.zip
 wrapper/
+
+# Local third-party binaries (e.g. Cider download) — never commit
+cider-v*.zip
+cider-v*.tar.gz
+cider-*.zip
+
+# Logs and scratch/tmp output
+*.log
+/tmp/
+tmp/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
