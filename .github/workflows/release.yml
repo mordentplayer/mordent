@@ -15,7 +15,7 @@ env:
   NDK_URL: https://redirector.gvt1.com/edgedl/android/repository/android-ndk-r23b-linux.zip
 
 jobs:
-  # ---- 1. the app itself -------------------------------------------------
+  # ---- 1. the app: linux -------------------------------------------------
   build-amc:
     name: amc (linux x86_64)
     runs-on: ubuntu-latest
@@ -52,7 +52,7 @@ jobs:
           path: target/release/amc
           if-no-files-found: error
 
-  # ---- 2. the third-party wrapper backend --------------------------------
+  # ---- 2. the third-party wrapper backend (linux only) -------------------
   build-wrapper:
     name: wrapper-lite (linux x86_64)
     runs-on: ubuntu-latest
@@ -115,10 +115,96 @@ jobs:
           path: wrapper-out
           if-no-files-found: error
 
-  # ---- 3. combine into one download --------------------------------------
+  # ---- 3. the app: macOS (macos-14 is arm64; build the Intel slice too) --
+  build-macos:
+    name: amc (macos ${{ matrix.arch }})
+    # macos-14 is arm64 but now marked deprecated by actions/runner-images;
+    # it still works, and macos-15 (also arm64) is the drop-in replacement.
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 → Rust 1.85 floor; pin to stable (ahead of that floor).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          pkg="amc-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
+          root="dist/${pkg}"
+          mkdir -p "$root"
+          cp "target/${{ matrix.target }}/release/amc" "$root/amc"
+          cp README.md "$root/README.md"
+          cat > "$root/WRAPPER-NOTICE.txt" <<'EOF'
+          The FairPlay wrapper is Linux-only. On macOS/Windows, point amc at a remote wrapper (Setup → Wrapper → remote URL).
+          EOF
+          tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+
+      - name: Upload macos bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.tar.gz
+          if-no-files-found: error
+
+  # ---- 4. the app: Windows ----------------------------------------------
+  build-windows:
+    name: amc (windows x86_64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 → Rust 1.85 floor; pin to stable (ahead of that floor).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $pkg = "amc-$env:GITHUB_REF_NAME-windows-x86_64"
+          $root = "dist/$pkg"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item "target/release/amc.exe" "$root/amc.exe"
+          Copy-Item "README.md" "$root/README.md"
+          @'
+          The FairPlay wrapper is Linux-only. On macOS/Windows, point amc at a remote wrapper (Setup → Wrapper → remote URL).
+          '@ | Set-Content -Path "$root/WRAPPER-NOTICE.txt" -Encoding utf8NoBOM
+          Compress-Archive -Path $root -DestinationPath "$pkg.zip" -Force
+          "PKG=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+      - name: Upload windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.zip
+          if-no-files-found: error
+
+  # ---- 5. linux bundle (app + wrapper) and the one release creator -------
   bundle:
     name: bundle + release
-    needs: [build-amc, build-wrapper]
+    needs: [build-amc, build-wrapper, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -134,6 +220,22 @@ jobs:
         with:
           name: wrapper-payload
           path: in/wrapper
+
+      # The macOS/Windows bundles are published as-is; only linux bundles the
+      # wrapper (the FairPlay backend is linux-only).
+      - name: Download macos bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: amc-*-macos-*
+          path: in/release
+          merge-multiple: true
+
+      - name: Download windows bundle
+        uses: actions/download-artifact@v4
+        with:
+          pattern: amc-*-windows-*
+          path: in/release
+          merge-multiple: true
 
       - name: Assemble bundle
         run: |
@@ -191,5 +293,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.PKG }}.tar.gz
+          files: |
+            ${{ env.PKG }}.tar.gz
+            in/release/*.tar.gz
+            in/release/*.zip
           generate_release_notes: true
