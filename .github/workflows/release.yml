@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    name: linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 → Rust 1.85 floor; pin to stable (ahead of that floor).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # eframe/winit/glutin (x11 + wayland) and rodio/cpal (alsa) build deps.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          pkg="amc-${tag}-linux-x86_64"
+          mkdir -p "dist/${pkg}"
+          cp target/release/amc "dist/${pkg}/amc"
+          cp README.md "dist/${pkg}/README.md"
+          cp assets/fonts/LICENSE-DejaVu.txt "dist/${pkg}/LICENSE-DejaVu.txt"
+          cp assets/fonts/LICENSE-Inter.txt "dist/${pkg}/LICENSE-Inter.txt"
+          tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.tar.gz
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PKG }}.tar.gz
+          generate_release_notes: true
