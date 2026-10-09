@@ -200,6 +200,22 @@ impl ErrorToast {
     fn copied_feedback(&self, now: std::time::Instant) -> bool {
         matches!(self.copied_at, Some(t) if now.saturating_duration_since(t) < COPIED_FEEDBACK)
     }
+
+    /// Time until this toast next needs a frame, or `None` once it is static:
+    /// the auto-dismiss countdown (frozen while the detail view is open) or the
+    /// transient "Copied ✓" label, whichever expires first. Feeds the single
+    /// repaint driver so both keep ticking while the window is unfocused.
+    fn next_repaint(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let ttl = (!self.expanded).then(|| self.remaining(now));
+        let copied = self.copied_at.and_then(|t| {
+            let left = COPIED_FEEDBACK.saturating_sub(now.saturating_duration_since(t));
+            (!left.is_zero()).then_some(left)
+        });
+        match (ttl, copied) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 /// UI settings persisted to ~/.config/amc/state.toml (atomic write).
@@ -244,6 +260,37 @@ fn sleep_label(sleep_at: &Option<(std::time::Instant, std::time::Duration)>) -> 
         None => "sleep off".to_string(),
         Some((t0, d)) => format!("sleep {}", fmt_pos(d.saturating_sub(t0.elapsed()))),
     }
+}
+
+/// Bounded delay until `App::update` must run again, or `None` when nothing is
+/// pending and the event loop may park indefinitely.
+///
+/// Auto-advance, the MPRIS command drain and the toast countdown are all
+/// evaluated inside `update()`, and egui/winit parks the frame loop when no
+/// repaint is requested and no window events arrive (an unfocused window gets
+/// no events at all). So a frame is guaranteed in every state that could still
+/// produce work: playing ticks fast (100 ms) to drive progress and the
+/// natural-end check; a loaded/preparing track, a non-empty queue or a
+/// debounced write ticks slower (250 ms); a live toast or sleep-timer deadline
+/// wakes exactly when it elapses (whichever comes first). With none of those
+/// there is nothing left to do and the loop parks.
+fn next_repaint_delay(
+    playing: bool,
+    work_pending: bool,
+    toast: Option<std::time::Duration>,
+    sleep: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let mut delay = if playing {
+        Some(std::time::Duration::from_millis(100))
+    } else if work_pending {
+        Some(std::time::Duration::from_millis(250))
+    } else {
+        None
+    };
+    for extra in toast.into_iter().chain(sleep) {
+        delay = Some(delay.map_or(extra, |d| d.min(extra)));
+    }
+    delay
 }
 
 pub struct App {
@@ -2017,8 +2064,21 @@ impl eframe::App for App {
 
         self.publish_mpris();
 
-        let repaint = if self.now.is_some() { 100 } else { 250 };
-        ctx.request_repaint_after(std::time::Duration::from_millis(repaint));
+        // Single repaint driver: one bounded wakeup covers every state where
+        // `update` may still have work (auto-advance, MPRIS drain, toasts), so
+        // playback keeps advancing while the window is unfocused; truly idle
+        // states park. See `next_repaint_delay`.
+        let now = std::time::Instant::now();
+        let playing = self.now.is_some() && !self.preparing && !self.is_paused() && !idle;
+        let work_pending = self.now.is_some()
+            || self.preparing
+            || !self.queue.is_empty()
+            || self.state_dirty.is_some();
+        let toast = self.error.as_ref().and_then(|e| e.next_repaint(now));
+        let sleep = self.sleep_at.map(|(t0, d)| d.saturating_sub(t0.elapsed()));
+        if let Some(delay) = next_repaint_delay(playing, work_pending, toast, sleep) {
+            ctx.request_repaint_after(delay);
+        }
     }
 
     /// Transparent-viewport clear color: the theme background at the theme's
@@ -3047,11 +3107,9 @@ impl App {
             self.error_detail_ui(ctx);
             return;
         }
-        // Keep the collapsed countdown ticking (playback usually repaints, but
-        // not while idle, e.g. an error raised from a fired search).
-        if let Some(t) = &self.error {
-            ctx.request_repaint_after(t.remaining(now));
-        }
+        // The collapsed countdown's repaint is owned by the single driver at
+        // the end of `update` (see `next_repaint_delay`), which covers the
+        // idle case too (e.g. an error raised from a fired search).
         let mut dismiss = false;
         let mut expand = false;
         egui::Area::new(egui::Id::new("toast"))
@@ -3160,10 +3218,8 @@ impl App {
             if let Some(e) = &mut self.error {
                 e.copied_at = Some(std::time::Instant::now());
             }
-            ctx.request_repaint_after(COPIED_FEEDBACK);
-        } else if copied {
-            // repaint so "Copied ✓" clears even without further input
-            ctx.request_repaint_after(COPIED_FEEDBACK);
+            // The "Copied ✓" label's repaint is owned by the single driver at
+            // the end of `update` (via `ErrorToast::next_repaint`).
         }
         if close {
             self.close_error_detail();
@@ -3586,5 +3642,83 @@ mod toast_state_tests {
         t.copied_at = Some(t0);
         assert!(t.copied_feedback(at(t0, 0.5)));
         assert!(!t.copied_feedback(t0 + COPIED_FEEDBACK));
+    }
+
+    #[test]
+    fn collapsed_toast_next_repaint_is_remaining_ttl() {
+        let t0 = Instant::now();
+        let t = toast(t0);
+        assert_eq!(t.next_repaint(at(t0, 3.0)), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn expanded_toast_next_repaint_is_none_without_copied_feedback() {
+        let t0 = Instant::now();
+        let mut t = toast(t0);
+        t.set_expanded(true, at(t0, 2.0));
+        // expiry is frozen while the detail is open → nothing to wake for
+        assert_eq!(t.next_repaint(at(t0, 100.0)), None);
+    }
+
+    #[test]
+    fn copied_feedback_wins_while_it_shows() {
+        let t0 = Instant::now();
+        let mut t = toast(t0);
+        t.set_expanded(true, at(t0, 1.0));
+        t.copied_at = Some(at(t0, 1.0));
+        assert_eq!(t.next_repaint(at(t0, 1.2)), Some(Duration::from_millis(800)));
+        // the label has cleared and expiry is still frozen → static
+        assert_eq!(t.next_repaint(at(t0, 3.0)), None);
+    }
+}
+
+#[cfg(test)]
+mod repaint_tests {
+    use super::next_repaint_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn idle_parks() {
+        assert_eq!(next_repaint_delay(false, false, None, None), None);
+    }
+
+    #[test]
+    fn playing_ticks_fast() {
+        assert_eq!(
+            next_repaint_delay(true, true, None, None),
+            Some(Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn loaded_track_or_queue_ticks_slow() {
+        assert_eq!(
+            next_repaint_delay(false, true, None, None),
+            Some(Duration::from_millis(250))
+        );
+    }
+
+    #[test]
+    fn countdowns_shorten_the_sleep() {
+        // a live countdown alone still wakes the otherwise-parked loop
+        assert_eq!(
+            next_repaint_delay(false, false, Some(Duration::from_millis(40)), None),
+            Some(Duration::from_millis(40))
+        );
+        // the nearest of toast / sleep deadline wins
+        assert_eq!(
+            next_repaint_delay(
+                false,
+                false,
+                Some(Duration::from_secs(8)),
+                Some(Duration::from_secs(3))
+            ),
+            Some(Duration::from_secs(3))
+        );
+        // a countdown never slows a playing tick
+        assert_eq!(
+            next_repaint_delay(true, true, Some(Duration::from_secs(5)), None),
+            Some(Duration::from_millis(100))
+        );
     }
 }
