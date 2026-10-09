@@ -13,7 +13,9 @@
 //! In decode-only mode (no audio device) a fake playback clock simulates the
 //! running track so queue/auto-advance behaves like a real player.
 
-use crate::api::{AlbumHit, Api, LibraryPlaylist, PlayEvent, PlayMode, SearchResults, Track};
+use crate::api::{
+    AlbumHit, Api, LibraryPlaylist, PlayEvent, PlayMode, SearchResults, Track, META_TTL_LIBRARY,
+};
 use crate::config::Config;
 use crate::fonts::FontChoice;
 use crate::mpris;
@@ -43,6 +45,9 @@ enum Msg {
         tracks: Vec<Track>,
     },
     Error(String),
+    /// Non-fatal warning from the cache layer (e.g. a stale copy was served
+    /// because the network is down); shown through the same toast.
+    Notice(String),
     /// One page of the user's library playlists (appended), next offset.
     Playlists(Vec<LibraryPlaylist>, Option<u32>),
     /// Tracks of a library playlist: first page (replaces) or a later page
@@ -313,6 +318,9 @@ pub struct App {
     library: Option<Vec<AlbumHit>>,
     library_loading: bool,
     library_next: Option<u32>,
+    /// When the current library page(s) were loaded; past META_TTL_LIBRARY
+    /// the view refetches on entry instead of pinning session-stale rows.
+    library_loaded: Option<std::time::Instant>,
     /// Library sort order (not persisted).
     library_sort: LibrarySort,
     /// Favorited track ids (persisted; sorted on save).
@@ -441,6 +449,7 @@ impl App {
             library: None,
             library_loading: false,
             library_next: None,
+            library_loaded: None,
             library_sort: LibrarySort::Added,
             favorites: state.favorites.clone().unwrap_or_default().into_iter().collect(),
             fav_tracks: HashMap::new(),
@@ -566,6 +575,9 @@ impl App {
             match api.search(&term, 30) {
                 Ok(r) => {
                     let _ = tx.send(Msg::Results(Box::new(r)));
+                    if let Some(note) = api.take_notice() {
+                        let _ = tx.send(Msg::Notice(note));
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Error(format!("{e:#}")));
@@ -579,9 +591,19 @@ impl App {
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            match Api::new(cfg).and_then(|api| api.library_albums_page(100, offset)) {
+            let api = match Api::new(cfg) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
+            match api.library_albums_page(100, offset) {
                 Ok((albums, next)) => {
                     let _ = tx.send(Msg::Library(albums, next));
+                    if let Some(note) = api.take_notice() {
+                        let _ = tx.send(Msg::Notice(note));
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Error(format!("{e:#}")));
@@ -595,9 +617,19 @@ impl App {
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            match Api::new(cfg).and_then(|api| api.library_playlists(50, offset)) {
+            let api = match Api::new(cfg) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
+            match api.library_playlists(50, offset) {
                 Ok((lists, next)) => {
                     let _ = tx.send(Msg::Playlists(lists, next));
+                    if let Some(note) = api.take_notice() {
+                        let _ = tx.send(Msg::Notice(note));
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Error(format!("{e:#}")));
@@ -615,9 +647,19 @@ impl App {
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            match Api::new(cfg).and_then(|api| api.playlist_tracks_page(&id, 100, offset)) {
+            let api = match Api::new(cfg) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
+            match api.playlist_tracks_page(&id, 100, offset) {
                 Ok((tracks, next)) => {
                     let _ = tx.send(Msg::PlaylistTracks { id, tracks, next });
+                    if let Some(note) = api.take_notice() {
+                        let _ = tx.send(Msg::Notice(note));
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Error(format!("{e:#}")));
@@ -644,8 +686,21 @@ impl App {
     fn switch_view(&mut self, v: View) {
         self.view = v;
         self.save_ui_state();
-        if v == View::Library && self.library.is_none() && !self.library_loading {
-            self.spawn_library(0);
+        if v == View::Library && !self.library_loading {
+            // within the metadata TTL the in-memory page is served as-is;
+            // past it, a re-entry refetches so a long session never pins
+            // stale rows (the disk cache may serve its own fresh copy)
+            let expired = self
+                .library_loaded
+                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(META_TTL_LIBRARY));
+            if expired {
+                self.library = None;
+                self.library_next = None;
+                self.library_loaded = None;
+            }
+            if self.library.is_none() {
+                self.spawn_library(0);
+            }
         }
         if v == View::Playlists && self.playlists.is_none() && !self.playlists_loading {
             self.spawn_playlists(0);
@@ -1490,6 +1545,9 @@ impl App {
                 Msg::Library(albums, next) => {
                     self.library.get_or_insert_with(Vec::new).extend(albums);
                     self.library_next = next;
+                    // stamp on the first page; "load more" keeps the
+                    // original load time
+                    self.library_loaded.get_or_insert_with(std::time::Instant::now);
                     self.library_loading = false;
                 }
                 Msg::Playlists(lists, next) => {
@@ -1585,6 +1643,9 @@ impl App {
                         m.loading_more = false;
                     }
                 }
+                // a stale-cache hint: same toast slot, non-fatal (no state
+                // reset — the fetch it belongs to succeeded)
+                Msg::Notice(note) => self.fail(note),
             }
         }
     }
