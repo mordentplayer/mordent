@@ -208,8 +208,9 @@ carries the seeked position.
 - `meta/` — amp-api responses (library UI, search, albums, artists, playlists)
   keyed by URL+storefront. Catalog entries stay fresh for 7 days, library
   entries for 1 hour; stale entries are re-fetched, and any cached copy is
-  served when the network is unreachable (offline browsing). Cleaned on
-  startup; exempt from the size budget.
+  served when the network is unreachable (offline browsing) — with a
+  visible "showing cached … — offline?" hint, though never over an auth
+  error (401/403). Cleaned on startup; exempt from the size budget.
 - `audio/<adam id>/` — per-track playback material: master/variant manifests,
   FairPlay license responses, and the **encrypted** CDN media bytes. A fully
   cached track starts with zero network access; partially cached tracks just

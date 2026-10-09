@@ -384,6 +384,10 @@ pub struct Api {
     agent: ureq::Agent,
     pub cfg: Config,
     bearer: RefCell<Option<String>>,
+    /// Pending user-facing notice from the cache layer (e.g. "served a
+    /// stale copy because the network is down"); consumed by the UI/CLI
+    /// after a fetch via [`Api::take_notice`].
+    notice: RefCell<Option<String>>,
 }
 
 impl Api {
@@ -404,6 +408,7 @@ impl Api {
             agent,
             cfg,
             bearer: RefCell::new(None),
+            notice: RefCell::new(None),
         })
     }
 
@@ -454,7 +459,10 @@ impl Api {
 
     /// GET with a single transparent 401-retry after bearer refresh, fronted
     /// by the metadata disk cache: fresh TTL → serve cached; network failure
-    /// with ANY cached copy → serve stale (offline browsing).
+    /// with any cached copy → serve stale (offline browsing), flagged via
+    /// [`Api::take_notice`] so the UI can say so. Auth failures (401/403)
+    /// are never masked by stale data — they surface with a hint to fix the
+    /// token instead.
     fn get_json_retry(&self, url: &str) -> Result<serde_json::Value> {
         if let Some(v) = self.meta_lookup(url) {
             return Ok(v);
@@ -466,7 +474,7 @@ impl Api {
             }
             Err(e) => e,
         };
-        if is_unauthorized(&err) {
+        if is_auth_error(&err) {
             match self.refresh_bearer().and_then(|_| self.get_json(url)) {
                 Ok(v) => {
                     self.meta_store(url, &v);
@@ -474,12 +482,48 @@ impl Api {
                 }
                 Err(e) => err = e,
             }
+            if is_auth_error(&err) {
+                // Still unauthorized on a freshly scraped bearer: the
+                // media-user-token (or account) is the problem, and stale
+                // data must not hide that.
+                return Err(self.auth_error(err));
+            }
+            // the refresh itself could not reach the network → fall through
+            // to the offline fallback below
         }
-        // network failed — any cached copy beats an error for browsing
-        if let Some(v) = self.meta_stale(url) {
+        // network failed (offline / down) — any cached copy beats an error
+        // for browsing, but say so
+        if let Some((v, stored)) = self.meta_stale(url) {
+            let kind = if url.contains("/v1/me/") { "library" } else { "catalog" };
+            let age = human_age(unix_now().saturating_sub(stored));
+            self.notice
+                .borrow_mut()
+                .replace(format!("showing cached {kind} from {age} — offline?"));
             return Ok(v);
         }
         Err(err)
+    }
+
+    /// User-facing message for an auth failure that survived a bearer
+    /// refresh. With a media-user-token configured (library, playlists and
+    /// library search all depend on it), the token is the prime suspect.
+    fn auth_error(&self, e: anyhow::Error) -> anyhow::Error {
+        if self
+            .cfg
+            .media_user_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
+            anyhow::anyhow!("media-user-token expired — update it in the config")
+        } else {
+            anyhow::anyhow!("Apple Music authentication failed — {e:#}")
+        }
+    }
+
+    /// Consume a pending notice from the cache layer, if the last fetch set
+    /// one (currently: a stale copy served past its TTL on network failure).
+    pub fn take_notice(&self) -> Option<String> {
+        self.notice.borrow_mut().take()
     }
 
     // ---- metadata disk cache ({cache_dir}/meta) ----
@@ -494,7 +538,8 @@ impl Api {
         cache_path(&self.cfg, &format!("meta/{key}.cache")).ok()
     }
 
-    /// Fresh TTL hit.
+    /// Fresh TTL hit. A missing/garbage header counts as a miss (treated
+    /// like an expired entry: refetch and overwrite), never as a hit.
     fn meta_lookup(&self, url: &str) -> Option<serde_json::Value> {
         let raw = std::fs::read_to_string(self.meta_path(url)?).ok()?;
         let (head, body) = raw.split_once('\n')?;
@@ -508,10 +553,22 @@ impl Api {
     }
 
     /// Any cached copy, regardless of age (network-failure fallback).
-    fn meta_stale(&self, url: &str) -> Option<serde_json::Value> {
-        let raw = std::fs::read_to_string(self.meta_path(url)?).ok()?;
-        let (_, body) = raw.split_once('\n')?;
-        serde_json::from_str(body).ok()
+    /// Returns the value plus a `stored` epoch-seconds stamp — the header's
+    /// when parseable, otherwise the file's mtime — so the stale-serve
+    /// notice can state the copy's age.
+    fn meta_stale(&self, url: &str) -> Option<(serde_json::Value, u64)> {
+        let p = self.meta_path(url)?;
+        let raw = std::fs::read_to_string(&p).ok()?;
+        let (head, body) = raw.split_once('\n')?;
+        let stored = serde_json::from_str::<serde_json::Value>(head)
+            .ok()
+            .and_then(|h| h.get("stored").and_then(|s| s.as_u64()))
+            .or_else(|| {
+                let m = std::fs::metadata(&p).ok()?;
+                let t = m.modified().ok()?;
+                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+            })?;
+        serde_json::from_str(body).ok().map(|v| (v, stored))
     }
 
     fn meta_store(&self, url: &str, v: &serde_json::Value) {
@@ -1030,7 +1087,10 @@ struct JsPlayBody<'a> {
 /// Metadata-cache freshness windows: catalog data barely changes, library
 /// data changes with every add/play.
 const META_TTL_CATALOG: u64 = 7 * 24 * 3600;
-const META_TTL_LIBRARY: u64 = 3600;
+
+/// Library TTL; the Library view also uses it to decide when its in-memory
+/// page is too old to keep showing without a refetch.
+pub const META_TTL_LIBRARY: u64 = 3600;
 
 /// TTL for an amp-api URL: library endpoints (`/v1/me/`) 1h, catalog 7d.
 fn meta_ttl(url: &str) -> u64 {
@@ -1042,8 +1102,32 @@ fn meta_ttl(url: &str) -> u64 {
 }
 
 /// Pure freshness decision (clock injected as `now` for tests).
+///
+/// A `stored` stamp in the future is garbage — clock skew, or a foreign /
+/// pre-project writer of the same cache layout — and must NOT count as
+/// maximally fresh: with saturating arithmetic it would be served forever,
+/// the sweep would keep it forever, and the network would never be
+/// consulted again (a Library frozen for weeks with no way to self-heal).
+/// Refusing it makes the entry stale → refetch → overwrite with a sane
+/// stamp.
 fn meta_fresh(stored: u64, now: u64, ttl: u64) -> bool {
-    now.saturating_sub(stored) < ttl
+    stored <= now && now - stored < ttl
+}
+
+/// "45 minutes" / "3 hours" / "2 days" for the stale-serve notice.
+fn human_age(age_secs: u64) -> String {
+    let (n, unit) = if age_secs < 3600 {
+        (age_secs / 60, "minute")
+    } else if age_secs < 24 * 3600 {
+        (age_secs / 3600, "hour")
+    } else {
+        (age_secs / (24 * 3600), "day")
+    };
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
 }
 
 /// Startup sweep: delete metadata cache entries older than their TTL
@@ -1079,10 +1163,13 @@ fn from_value<T: DeserializeOwned>(v: serde_json::Value) -> Result<T> {
     serde_json::from_value(v).map_err(Into::into)
 }
 
-fn is_unauthorized(e: &anyhow::Error) -> bool {
+/// True when the error is an HTTP auth failure (401/403). These are never
+/// masked by the stale-cache fallback: serving a weeks-old library on top of
+/// a dead token hides the actual problem from the user.
+fn is_auth_error(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<ureq::Error>()
-            .is_some_and(|ue| matches!(ue, ureq::Error::Status(401, _)))
+            .is_some_and(|ue| matches!(ue, ureq::Error::Status(401 | 403, _)))
     })
 }
 
@@ -1268,9 +1355,41 @@ mod tests {
         assert!(meta_fresh(1_000, 1_000 + ttl - 1, ttl)); // inside window
         assert!(!meta_fresh(1_000, 1_000 + ttl, ttl)); // boundary: stale
         assert!(!meta_fresh(1_000, 2_000 + ttl, ttl));
-        // clock never regresses a decision
-        assert!(meta_fresh(2_000, 1_000, ttl)); // stored "in the future" is fresh
+        // a stamp in the future is garbage (clock skew / foreign writer):
+        // it must count as stale so the entry is refetched and overwritten
+        // instead of being served — and kept by the sweep — forever
+        assert!(!meta_fresh(2_000, 1_000, ttl));
+        // a milliseconds-unit stamp (1.79e12) is just a huge future stamp:
+        // same refusal
+        assert!(!meta_fresh(1_791_502_234_000, 1_791_502_234, ttl));
         assert_eq!(meta_ttl(""), META_TTL_CATALOG); // default is catalog
+    }
+
+    #[test]
+    fn human_age_formats_minutes_hours_days() {
+        assert_eq!(human_age(0), "0 minutes");
+        assert_eq!(human_age(59), "0 minutes");
+        assert_eq!(human_age(60), "1 minute");
+        assert_eq!(human_age(45 * 60), "45 minutes");
+        assert_eq!(human_age(3600), "1 hour");
+        assert_eq!(human_age(23 * 3600), "23 hours");
+        assert_eq!(human_age(24 * 3600), "1 day");
+        assert_eq!(human_age(3 * 24 * 3600 + 500), "3 days");
+    }
+
+    #[test]
+    fn auth_errors_detected_401_403_only() {
+        fn status_err(code: u16) -> anyhow::Error {
+            let resp = ureq::Response::new(code, "test", "{}").unwrap();
+            anyhow::Error::new(ureq::Error::Status(code, resp))
+        }
+        assert!(is_auth_error(&status_err(401)));
+        assert!(is_auth_error(&status_err(403)));
+        assert!(!is_auth_error(&status_err(404)));
+        assert!(!is_auth_error(&status_err(500)));
+        assert!(!is_auth_error(&anyhow::Error::msg("connection refused")));
+        // context-wrapped errors still detected through the chain
+        assert!(is_auth_error(&status_err(401).context("GET https://x")));
     }
 
     #[test]
@@ -1306,7 +1425,7 @@ mod tests {
         let old = format!("{{\"stored\":0,\"ttl\":{}}}\n{body}", META_TTL_CATALOG);
         std::fs::write(&p, old).unwrap();
         assert!(api.meta_lookup(url).is_none());
-        assert_eq!(api.meta_stale(url).as_ref(), Some(&v));
+        assert_eq!(api.meta_stale(url).map(|(v, _)| v).as_ref(), Some(&v));
         // store overwrites (header refresh)
         api.meta_store(url, &v);
         assert_eq!(api.meta_lookup(url).as_ref(), Some(&v));
@@ -1326,6 +1445,141 @@ mod tests {
         clean_meta_cache(&cfg);
         assert!(!p.exists(), "expired entry swept");
         assert!(fp.exists(), "fresh entry kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_future_and_malformed_headers_never_served_fresh() {
+        let dir = std::env::temp_dir().join(format!("amc-meta-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            cache_dir: dir.clone(),
+            ..Config::default()
+        };
+        let api = Api::new(cfg).unwrap();
+        let url = "https://amp-api.music.apple.com/v1/me/library/albums?limit=100&offset=0";
+        let body = fixture("meta_stale_body.json").to_string();
+
+        // every one of these headers is a miss (refetch + overwrite), and
+        // the startup sweep drops what the lookup refuses — no entry may be
+        // served as fresh or kept forever
+        let bad_headers = [
+            // clock-ahead laptop: stored a day in the future
+            format!("{{\"stored\":{},\"ttl\":3600}}", unix_now() + 86_400),
+            // milliseconds-unit stamp (foreign/pre-project cache writer)
+            format!("{{\"stored\":{},\"ttl\":3600}}", (unix_now() + 60) * 1000),
+            // wrong types / missing fields / junk
+            format!("{{\"stored\":\"{}\",\"ttl\":3600}}", unix_now()),
+            "{\"ttl\":3600}".to_string(),
+            "{\"stored\":1}".to_string(),
+            "not json at all".to_string(),
+            String::new(), // empty header line, body only
+        ];
+        for h in &bad_headers {
+            let p = api.meta_path(url).unwrap();
+            std::fs::write(&p, format!("{h}\n{body}")).unwrap();
+            assert!(api.meta_lookup(url).is_none(), "served fresh: {h:?}");
+            clean_meta_cache(&api.cfg);
+            assert!(!p.exists(), "sweep kept: {h:?}");
+        }
+
+        // a well-formed fresh header is still a hit and survives the sweep
+        let p = api.meta_path(url).unwrap();
+        std::fs::write(
+            &p,
+            format!("{{\"stored\":{},\"ttl\":{META_TTL_LIBRARY}}}\n{body}", unix_now()),
+        )
+        .unwrap();
+        assert!(api.meta_lookup(url).is_some());
+        clean_meta_cache(&api.cfg);
+        assert!(p.exists(), "well-formed fresh entry swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-auth network failure (404 here) must not write the error body
+    /// into the cache, and the stale copy it serves must be flagged via
+    /// `take_notice` (visible staleness).
+    #[test]
+    fn no_cache_on_4xx_and_stale_serve_is_flagged() {
+        let dir = std::env::temp_dir().join(format!("amc-meta-4xx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            cache_dir: dir.clone(),
+            ..Config::default()
+        };
+        let api = Api::new(cfg).unwrap();
+        // bearer comes from a seeded cache so the test never scrapes
+        std::fs::write(api.cfg.cache_dir.join("bearer.jwt"), "test-bearer").unwrap();
+
+        let old_body = serde_json::to_string(&fixture("meta_stale_body.json")).unwrap();
+
+        // one-shot HTTP server answering 404 with a JSON error body
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"errors\":[{\"status\":\"404\"}]}",
+            )
+            .unwrap();
+        });
+
+        // the cache key is the full URL string: fetch the loopback URL and
+        // seed its stale copy under exactly that key
+        let fetch_url = format!("http://127.0.0.1:{port}/v1/catalog/us/artists/404test");
+        let p = api.meta_path(&fetch_url).unwrap();
+        // seed a long-expired copy (the startup sweep would have dropped
+        // it; this test calls the Api directly, so it is still on disk)
+        std::fs::write(
+            &p,
+            format!("{{\"stored\":0,\"ttl\":{}}}\n{old_body}", META_TTL_CATALOG),
+        )
+        .unwrap();
+
+        let v = api
+            .get_json_retry(&fetch_url)
+            .expect("stale fallback should serve the old copy");
+        server.join().unwrap();
+
+        assert_eq!(v, fixture("meta_stale_body.json"), "stale copy served");
+        // the 404 body never entered the cache; the old entry is untouched
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("\"stored\":0"), "error body must not refresh the header");
+        assert!(raw.ends_with(&old_body), "error body must not overwrite the data");
+        // the serve is visible, exactly once
+        let notice = api.take_notice().expect("stale serve must set a notice");
+        assert!(notice.starts_with("showing cached catalog from "), "{notice}");
+        assert!(notice.ends_with("— offline?"), "{notice}");
+        assert!(api.take_notice().is_none(), "notice consumed once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_error_message_points_at_the_media_user_token() {
+        let dir = std::env::temp_dir().join(format!("amc-meta-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let with_token = Config {
+            cache_dir: dir.clone(),
+            media_user_token: Some("tok".into()),
+            ..Config::default()
+        };
+        let api = Api::new(with_token).unwrap();
+        let e = api.auth_error(anyhow::Error::msg("401"));
+        assert_eq!(e.to_string(), "media-user-token expired — update it in the config");
+
+        let no_token = Config {
+            cache_dir: dir.clone(),
+            media_user_token: None,
+            ..Config::default()
+        };
+        let api = Api::new(no_token).unwrap();
+        let e = api.auth_error(anyhow::Error::msg("401 from https://x"));
+        assert!(
+            e.to_string()
+                .starts_with("Apple Music authentication failed"),
+            "{e}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

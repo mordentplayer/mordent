@@ -228,6 +228,10 @@ fn cmd_library(cfg: &config::Config, rest: &[String]) -> Result<()> {
                 );
             }
         }
+    };
+    // a stale-cache hint set while serving the page above (offline mode)
+    if let Some(note) = api.take_notice() {
+        eprintln!("note: {note}");
     }
     Ok(())
 }
