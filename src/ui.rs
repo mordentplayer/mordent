@@ -33,8 +33,9 @@ use crate::queuemodel::{Advance, Queue, RemoveEffect, Repeat};
 
 enum Msg {
     Results(Box<SearchResults>),
-    /// One page of the user's library albums (appended), next offset.
-    Library(Vec<AlbumHit>, Option<u32>),
+    /// One page of the user's library albums, tagged with the sort it was
+    /// fetched under (mismatched pages are dropped, never mixed).
+    Library(Vec<AlbumHit>, Option<u32>, LibrarySort),
     /// Fully prepared decoder for the given playback generation.
     Source(u64, Box<PacketSource>),
     /// Tracks of an album, in order, tagged with the album they belong to.
@@ -586,10 +587,21 @@ impl App {
         });
     }
 
+    /// Restart the library fetch from page 0 (sort switch): drop all pages
+    /// held under the old server order. An in-flight page of the old sort is
+    /// discarded on arrival by the sort tag on `Msg::Library`.
+    fn restart_library(&mut self) {
+        self.library = None;
+        self.library_next = None;
+        self.library_loaded = None;
+        self.spawn_library(0);
+    }
+
     fn spawn_library(&mut self, offset: u32) {
         self.library_loading = true;
         let tx = self.tx.clone();
         let cfg = self.cfg.clone();
+        let sort = self.library_sort;
         std::thread::spawn(move || {
             let api = match Api::new(cfg) {
                 Ok(a) => a,
@@ -598,9 +610,18 @@ impl App {
                     return;
                 }
             };
-            match api.library_albums_page(100, offset) {
+            // Added: server-side newest-first so page 0 contains the recent
+            // additions (the default alphabetical order puts them outside
+            // page 0, which made the view look frozen at an old snapshot).
+            // Name: no server support (400); the client sorts the fetched
+            // pages case-insensitively.
+            let param = match sort {
+                LibrarySort::Added => Some("-dateAdded"),
+                LibrarySort::Name => None,
+            };
+            match api.library_albums_page(100, offset, param) {
                 Ok((albums, next)) => {
-                    let _ = tx.send(Msg::Library(albums, next));
+                    let _ = tx.send(Msg::Library(albums, next, sort));
                     if let Some(note) = api.take_notice() {
                         let _ = tx.send(Msg::Notice(note));
                     }
@@ -1542,7 +1563,11 @@ impl App {
                     self.results = Some(*r);
                     self.searching = false;
                 }
-                Msg::Library(albums, next) => {
+                Msg::Library(_, _, sort) if sort != self.library_sort => {
+                    // a page fetched under the previously selected sort:
+                    // drop it so pages from different server orders never mix
+                }
+                Msg::Library(albums, next, _) => {
                     self.library.get_or_insert_with(Vec::new).extend(albums);
                     self.library_next = next;
                     // stamp on the first page; "load more" keeps the
@@ -2280,7 +2305,7 @@ impl App {
     /// Library albums with a sort toggle (add date newest first, or name).
     fn library_central(&mut self, ui: &mut egui::Ui, act: &mut Option<CentralAction>) {
         let loading = self.library_loading;
-        // sort control (client-side; switching does not re-query)
+        // sort control; switching refetches page 0 under the new server sort
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -2288,14 +2313,18 @@ impl App {
             if ui
                 .selectable_label(self.library_sort == LibrarySort::Added, "add date")
                 .clicked()
+                && self.library_sort != LibrarySort::Added
             {
                 self.library_sort = LibrarySort::Added;
+                self.restart_library();
             }
             if ui
                 .selectable_label(self.library_sort == LibrarySort::Name, "name")
                 .clicked()
+                && self.library_sort != LibrarySort::Name
             {
                 self.library_sort = LibrarySort::Name;
+                self.restart_library();
             }
         });
         ui.add_space(2.0);

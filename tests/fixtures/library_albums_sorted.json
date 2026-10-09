@@ -1,0 +1,44 @@
+{
+ "next": null,
+ "meta": {
+  "total": 3
+ },
+ "data": [
+  {
+   "id": "i.FIXTURE00000011",
+   "type": "library-albums",
+   "href": "/v1/me/library/albums/i.FIXTURE00000011",
+   "attributes": {
+    "name": "Newest Arrival",
+    "artistName": "Fixture Artist",
+    "trackCount": 3,
+    "releaseDate": "2026-10-01",
+    "dateAdded": "2026-10-08T15:15:43Z"
+   }
+  },
+  {
+   "id": "i.FIXTURE00000012",
+   "type": "library-albums",
+   "href": "/v1/me/library/albums/i.FIXTURE00000012",
+   "attributes": {
+    "name": "Middle Arrival",
+    "artistName": "Fixture Artist",
+    "trackCount": 5,
+    "releaseDate": "2025-02-20",
+    "dateAdded": "2026-04-10T03:01:52Z"
+   }
+  },
+  {
+   "id": "i.FIXTURE00000013",
+   "type": "library-albums",
+   "href": "/v1/me/library/albums/i.FIXTURE00000013",
+   "attributes": {
+    "name": "Oldest Arrival",
+    "artistName": "Fixture Artist",
+    "trackCount": 9,
+    "releaseDate": "2013-09-13",
+    "dateAdded": "2013-11-15T18:51:17Z"
+   }
+  }
+ ]
+}

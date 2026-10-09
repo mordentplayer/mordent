@@ -371,6 +371,19 @@ fn is_catalog_album_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// URL for one page of the user's library albums, with an optional
+/// server-side `sort` value (e.g. `-dateAdded`).
+fn library_albums_url(limit: u32, offset: u32, sort: Option<&str>) -> String {
+    match sort {
+        Some(s) => format!(
+            "https://amp-api.music.apple.com/v1/me/library/albums?limit={limit}&offset={offset}&sort={s}&l=en-US"
+        ),
+        None => format!(
+            "https://amp-api.music.apple.com/v1/me/library/albums?limit={limit}&offset={offset}&l=en-US"
+        ),
+    }
+}
+
 fn parse_next_offset(next: &str) -> Option<u32> {
     let i = next.find("offset=")?;
     let rest = &next[i + 7..];
@@ -654,19 +667,22 @@ impl Api {
     /// User library albums (id may be a library id — playable ids resolved
     /// per item via playParams.catalogId).
     pub fn library_albums(&self, limit: u32, offset: u32) -> Result<Vec<AlbumHit>> {
-        self.library_albums_page(limit, offset).map(|(albums, _)| albums)
+        self.library_albums_page(limit, offset, None).map(|(albums, _)| albums)
     }
 
     /// One page of the user's library albums. Returns the albums plus the
     /// offset for the next page (None = end), mirroring `library_songs`.
+    /// `sort` is a server-side `sort` value; empirically (2026-10) Apple
+    /// accepts only `dateAdded` (with `-` for descending) on this endpoint —
+    /// name sorts are rejected with 400. None = server default, which is
+    /// alphabetical by title (new additions then fall outside page 0).
     pub fn library_albums_page(
         &self,
         limit: u32,
         offset: u32,
+        sort: Option<&str>,
     ) -> Result<(Vec<AlbumHit>, Option<u32>)> {
-        let url = format!(
-            "https://amp-api.music.apple.com/v1/me/library/albums?limit={limit}&offset={offset}&l=en-US"
-        );
+        let url = library_albums_url(limit, offset, sort);
         let raw: RawLibraryResp = from_value(self.get_json_retry(&url)?)?;
         let albums = raw.data.iter().map(|r| r.to_album()).collect();
         Ok((albums, raw.next.as_deref().and_then(parse_next_offset)))
@@ -1706,6 +1722,49 @@ mod tests {
         assert!(albums[1].artwork.is_none());
 
         assert_eq!(raw.next.as_deref().and_then(parse_next_offset), Some(2));
+    }
+
+    #[test]
+    fn library_albums_url_includes_sort_param() {
+        // default (no sort): unchanged historical URL, server returns its
+        // alphabetical-by-title order
+        assert_eq!(
+            library_albums_url(100, 0, None),
+            "https://amp-api.music.apple.com/v1/me/library/albums?limit=100&offset=0&l=en-US"
+        );
+        // Added → server-side newest-first
+        assert_eq!(
+            library_albums_url(100, 0, Some("-dateAdded")),
+            "https://amp-api.music.apple.com/v1/me/library/albums?limit=100&offset=0&sort=-dateAdded&l=en-US"
+        );
+        // later pages must carry the same sort so pages tile correctly
+        assert_eq!(
+            library_albums_url(100, 100, Some("-dateAdded")),
+            "https://amp-api.music.apple.com/v1/me/library/albums?limit=100&offset=100&sort=-dateAdded&l=en-US"
+        );
+    }
+
+    #[test]
+    fn library_albums_sorted_fixture_serves_newest_first() {
+        // synthetic response shaped like the live sort=-dateAdded page:
+        // the first rows are the most recently added albums
+        let raw: RawLibraryResp = decoded("library_albums_sorted.json");
+        let albums: Vec<AlbumHit> = raw.data.iter().map(|r| r.to_album()).collect();
+        assert_eq!(albums.len(), 3);
+        let dates: Vec<Option<&str>> = albums.iter().map(|a| a.date_added.as_deref()).collect();
+        assert_eq!(
+            dates,
+            vec![
+                Some("2026-10-08T15:15:43Z"),
+                Some("2026-04-10T03:01:52Z"),
+                Some("2013-11-15T18:51:17Z"),
+            ]
+        );
+        // newest first as served (the UI's dateAdded re-sort is a no-op here)
+        assert_eq!(albums[0].name, "Newest Arrival");
+        assert_eq!(albums[2].name, "Oldest Arrival");
+        // end of pagination
+        assert_eq!(raw.next.as_deref().and_then(parse_next_offset), None);
     }
 
     #[test]
