@@ -27,7 +27,9 @@ use crate::stream;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 
 use crate::queuemodel::{Advance, Queue, RemoveEffect, Repeat};
 
@@ -303,6 +305,53 @@ fn next_repaint_delay(
     delay
 }
 
+/// Value published to the wake thread meaning "fully idle — request nothing".
+const WAKE_PARKED: u64 = u64::MAX;
+
+/// Millis handed to the off-frame wake thread for one cycle: the desired
+/// delay, or the `WAKE_PARKED` sentinel when nothing is pending (pure;
+/// unit-tested).
+fn wake_publish_ms(delay: Option<std::time::Duration>) -> u64 {
+    delay.map_or(WAKE_PARKED, |d| {
+        d.as_millis().min((WAKE_PARKED - 1) as u128) as u64
+    })
+}
+
+/// How long the wake thread sleeps for a published value: the delay itself,
+/// or `None` when parked (idle cycles poll slowly and never repaint — no busy
+/// loop). A 1 ms floor keeps a zero published delay from spinning the thread
+/// hot (pure; unit-tested).
+fn wake_thread_sleep(ms: u64) -> Option<std::time::Duration> {
+    (ms != WAKE_PARKED).then(|| std::time::Duration::from_millis(ms.max(1)))
+}
+
+/// Permanent off-frame wake thread ("amc-wake"). `update`'s in-frame
+/// `request_repaint_after` is kept (correct and zero-cost when frames flow),
+/// but it can only speak from INSIDE a frame: on Wayland a redraw withheld
+/// for an unfocused window (niri-family compositors stop delivering them)
+/// would silence the frame loop, and with it the driver that could revive it
+/// — auto-advance then waits for focus. This thread re-issues the wake from
+/// off-frame every cycle via `Context::request_repaint`, which eframe wires
+/// through its `EventLoopProxy` (an event-loop user event, not a compositor
+/// frame callback), so playback keeps advancing while the window is
+/// unfocused. Lives until process exit, like the mpris/prefetch threads.
+fn spawn_wake_thread(ctx: egui::Context, wake_ms: Arc<AtomicU64>) {
+    std::thread::Builder::new()
+        .name("amc-wake".into())
+        .spawn(move || loop {
+            match wake_thread_sleep(wake_ms.load(Ordering::Relaxed)) {
+                None => std::thread::sleep(std::time::Duration::from_secs(1)),
+                Some(d) => {
+                    // Sleep exactly as long as the in-frame driver intended:
+                    // never more often than the driver requests.
+                    std::thread::sleep(d);
+                    ctx.request_repaint();
+                }
+            }
+        })
+        .expect("spawn amc-wake thread");
+}
+
 pub struct App {
     cfg: Config,
     player: Player,
@@ -416,10 +465,13 @@ pub struct App {
     prefetch: Prefetcher,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
+    /// Desired next-wake delay in millis, published by `update` every frame
+    /// and read by the "amc-wake" thread (`WAKE_PARKED` = fully idle).
+    wake_ms: Arc<AtomicU64>,
 }
 
 impl App {
-    fn new(cfg: Config) -> Self {
+    fn new(cfg: Config, egui_ctx: egui::Context) -> Self {
         let player = Player::new();
         let state = load_state();
         let (theme, theme_warns) = Theme::load();
@@ -437,6 +489,8 @@ impl App {
         };
         let (tx, rx) = channel();
         let prefetch = Prefetcher::new(&cfg);
+        // Parked sentinel until the first frame publishes a real delay.
+        let wake_ms = Arc::new(AtomicU64::new(WAKE_PARKED));
         let mut app = Self {
             cfg,
             player,
@@ -509,7 +563,9 @@ impl App {
             prefetch,
             rx,
             tx,
+            wake_ms: wake_ms.clone(),
         };
+        spawn_wake_thread(egui_ctx, wake_ms);
         match state.last_view.as_deref() {
             // older builds had Albums as a main tab; map it to the Search
             // sub-view. Unknown values fall back to Search (the default).
@@ -2186,9 +2242,18 @@ impl eframe::App for App {
             || self.state_dirty.is_some();
         let toast = self.error.as_ref().and_then(|e| e.next_repaint(now));
         let sleep = self.sleep_at.map(|(t0, d)| d.saturating_sub(t0.elapsed()));
-        if let Some(delay) = next_repaint_delay(playing, work_pending, toast, sleep) {
+        let next_delay = next_repaint_delay(playing, work_pending, toast, sleep);
+        if let Some(delay) = next_delay {
             ctx.request_repaint_after(delay);
         }
+        // Mirror the delay to the off-frame wake thread ("amc-wake"): the
+        // in-frame request above only fires while frames are flowing, so a
+        // compositor that stops redrawing an unfocused window (Wayland /
+        // niri-family frame-callback throttle) would silence it permanently.
+        // The thread re-issues the wake off-frame, keeping playback alive;
+        // when parked it sleeps ~1s and requests nothing.
+        self.wake_ms
+            .store(wake_publish_ms(next_delay), Ordering::Relaxed);
     }
 
     /// Transparent-viewport clear color: the theme background at the theme's
@@ -3526,7 +3591,7 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
         // Fonts are bundled (`src/fonts.rs`, `include_bytes!`) and installed
         // by the first `App::poll_theme`: nothing is read from the filesystem,
         // so the UI renders identically on a bare system.
-        Box::new(move |_cc| Ok(Box::new(App::new(cfg)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cfg, cc.egui_ctx.clone())))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }
@@ -3833,5 +3898,43 @@ mod repaint_tests {
             next_repaint_delay(true, true, Some(Duration::from_secs(5)), None),
             Some(Duration::from_millis(100))
         );
+    }
+}
+
+/// The wake-thread shared-value surface is deliberately thin: publication is
+/// `update` storing the already-unit-tested `next_repaint_delay` output, and
+/// the thread side is `sleep` + `request_repaint` (std + egui calls with no
+/// logic of their own). Only the pure encode/decode of the published value is
+/// testable — covered here.
+#[cfg(test)]
+mod wake_thread_tests {
+    use super::{wake_publish_ms, wake_thread_sleep, WAKE_PARKED};
+    use std::time::Duration;
+
+    #[test]
+    fn idle_publishes_parked_sentinel_and_thread_parks() {
+        assert_eq!(wake_publish_ms(None), WAKE_PARKED);
+        assert_eq!(wake_thread_sleep(WAKE_PARKED), None);
+    }
+
+    #[test]
+    fn delay_roundtrips_through_the_published_value() {
+        for ms in [100u64, 250, 40, 1000 * 60 * 30] {
+            let published = wake_publish_ms(Some(Duration::from_millis(ms)));
+            assert_eq!(wake_thread_sleep(published), Some(Duration::from_millis(ms)));
+        }
+    }
+
+    #[test]
+    fn zero_delay_never_spins_the_thread() {
+        assert_eq!(wake_thread_sleep(0), Some(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn oversized_delay_clamps_below_the_sentinel() {
+        let clamped = wake_publish_ms(Some(Duration::MAX));
+        assert_eq!(clamped, WAKE_PARKED - 1);
+        // and it still means "wake after a very long sleep", not "park"
+        assert_ne!(wake_thread_sleep(clamped), None);
     }
 }
