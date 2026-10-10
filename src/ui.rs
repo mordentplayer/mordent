@@ -549,6 +549,20 @@ impl App {
         // The selftest pins repeat-off for its deterministic assertions (the
         // queue-model stage relies on natural advance moving on).
         let selftest = std::env::var("AMC_SELFTEST").is_ok();
+        // The selftest stage machine asserts on REAL search results, so it is
+        // meaningless without a query. Fail loudly and immediately instead of
+        // sitting idle until the (minutes-later) per-stage timeout.
+        if selftest
+            && std::env::var("AMC_DEMO_TERM")
+                .map(|t| t.trim().is_empty())
+                .unwrap_or(true)
+        {
+            eprintln!(
+                "[selftest] no AMC_DEMO_TERM set — selftest needs a search query \
+                 (e.g. AMC_DEMO_TERM=\"daft punk\"); exiting"
+            );
+            std::process::exit(2);
+        }
         let (cmd, pb, sup_rx) = supervisor::spawn(
             cfg.clone(),
             queue.clone(),

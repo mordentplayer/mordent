@@ -183,11 +183,14 @@ are explicit, and the pointer turns into a hand over clickable rows.
 | `?` | shortcut cheatsheet overlay |
 | click progress bar | seek |
 
-`AMC_SELFTEST=1 amc ui` runs a deterministic headless state-machine test
+`AMC_SELFTEST=1 AMC_DEMO_TERM="daft punk" amc ui` runs a deterministic
+headless state-machine test
 (queue pointer model: non-consumption, `+` auto-start rules, ▲▼ + drag
 reorder and shuffle bookkeeping, prev/next, ✕ of the current row,
 auto-advance, stop-at-end and resume-on-append) and prints
-`RESULT: PASS/FAIL`.
+`RESULT: PASS/FAIL`. `AMC_DEMO_TERM` is required — it drives the search the
+state machine asserts on (without it the selftest exits immediately with a
+message, so it can never hang).
 `AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums|favorites|playlists`
 pre-seed the UI for headless screenshots (`albums` opens the Search tab's
 Albums sub-view); `AMC_DEMO_PLAYLIST=<n>` additionally
