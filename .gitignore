@@ -13,6 +13,16 @@ cider-v*.zip
 cider-v*.tar.gz
 cider-*.zip
 
+# macOS wrapper container (docs/macos-container/): the build context is
+# assembled per-release — the Dockerfile/entrypoint.sh/compose.yaml and the
+# docs are tracked, but the staged wrapper inputs, the user's Apple login
+# state and the shippable image tarball are NOT (see the release workflow).
+docs/macos-container/data/
+docs/macos-container/rootfs/
+docs/macos-container/wrapper-lite-rootless
+docs/macos-container/wrapper-lite-amd64.tar.gz
+*.tar.gz
+
 # Logs and scratch/tmp output
 *.log
 /tmp/

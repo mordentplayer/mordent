@@ -64,6 +64,15 @@ cargo build --release
    cache_size_gb = 10                     # audio-cache budget; 0 disables
    ```
 
+### Running the wrapper on macOS (or a home server)
+
+The wrapper backend is Linux/x86-64, so on a Mac it runs in a Docker
+container: [`docs/macos-container/README-friend.md`](docs/macos-container/README-friend.md)
+is a step-by-step (non-technical) guide, with the `Dockerfile`/`compose.yaml`
+and the container forensics in the same directory. Prefer an always-on Linux
+box? Run the wrapper natively there and just point `wrapper_url` at it — see
+[`docs/macos-container/README-home-server.md`](docs/macos-container/README-home-server.md).
+
 ## Usage
 
 ```sh

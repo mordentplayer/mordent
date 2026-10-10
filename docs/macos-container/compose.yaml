@@ -1,0 +1,59 @@
+# wrapper-lite container — FINAL working configuration.
+#
+# Verified live on x86-64 Ubuntu 24.04 (Docker 29.1.x) with the DISTRO DEFAULT
+# sysctl (kernel.apparmor_restrict_unprivileged_userns=1). Copy `data/` in from
+# a machine that is already logged in, or do the one-time login via
+# USERNAME/PASSWORD (see README-friend.md).
+#
+#   docker compose up -d
+#   curl 127.0.0.1:12340/status      # -> {"code":0,...,"regions":["ca"]}
+#
+# The image is linux/amd64 ONLY, because the FairPlay payload inside the rootfs
+# (rootfs/system/bin/lite + the bionic libs) is Android *x86-64*. There is no
+# arm64 build of the payload. On Apple Silicon this image runs under Docker
+# Desktop/OrbStack amd64 emulation (enable "Use Rosetta for x86/amd64
+# emulation" in Docker Desktop for near-native speed) — see FINDINGS.md.
+services:
+  wrapper:
+    image: wrapper-lite:amd64
+    container_name: wrapper-lite
+    # The image is shipped as a `docker load` tarball, not pulled from a
+    # registry. If compose ever reports "pull access denied", this line (or
+    # running `docker load` first) is the fix.
+    pull_policy: never
+    # Uncomment on Apple Silicon to pin the (only) available arch explicitly:
+    # platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:12340:12340"
+    volumes:
+      # Apple session / FairPlay tokens. Created empty in the image on purpose
+      # (never baked in). Keep this directory private.
+      - ./data:/app/rootfs/data
+    environment:
+      # Only used for the very first login (when data/mpl_db/kvs.sqlitedb is
+      # absent). Put them in a .env file next to this file, not in here.
+      USERNAME: ${USERNAME:-}
+      PASSWORD: ${PASSWORD:-}
+    # --- Why these opts (see FINDINGS.md "mount/security forensics") ---
+    # The launcher creates its own user namespace, bind-mounts /dev/urandom and
+    # mounts a fresh procfs, then chroot()s into the Android rootfs. Docker's
+    # defaults block each of those steps. These three toggles are the minimum
+    # that worked; this is NOT --privileged (no host devices, no host mounts).
+    #
+    #   seccomp:unconfined     -> allows unshare(CLONE_NEWUSER)   (default seccomp denies it)
+    #   apparmor:unconfined    -> allows the bind mounts          (docker-default profile denies mount)
+    #   systempaths=unconfined -> allows mounting a fresh procfs   (else EPERM: "too revealing")
+    #
+    # cap_add SYS_ADMIN is what makes the container's unshare() a *privileged*
+    # one, so Ubuntu 24.04+'s `apparmor_restrict_unprivileged_userns` hardening
+    # does not block writing uid_map. VERIFIED required on Ubuntu 24.04 with the
+    # stock sysctl=1. EXPECTED unnecessary on macOS (Docker Desktop/OrbStack run
+    # their own LinuxKit VM where that AppArmor policy does not exist), but it is
+    # harmless there — see FINDINGS.md, and the Apple-Silicon note in the README.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+      - systempaths=unconfined

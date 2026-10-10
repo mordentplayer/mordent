@@ -82,9 +82,13 @@ jobs:
         working-directory: wrapper-src
         run: |
           set -euo pipefail
+          # BUILD_HOST_LAUNCHERS is ON by default: builds wrapper-lite +
+          # wrapper-lite-rootless (host launchers) alongside the Android-layer
+          # `lite` binary.
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
           test -x wrapper-lite
+          test -x wrapper-lite-rootless
           test -x rootfs/system/bin/lite
 
       - name: Assemble wrapper payload
@@ -92,6 +96,10 @@ jobs:
           set -euo pipefail
           mkdir -p wrapper-out
           cp wrapper-src/wrapper-lite wrapper-out/wrapper-lite
+          # The rootless launcher is what the container image runs (it does its
+          # own user namespace + chroot); shipped in the payload so
+          # build-container can stage it into the image build context.
+          cp wrapper-src/wrapper-lite-rootless wrapper-out/wrapper-lite-rootless
           cp wrapper-src/WRAPPER_COMMIT wrapper-out/WRAPPER_COMMIT
           cp wrapper-src/LICENSE wrapper-out/LICENSE-wrapper.txt
           cp wrapper-src/README.md wrapper-out/README-wrapper.md
@@ -106,6 +114,7 @@ jobs:
           test ! -e wrapper-out/rootfs/data/DEV_TOKEN
           test -x wrapper-out/rootfs/system/bin/lite
           chmod 0755 wrapper-out/wrapper-lite
+          chmod 0755 wrapper-out/wrapper-lite-rootless
           find wrapper-out -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
 
       - name: Upload wrapper payload
@@ -115,7 +124,64 @@ jobs:
           path: wrapper-out
           if-no-files-found: error
 
-  # ---- 3. the app: macOS (macos-14 is arm64; build the Intel slice too) --
+  # ---- 3. the friend's Mac backend: wrapper-lite in a container -----------
+  # The FairPlay payload is Android x86-64, so the image is linux/amd64 only
+  # (see docs/macos-container/FINDINGS.md §1). Runner is amd64, so this is a
+  # native build. The image is shipped as a `docker save` tarball; the name
+  # below is exactly what docs/macos-container/README-friend.md tells friends
+  # to `docker load`.
+  build-container:
+    name: wrapper-lite container (linux amd64)
+    needs: [build-wrapper]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download wrapper payload
+        uses: actions/download-artifact@v4
+        with:
+          name: wrapper-payload
+          path: in/wrapper
+
+      # The Dockerfile COPYs wrapper-lite-rootless + rootfs from its build
+      # context (docs/macos-container/), so stage them there before building.
+      - name: Stage container build context
+        working-directory: docs/macos-container
+        run: |
+          set -euo pipefail
+          install -m 0755 ../../in/wrapper/wrapper-lite-rootless wrapper-lite-rootless
+          cp -a ../../in/wrapper/rootfs rootfs
+          test -x wrapper-lite-rootless
+          test -x rootfs/system/bin/lite
+          # Login state must never reach the image (the Dockerfile also
+          # `rm -rf /app/rootfs/data`; .dockerignore excludes it from the
+          # context). Fail loudly if the payload ever gained any.
+          test -z "$(find rootfs/data -mindepth 1 -print -quit 2>/dev/null || true)"
+          find . -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
+
+      - name: Build image
+        working-directory: docs/macos-container
+        run: docker build -t wrapper-lite:amd64 .
+
+      - name: Export image tarball
+        working-directory: docs/macos-container
+        run: |
+          set -euo pipefail
+          docker image inspect wrapper-lite:amd64 \
+            --format 'image: os={{.Os}} arch={{.Architecture}} size={{.Size}}'
+          test "$(docker image inspect wrapper-lite:amd64 --format '{{.Architecture}}')" = "amd64"
+          docker save wrapper-lite:amd64 | gzip -1 > wrapper-lite-amd64.tar.gz
+          test -s wrapper-lite-amd64.tar.gz
+          ls -l wrapper-lite-amd64.tar.gz
+
+      - name: Upload container image
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: docs/macos-container/wrapper-lite-amd64.tar.gz
+          if-no-files-found: error
+
+  # ---- 4. the app: macOS (macos-14 is arm64; build the Intel slice too) --
   build-macos:
     name: amc (macos ${{ matrix.arch }})
     # macos-14 is arm64 but now marked deprecated by actions/runner-images;
@@ -164,7 +230,7 @@ jobs:
           path: ${{ env.PKG }}.tar.gz
           if-no-files-found: error
 
-  # ---- 4. the app: Windows ----------------------------------------------
+  # ---- 5. the app: Windows ----------------------------------------------
   build-windows:
     name: amc (windows x86_64)
     runs-on: windows-2022
@@ -201,10 +267,12 @@ jobs:
           path: ${{ env.PKG }}.zip
           if-no-files-found: error
 
-  # ---- 5. linux bundle (app + wrapper) and the one release creator -------
+  # ---- 6. bundle + the one release creator -------------------------------
+  # Single `action-gh-release` step for the whole workflow: two jobs creating
+  # the same tag's release concurrently would race on assets.
   bundle:
     name: bundle + release
-    needs: [build-amc, build-wrapper, build-macos, build-windows]
+    needs: [build-amc, build-wrapper, build-container, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -220,6 +288,15 @@ jobs:
         with:
           name: wrapper-payload
           path: in/wrapper
+
+      # The container image (linux/amd64 `docker save` tarball) and the compose
+      # file are published as loose release assets — a friend loads the tarball
+      # and starts it from the compose file (see README-friend.md).
+      - name: Download container image
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: in/container
 
       # The macOS/Windows bundles are published as-is; only linux bundles the
       # wrapper (the FairPlay backend is linux-only).
@@ -295,6 +372,8 @@ jobs:
         with:
           files: |
             ${{ env.PKG }}.tar.gz
+            in/container/wrapper-lite-amd64.tar.gz
+            docs/macos-container/compose.yaml
             in/release/*.tar.gz
             in/release/*.zip
           generate_release_notes: true

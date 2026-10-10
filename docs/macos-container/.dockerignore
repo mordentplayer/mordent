@@ -1,0 +1,9 @@
+# Never bake Apple session/login data into an image.
+rootfs/data
+rootfs/proc
+rootfs/dev
+data
+# The image tarball this context produces (never send it to the daemon).
+*.tar.gz
+# Docs are not baked into the image.
+*.md
