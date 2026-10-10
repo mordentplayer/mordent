@@ -1,0 +1,33 @@
+# Disposable sandbox for the Mordent issue-triage agent.
+#
+# Image contents: a Rust toolchain (to attempt reproductions), Python (to talk
+# to the credential-injecting gateway via the CLI), and the OpenCode CLI
+# ("omp"), downloaded from its public release at build time.
+#
+# This image deliberately contains NO credentials and NO access to the host.
+# The only credential proxy in the picture lives outside the container.
+FROM rust:1.85-slim-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git python3 pkg-config \
+      libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
+      libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# The agent CLI, from its public release channel (no auth required to fetch).
+ARG OMP_VERSION=latest
+RUN curl -fsSL -o /usr/local/bin/omp \
+      "https://github.com/can1357/oh-my-pi/releases/${OMP_VERSION}/download/omp-linux-x64" \
+ && chmod +x /usr/local/bin/omp \
+ && omp --version
+
+# Non-root user: the sandbox does not need root, and dropping it shrinks the
+# blast radius of anything the model is persuaded to run.
+RUN useradd --create-home --uid 1000 sandbox
+USER sandbox
+ENV OMP_SKIP_SETUP=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    CARGO_TERM_COLOR=never
+
+WORKDIR /work
