@@ -28,7 +28,7 @@ impl Default for Config {
             storefront: "us".into(),
             wrapper_url: "http://127.0.0.1:12340".into(),
             media_user_token: None,
-            cache_dir: home().join(".cache/mordent"),
+            cache_dir: default_cache_dir(),
             report_plays: true,
             cache_size_gb: 10,
         }
@@ -39,8 +39,157 @@ pub fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
+/// The `mordent` config directory (`~/.config/mordent`).
+pub fn config_dir() -> PathBuf {
+    home().join(".config/mordent")
+}
+
+/// The default `mordent` cache directory (`~/.cache/mordent`).
+pub fn default_cache_dir() -> PathBuf {
+    home().join(".cache/mordent")
+}
+
+/// Pre-rename config directory (`~/.config/amc`); see [`migrate_legacy_dirs`].
+fn legacy_config_dir() -> PathBuf {
+    home().join(".config/amc")
+}
+
+/// Pre-rename cache directory (`~/.cache/amc`); see [`migrate_legacy_dirs`].
+fn legacy_cache_dir() -> PathBuf {
+    home().join(".cache/amc")
+}
+
+/// What to do about one legacy→new directory pair (pure; unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Migration {
+    /// The legacy dir is absent — nothing to migrate.
+    Absent,
+    /// The new dir already exists — leave the legacy dir alone.
+    AlreadyNew,
+    /// Legacy exists and the new path is free — move it.
+    Move,
+}
+
+/// Decide the migration for a legacy→new directory pair. Only a legacy dir
+/// whose new counterpart does not exist is moved; a live new dir is never
+/// clobbered.
+pub fn plan_migration(legacy: &Path, new: &Path) -> Migration {
+    if !legacy.exists() {
+        Migration::Absent
+    } else if new.exists() {
+        Migration::AlreadyNew
+    } else {
+        Migration::Move
+    }
+}
+
+/// Recursive copy fallback for [`move_dir`] when `rename` fails (e.g. across
+/// filesystems). Files are copied; directories are recreated.
+fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("copying {}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Move `from` to `to`, falling back to copy + remove when `rename` fails.
+fn move_dir(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_dir_all(from, to)?;
+            std::fs::remove_dir_all(from)
+                .with_context(|| format!("removing {}", from.display()))?;
+            Ok(())
+        }
+    }
+}
+
+/// Migrate one legacy dir, logging exactly one line when it acts. Best-effort:
+/// a failure is logged and swallowed (callers must not be blocked).
+fn migrate_dir(label: &str, legacy: &Path, new: &Path) {
+    if plan_migration(legacy, new) != Migration::Move {
+        return;
+    }
+    match move_dir(legacy, new) {
+        Ok(()) => eprintln!(
+            "[migrate] {label}: moved {} -> {}",
+            legacy.display(),
+            new.display()
+        ),
+        Err(e) => eprintln!(
+            "[migrate] {label}: could not move {} -> {} ({e:#})",
+            legacy.display(),
+            new.display()
+        ),
+    }
+}
+
+/// Pure core of [`rewrite_legacy_cache_dir`]: swap `old` → `new` in `text`,
+/// returning the new body, or `None` when there is nothing to change.
+fn swap_cache_dir(text: &str, old: &str, new: &str) -> Option<String> {
+    if !text.contains(old) {
+        return None;
+    }
+    let updated = text.replace(old, new);
+    (updated != text).then_some(updated)
+}
+
+/// Rewrite a `cache_dir` value still pointing at the pre-rename cache path so
+/// a migrated config keeps using the moved cache. Leaves the rest of the file
+/// byte-for-byte intact (plain substring swap, no TOML round-trip).
+fn rewrite_legacy_cache_dir() {
+    let path = config_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let old = legacy_cache_dir();
+    let old = old.to_string_lossy();
+    let new = default_cache_dir();
+    let Some(updated) = swap_cache_dir(&text, old.as_ref(), new.to_string_lossy().as_ref())
+    else {
+        return;
+    };
+    let tmp = tmp_path(&path);
+    if std::fs::write(&tmp, updated).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        eprintln!(
+            "[migrate] config: cache_dir {} -> {}",
+            old,
+            new.display()
+        );
+    }
+}
+
+/// Move the pre-rename `amc` directories to their `mordent` names. Idempotent
+/// and safe to call from every entry point before the first config read:
+///
+/// * `~/.config/amc` → `~/.config/mordent` (then a stale `cache_dir` pointing
+///   at the legacy cache path is rewritten in place);
+/// * `~/.cache/amc` → `~/.cache/mordent` (best-effort — never blocks startup).
+///
+/// A legacy dir is only moved when the new path is free; an existing new dir is
+/// never clobbered.
+pub fn migrate_legacy_dirs() {
+    migrate_dir("config", &legacy_config_dir(), &config_dir());
+    rewrite_legacy_cache_dir();
+    migrate_dir("cache", &legacy_cache_dir(), &default_cache_dir());
+}
+
 fn config_path() -> PathBuf {
-    home().join(".config/mordent/config.toml")
+    config_dir().join("config.toml")
 }
 
 /// Path of the user config file (`~/.config/mordent/config.toml`).
@@ -320,5 +469,95 @@ mod wizard_write_tests {
             assert_eq!(mode, 0o600, "config should be private");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "mordent-migration-test-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn plan_migration_only_moves_an_unshadowed_legacy_dir() {
+        let root = tmpdir("plan");
+        let legacy = root.join(".config/amc");
+        let new = root.join(".config/mordent");
+
+        assert_eq!(plan_migration(&legacy, &new), Migration::Absent);
+
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(plan_migration(&legacy, &new), Migration::Move);
+
+        std::fs::create_dir_all(&new).unwrap();
+        assert_eq!(plan_migration(&legacy, &new), Migration::AlreadyNew);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_dir_moves_legacy_contents_and_is_idempotent() {
+        let root = tmpdir("move");
+        let legacy = root.join("old");
+        let new = root.join("new");
+        std::fs::create_dir_all(legacy.join("meta")).unwrap();
+        std::fs::write(legacy.join("meta/a.cache"), b"x").unwrap();
+        std::fs::write(legacy.join("config.toml"), b"storefront = \"us\"\n").unwrap();
+
+        migrate_dir("config", &legacy, &new);
+        assert!(!legacy.exists(), "legacy dir should be gone");
+        assert_eq!(std::fs::read(new.join("meta/a.cache")).unwrap(), b"x");
+        assert!(new.join("config.toml").is_file());
+
+        // A second run has nothing left to move.
+        migrate_dir("config", &legacy, &new);
+        assert!(new.join("config.toml").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_dir_keeps_both_when_new_exists() {
+        let root = tmpdir("both");
+        let legacy = root.join("old");
+        let new = root.join("new");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old-marker"), b"old").unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("new-marker"), b"new").unwrap();
+
+        migrate_dir("cache", &legacy, &new);
+        assert!(legacy.join("old-marker").is_file(), "legacy untouched");
+        assert!(new.join("new-marker").is_file(), "new untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn swap_cache_dir_rewrites_only_the_legacy_path() {
+        let text = "storefront = \"us\"\ncache_dir = \"/home/a/.cache/amc\"\n";
+        let got = swap_cache_dir(text, "/home/a/.cache/amc", "/home/a/.cache/mordent").unwrap();
+        assert!(
+            got.contains("cache_dir = \"/home/a/.cache/mordent\""),
+            "{got}"
+        );
+        assert!(!got.contains(".cache/amc\""), "{got}");
+        // Already-new configs are left alone.
+        assert_eq!(
+            swap_cache_dir(&got, "/home/a/.cache/amc", "/home/a/.cache/mordent"),
+            None
+        );
     }
 }

@@ -56,6 +56,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Move any pre-rename `~/.config/amc` / `~/.cache/amc` into the `mordent`
+    // names BEFORE the first config read — every entry point goes through here
+    // (CLI subcommands, `ui`, and the `setup` wizard).
+    config::migrate_legacy_dirs();
     // Detect FIRST-RUN before Config::load() auto-writes a default file: with
     // no config.toml, `mordent ui` opens the setup wizard instead of the app.
     let first_run = !config::config_exists();
@@ -71,6 +75,10 @@ fn run() -> Result<()> {
     let rest: Vec<String> = args.collect();
 
     match cmd.as_str() {
+        "-h" | "--help" => {
+            usage();
+            return Ok(());
+        }
         "token" => {
             let api = api::Api::new(cfg)?;
             println!("{}", api.bearer()?);
