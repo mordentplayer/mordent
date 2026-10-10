@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # install-wrapper.sh — install the bundled wrapper-lite into PREFIX and
-# register it as the `amc-wrapper` systemd service.
+# register it as the `mordent-wrapper` systemd service.
 #
-# Driven by the amc setup wizard, which runs this through pkexec (i.e. as root).
+# Driven by the mordent setup wizard, which runs this through pkexec (i.e. as root).
 # Safe to run repeatedly: re-running stops the service, replaces the launcher
 # and the rootfs skeleton, and starts it again. Linux login state under
 # PREFIX/rootfs/data/ is preserved (the bundle ships no token files).
@@ -13,22 +13,22 @@
 #                                   [--prefix DIR] [--no-start]
 #
 # --src defaults to the directory this script lives in, i.e. the extracted
-# bundle root (…/amc-<tag>-linux-x86_64). On success the service is up,
+# bundle root (…/mordent-<tag>-linux-x86_64). On success the service is up,
 # /status has answered, and the base URL is printed on stdout; all
 # human-readable logging goes to stderr.
 #
 set -euo pipefail
 
-SERVICE_NAME="amc-wrapper"
+SERVICE_NAME="mordent-wrapper"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PORT=12340
-PREFIX="/opt/amc-wrapper"
+PREFIX="/opt/mordent-wrapper"
 SRC=""
 START=1
 
-log() { printf '[amc-install] %s\n' "$*" >&2; }
+log() { printf '[mordent-install] %s\n' "$*" >&2; }
 fail() {
-  printf '[amc-install] ERROR: %s\n' "$*" >&2
+  printf '[mordent-install] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -36,14 +36,14 @@ usage() {
   cat <<'EOF'
 Usage: install-wrapper.sh [options]
 
-Installs the bundled wrapper-lite into PREFIX and manages the amc-wrapper
+Installs the bundled wrapper-lite into PREFIX and manages the mordent-wrapper
 systemd service. Must run as root.
 
 Options:
   --src DIR     Extracted bundle directory (default: the parent of this
                 script's directory, i.e. <bundle>/scripts/..)
   --port PORT   Port wrapper-lite listens on (default: 12340)
-  --prefix DIR  Install prefix (default: /opt/amc-wrapper)
+  --prefix DIR  Install prefix (default: /opt/mordent-wrapper)
   --no-start    Install and enable the service, but do not start it
   -h, --help    Show this help
 EOF
@@ -145,7 +145,7 @@ systemctl restart "$SERVICE_NAME"
 if ! wait_for_status; then
   log "wrapper-lite did not answer /status within 30s; last log lines:"
   journalctl -u "$SERVICE_NAME" -n 20 --no-pager >&2 || true
-  fail "amc-wrapper failed to start"
+  fail "mordent-wrapper failed to start"
 fi
 
 log "service is up: $(curl -s --max-time 2 "http://127.0.0.1:${PORT}/status" 2>/dev/null | head -c 200 || true)"

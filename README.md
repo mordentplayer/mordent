@@ -1,8 +1,6 @@
-# amc — Apple Music, native and fast
+# Mordent — Apple Music, native and fast
 
-<!-- CI badge (placeholder slug; uncomment + replace once the public owner/repo name is final):
-[![CI](https://github.com/nightly-amc/amc/actions/workflows/ci.yml/badge.svg)](https://github.com/nightly-amc/amc/actions/workflows/ci.yml)
--->
+[![CI](https://github.com/sliced-paraiba/mordent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sliced-paraiba/mordent/actions/workflows/ci.yml)
 
 A lightweight native Apple Music client for Linux (Rust + egui). Goals:
 instant startup, minimal resource use, and the shortest possible path from
@@ -19,7 +17,7 @@ requires an active Apple Music subscription logged into the wrapper.
 ## Architecture
 
 ```
-┌─────────────────────────────── amc (single Rust binary) ──────────────────────┐
+┌─────────────────────────────── mordent (single Rust binary) ──────────────────────┐
 │  egui UI ── queue / player bar / search                                      │
 │     │                                                                        │
 │  amp-api client          wrapper-lite client        streaming pipeline        │
@@ -55,7 +53,7 @@ cargo build --release
    (Google's CDN is blocked on some networks — the gvt1 mirror works:
    `https://redirector.gvt1.com/edgedl/android/repository/android-ndk-r23b-linux.zip`).
 
-2. **config** `~/.config/amc/config.toml` (created on first run):
+2. **config** `~/.config/mordent/config.toml` (created on first run):
    ```toml
    storefront = "us"                      # your country code
    wrapper_url = "http://127.0.0.1:12340"
@@ -75,13 +73,13 @@ box? Run the wrapper natively there and just point `wrapper_url` at it — see
 
 ## First-run setup
 
-`amc` ships a guided setup wizard, so going from zero to playing music needs
-no docs. The first `amc ui` on a machine with **no** `~/.config/amc/config.toml`
+`Mordent` ships a guided setup wizard, so going from zero to playing music needs
+no docs. The first `mordent ui` on a machine with **no** `~/.config/mordent/config.toml`
 opens the wizard instead of the app; after that it starts normally. Re-run it
 any time with:
 
 ```sh
-amc setup
+mordent setup
 ```
 
 The wizard walks through:
@@ -100,7 +98,7 @@ The wizard walks through:
 5. **Preferences** — storefront, optional `media_user_token`, play reporting
    and the audio-cache budget.
 6. **Audio check** — confirms an output device opens.
-7. **Finish** — writes `~/.config/amc/config.toml` (atomically; keys the wizard
+7. **Finish** — writes `~/.config/mordent/config.toml` (atomically; keys the wizard
    does not collect are preserved) and drops you into the player.
 
 On a Mac, the helper runs in Docker: the wizard's *Connect to a music helper*
@@ -113,19 +111,34 @@ Installing the helper locally streams the installer's output into the wizard:
 
 ![local helper install](docs/setup/wizard-local-install.png)
 
+## Upgrading from `amc`
+
+Mordent is the same program under a new name — nothing needs re-authenticating.
+
+* **Config + cache** — the first run moves the old directories automatically:
+  `~/.config/amc` → `~/.config/mordent` (config.toml, state.toml, theme.toml) and
+  `~/.cache/amc` → `~/.cache/mordent` (meta/, audio/, tracks/). A `cache_dir` in
+  config.toml still pointing at the old path is rewritten to match. Each move
+  logs one line; if the new path already exists, the old directory is left
+  untouched.
+* **Helper install** — an existing helper installed under `/opt/amc-wrapper`
+  keeps working unchanged: Mordent talks to it over HTTP, so there is nothing to
+  reinstall or re-login. Fresh installs from this tree default to
+  `/opt/mordent-wrapper` (service `mordent-wrapper`).
+
 ## Usage
 
 ```sh
-amc ui                    # the app (tabs, queue, seek — see UI section below)
-amc setup                 # guided first-run setup (install helper, log in, prefs)
-amc search "daft punk"    # catalog search
-amc play "get lucky"      # CLI playback with time-to-music stats
-amc lyrics <songId> [--syllable]   # line- or word-timed lyrics
-amc decrypt <songId> [out]  # stream + decrypt to file
-amc decode <file>         # verify a decrypted file decodes
+mordent ui                    # the app (tabs, queue, seek — see UI section below)
+mordent setup                 # guided first-run setup (install helper, log in, prefs)
+mordent search "daft punk"    # catalog search
+mordent play "get lucky"      # CLI playback with time-to-music stats
+mordent lyrics <songId> [--syllable]   # line- or word-timed lyrics
+mordent decrypt <songId> [out]  # stream + decrypt to file
+mordent decode <file>         # verify a decrypted file decodes
 ```
 
-## UI (`amc ui`)
+## UI (`mordent ui`)
 
 Four tabs — **Search**, **Library**, **Favorites**, **Playlists**.
 Clicking a track plays it immediately (replacing the current track and
@@ -183,25 +196,25 @@ are explicit, and the pointer turns into a hand over clickable rows.
 | `?` | shortcut cheatsheet overlay |
 | click progress bar | seek |
 
-`AMC_SELFTEST=1 AMC_DEMO_TERM="daft punk" amc ui` runs a deterministic
+`MORDENT_SELFTEST=1 MORDENT_DEMO_TERM="daft punk" mordent ui` runs a deterministic
 headless state-machine test
 (queue pointer model: non-consumption, `+` auto-start rules, ▲▼ + drag
 reorder and shuffle bookkeeping, prev/next, ✕ of the current row,
 auto-advance, stop-at-end and resume-on-append) and prints
-`RESULT: PASS/FAIL`. `AMC_DEMO_TERM` is required — it drives the search the
+`RESULT: PASS/FAIL`. `MORDENT_DEMO_TERM` is required — it drives the search the
 state machine asserts on (without it the selftest exits immediately with a
 message, so it can never hang).
-`AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums|favorites|playlists`
+`MORDENT_DEMO_TERM=<query>` / `MORDENT_DEMO_VIEW=library|albums|favorites|playlists`
 pre-seed the UI for headless screenshots (`albums` opens the Search tab's
-Albums sub-view); `AMC_DEMO_PLAYLIST=<n>` additionally
+Albums sub-view); `MORDENT_DEMO_PLAYLIST=<n>` additionally
 opens the n-th library playlist (0-based) once the list loads, and
-`AMC_DEMO_LYRICS=1` opens the lyrics panel.
-`AMC_DEMO_CLOSE=1` simulates a WM close request
+`MORDENT_DEMO_LYRICS=1` opens the lyrics panel.
+`MORDENT_DEMO_CLOSE=1` simulates a WM close request
 (`ViewportCommand::Close` → the same path as `✕`/niri's `Win+Q`) so the close
 policy is testable headlessly: alone it fires after a short delay (idle
-session → the process exits); combined with `AMC_DEMO_PLAY` it waits until a
+session → the process exits); combined with `MORDENT_DEMO_PLAY` it waits until a
 track is current (played session → the window hides on X11, or the process
-exits on Wayland). `AMC_DEMO_TRAY_TOGGLE=<secs>` invokes the tray's Show/Hide
+exits on Wayland). `MORDENT_DEMO_TRAY_TOGGLE=<secs>` invokes the tray's Show/Hide
 menu action after N seconds through the real `Handle::update` path (the
 pointer cannot click a tray icon headlessly).
 
@@ -228,7 +241,7 @@ it and seeking moves it.
 
 ## Theming
 
-Optional `~/.config/amc/theme.toml`; a missing file (or missing keys) falls
+Optional `~/.config/mordent/theme.toml`; a missing file (or missing keys) falls
 back to the built-in dark defaults. It is read at startup and hot-reloaded
 (polled about once a second), so editing it recolors the running window — no
 restart. Bad values are ignored with a one-off warning (toast + stderr) and the
@@ -260,24 +273,24 @@ X server it simply renders solid — neither case errors.
 =======
 ## Media keys / MPRIS
 
-`amc ui` registers `org.mpris.MediaPlayer2.amc` on the session bus: it shows
+`mordent ui` registers `org.mpris.MediaPlayer2.mordent` on the session bus: it shows
 up in the GNOME/KDE media bar and lock screen with cover, title/artist and
 working controls (play/pause, next/prev, seek, stop, shuffle, repeat,
 volume). No session bus → MPRIS silently stays off; the app is unchanged.
 
 ```sh
-playerctl --player=amc status
-playerctl --player=amc metadata
-playerctl --player=amc play-pause        # media keys: playerctl -a play-pause
-playerctl --player=amc next              # also: previous, stop, position 1:23
-playerctl --player=amc volume 0.5
-playerctl --player=amc loop Track        # None / Track / Playlist
-playerctl --player=amc shuffle On
+playerctl --player=mordent status
+playerctl --player=mordent metadata
+playerctl --player=mordent play-pause        # media keys: playerctl -a play-pause
+playerctl --player=mordent next              # also: previous, stop, position 1:23
+playerctl --player=mordent volume 0.5
+playerctl --player=mordent loop Track        # None / Track / Playlist
+playerctl --player=mordent shuffle On
 ```
 
 ## Tray
 
-`amc ui` (Linux) registers a StatusNotifierItem tray icon (`ksni`, pure Rust —
+`mordent ui` (Linux) registers a StatusNotifierItem tray icon (`ksni`, pure Rust —
 no GTK mainloop): an accent eighth-note painted in-binary, a now-playing
 tooltip, and a menu with **Show/Hide, Play/Pause (reflects state), Next,
 Previous, Quit**. Left-click (Activate) toggles window visibility. The icon is
@@ -287,7 +300,7 @@ appear until the first track.
 
 **Window close (✕ / the WM's close, e.g. niri's `Win+Q`):**
 
-* **nothing has played yet → amc quits** — the same clean flush path as
+* **nothing has played yet → Mordent quits** — the same clean flush path as
   Ctrl+Q (the open play-report segment is closed, then the process exits);
 * **a track has played → close to the tray** — the close is cancelled and the
   window is hidden; music keeps playing from the supervisor thread (this
@@ -309,7 +322,7 @@ Hiding the window is a winit capability and it differs per backend
 On **X11** Show/Hide works fully: the tray's Hide/Show item, left-click
 (Activate), close-to-tray and MPRIS Raise all map/unmap the window. On
 **Wayland** a client cannot unmap its toplevel at all — winit no-ops it, and
-niri implements no `xdg_toplevel.set_minimized` fallback either — so amc does
+niri implements no `xdg_toplevel.set_minimized` fallback either — so Mordent does
 not pretend:
 
 * the tray's Hide/Show item is **disabled and labelled "Hide unavailable on
@@ -323,7 +336,7 @@ Host support: waybar/Hyprland/niri/umbriel, KDE Plasma — SNI natively; GNOME
 needs an AppIndicator extension. No StatusNotifier host (bare X11, VPS)? The
 tray degrades silently — logged once, no icon — and the close policy above
 still applies; restore a hidden window with MPRIS Raise (`playerctl
---player=amc open`/`play` on some setups), `wmctrl -a amc`, or a relaunch.
+--player=mordent open`/`play` on some setups), `wmctrl -a mordent`, or a relaunch.
 macOS/Windows builds compile a no-tray stub with the same close policy.
 
 ## Playback is UI-independent
@@ -335,16 +348,16 @@ command drain. The UI is a renderer + command sender over a small command
 channel; both sides share the queue (behind a mutex) and one published
 playback snapshot. Hiding the window, an unfocused/compositor-throttled
 window, or a frozen frame loop can therefore never stop or stall playback.
-Debug hook: `AMC_NO_REPAINT=1 amc ui` suppresses **every** repaint request
+Debug hook: `MORDENT_NO_REPAINT=1 mordent ui` suppresses **every** repaint request
 (in-frame driver, wake thread, supervisor wakes) — the UI stops being
 scheduled entirely while playback, natural advance and MPRIS keep working
 (see the supervisor's `[sup …]` log lines; most useful together with the
-frame-independent `AMC_DEMO_PLAY=<n>` hook, e.g.
-`AMC_NO_REPAINT=1 AMC_DEMO_PLAY=0 amc ui`).
+frame-independent `MORDENT_DEMO_PLAY=<n>` hook, e.g.
+`MORDENT_NO_REPAINT=1 MORDENT_DEMO_PLAY=0 mordent ui`).
 
 ## Play reporting
 
-With `media_user_token` set and `report_plays = true` (the default), `amc ui`
+With `media_user_token` set and `report_plays = true` (the default), `mordent ui`
 reports playback segments to Apple's Universal Activity Service so plays land
 in your Recently Played / play counts — the same JSPLAY protocol the web
 player uses (PLAY_START / PLAY_END per pause, resume, seek, skip, natural
@@ -358,7 +371,7 @@ carries the seeked position.
 
 ## Caching
 
-`amc` keeps a local disk cache under `cache_dir` (default `~/.cache/amc`):
+`Mordent` keeps a local disk cache under `cache_dir` (default `~/.cache/mordent`):
 
 - `meta/` — amp-api responses (library UI, search, albums, artists, playlists)
   keyed by URL+storefront. Catalog entries stay fresh for 7 days, library
@@ -379,7 +392,7 @@ at play time, so the cached files are inert without your device's license
 material. (The transient `tracks/<id>.m4a` decode buffer is separate
 machinery, not part of the cache budget.)
 
-Whenever the queue or the playing track changes, amc also prefetches the
+Whenever the queue or the playing track changes, Mordent also prefetches the
 up-next queue sequentially in the background (one worker, nearest first,
 skipping already-cached tracks), so when a song ends the next one starts
 from the cache instead of waiting on a download. Queue edits re-target the

@@ -15,8 +15,8 @@ it alive. The Apple session refreshes itself every ~30 minutes, so the box can
 run unattended for days.
 
 Remote clients then just point their player at the server instead of at
-localhost: set `wrapper_url = "http://music-box.local:12340"` in `amc`'s
-`~/.config/amc/config.toml` (or the equivalent field in any other client).
+localhost: set `wrapper_url = "http://music-box.local:12340"` in `Mordent`'s
+`~/.config/mordent/config.toml` (or the equivalent field in any other client).
 Because the wrapper carries no authentication of its own, do **not** expose its
 port to the open internet — bind it to the LAN/VPN address, or reach it over
 Tailscale/WireGuard or an SSH tunnel (`ssh -L 12340:127.0.0.1:12340 user@box`,

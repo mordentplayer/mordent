@@ -1,24 +1,24 @@
-# amc-wrapper.service — systemd unit for the bundled wrapper-lite backend.
+# mordent-wrapper.service — systemd unit for the bundled wrapper-lite backend.
 #
-# Installed to /etc/systemd/system/amc-wrapper.service by
+# Installed to /etc/systemd/system/mordent-wrapper.service by
 # scripts/install-wrapper.sh, which also substitutes the configured port into
 # the ExecStart line. wrapper-lite must run as root and with PREFIX as its
 # working directory: the launcher bind-mounts /dev/urandom into ./rootfs/dev,
 # then chdir+chroots into ./rootfs and execs /system/bin/lite.
 #
-# Manage with: systemctl status|restart amc-wrapper
-# Logs:        journalctl -u amc-wrapper -f
+# Manage with: systemctl status|restart mordent-wrapper
+# Logs:        journalctl -u mordent-wrapper -f
 
 [Unit]
-Description=amc wrapper-lite (Apple Music FairPlay decryption backend)
+Description=Mordent wrapper-lite (Apple Music FairPlay decryption backend)
 Documentation=https://github.com/WorldObservationLog/wrapper/tree/lite
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/amc-wrapper
-ExecStart=/opt/amc-wrapper/wrapper-lite --host 127.0.0.1 --port 12340
+WorkingDirectory=/opt/mordent-wrapper
+ExecStart=/opt/mordent-wrapper/wrapper-lite --host 127.0.0.1 --port 12340
 Restart=on-failure
 RestartSec=3
 KillMode=control-group

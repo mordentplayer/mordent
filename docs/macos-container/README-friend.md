@@ -146,9 +146,9 @@ The helper needs your Apple Music session. It stores it in
 ## Step 5 — point your player at it
 
 The helper answers on **`http://127.0.0.1:12340`**. Set that as the
-"wrapper URL" in your player's settings (for `amc`, that's the
+"wrapper URL" in your player's settings (for `Mordent`, that's the
 `wrapper_url = "http://127.0.0.1:12340"` line in
-`~/.config/amc/config.toml`, and set `storefront` to your country code —
+`~/.config/mordent/config.toml`, and set `storefront` to your country code —
 the `regions` value from Step 3 tells you which).
 
 The helper starts automatically with your Mac (the `restart: unless-stopped`

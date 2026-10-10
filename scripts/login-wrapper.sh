@@ -2,10 +2,10 @@
 #
 # login-wrapper.sh — one-time Apple Music login for wrapper-lite.
 #
-# Driven by the amc setup wizard, which runs this through pkexec (i.e. as root).
+# Driven by the mordent setup wizard, which runs this through pkexec (i.e. as root).
 # It is a thin, logged wrapper around `wrapper-lite --login`:
 #
-#   * stops the amc-wrapper service (login rewrites the token files),
+#   * stops the mordent-wrapper service (login rewrites the token files),
 #   * runs the file-based 2FA flow: the code is NOT passed on stdin, instead
 #     the wizard writes it to PREFIX/rootfs/data/2fa.txt and wrapper-lite picks
 #     it up from there (that is what --code-from-file enables),
@@ -14,28 +14,28 @@
 #
 # Usage:
 #   sudo scripts/login-wrapper.sh --email you@example.com [--password PASS]
-#                                 [--port 12340] [--prefix /opt/amc-wrapper]
+#                                 [--port 12340] [--prefix /opt/mordent-wrapper]
 #                                 [--twofa-dir DIR] [--timeout SECS]
 #
-# Password resolution order: --password, $AMC_WRAPPER_PASSWORD, --password-file,
+# Password resolution order: --password, $MORDENT_WRAPPER_PASSWORD, --password-file,
 # interactive prompt (no echo). Prefer the environment variable when running
 # interactively: a --password argument is briefly visible to other local users
 # via `ps`. The setup wizard uses --password-file (pkexec strips the env).
 #
 set -euo pipefail
 
-SERVICE_NAME="amc-wrapper"
-PREFIX="${AMC_WRAPPER_PREFIX:-/opt/amc-wrapper}"
-PORT="${AMC_WRAPPER_PORT:-12340}"
-EMAIL="${AMC_WRAPPER_EMAIL:-}"
-PASSWORD="${AMC_WRAPPER_PASSWORD:-}"
+SERVICE_NAME="mordent-wrapper"
+PREFIX="${MORDENT_WRAPPER_PREFIX:-/opt/mordent-wrapper}"
+PORT="${MORDENT_WRAPPER_PORT:-12340}"
+EMAIL="${MORDENT_WRAPPER_EMAIL:-}"
+PASSWORD="${MORDENT_WRAPPER_PASSWORD:-}"
 PASSWORD_FILE=""
 TWOFA_DIR=""
 TIMEOUT=300
 
-log() { printf '[amc-login] %s\n' "$*" >&2; }
+log() { printf '[mordent-login] %s\n' "$*" >&2; }
 fail() {
-  printf '[amc-login] ERROR: %s\n' "$*" >&2
+  printf '[mordent-login] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -46,15 +46,15 @@ Usage: login-wrapper.sh [options]
 Performs the first-time Apple Music login for wrapper-lite. Must run as root.
 
 Options:
-  --email EMAIL     Apple ID email (default: $AMC_WRAPPER_EMAIL, else prompt)
-  --password PASS   Apple ID password (default: $AMC_WRAPPER_PASSWORD, else
+  --email EMAIL     Apple ID email (default: $MORDENT_WRAPPER_EMAIL, else prompt)
+  --password PASS   Apple ID password (default: $MORDENT_WRAPPER_PASSWORD, else
                     prompt; the env var is preferred over this argument)
   --password-file F Read the password from FILE (first line). This is how the
-                    amc setup wizard passes it: pkexec runs this script with a
-                    minimal environment, so $AMC_WRAPPER_PASSWORD never
+                    mordent setup wizard passes it: pkexec runs this script with a
+                    minimal environment, so $MORDENT_WRAPPER_PASSWORD never
                     arrives, and a 0600 file the wizard owns does.
   --port PORT       Port to report back (default: 12340)
-  --prefix DIR      Install prefix (default: /opt/amc-wrapper)
+  --prefix DIR      Install prefix (default: /opt/mordent-wrapper)
   --twofa-dir DIR   Where the 2FA code file lives
                     (default: PREFIX/rootfs/data/2fa.txt)
   --timeout SECS    Give up waiting for the 2FA code after SECS (default: 300)

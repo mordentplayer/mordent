@@ -16,8 +16,8 @@ env:
 
 jobs:
   # ---- 1. the app: linux -------------------------------------------------
-  build-amc:
-    name: amc (linux x86_64)
+  build-mordent:
+    name: mordent (linux x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,11 +45,11 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
-      - name: Upload amc binary
+      - name: Upload mordent binary
         uses: actions/upload-artifact@v4
         with:
-          name: amc-binary
-          path: target/release/amc
+          name: mordent-binary
+          path: target/release/mordent
           if-no-files-found: error
 
   # ---- 2. the third-party wrapper backend (linux only) -------------------
@@ -183,7 +183,7 @@ jobs:
 
   # ---- 4. the app: macOS (macos-14 is arm64; build the Intel slice too) --
   build-macos:
-    name: amc (macos ${{ matrix.arch }})
+    name: mordent (macos ${{ matrix.arch }})
     # macos-14 is arm64 but now marked deprecated by actions/runner-images;
     # it still works, and macos-15 (also arm64) is the drop-in replacement.
     runs-on: macos-14
@@ -212,13 +212,13 @@ jobs:
       - name: Package tarball
         run: |
           set -euo pipefail
-          pkg="amc-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
+          pkg="mordent-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
           root="dist/${pkg}"
           mkdir -p "$root"
-          cp "target/${{ matrix.target }}/release/amc" "$root/amc"
+          cp "target/${{ matrix.target }}/release/mordent" "$root/mordent"
           cp README.md "$root/README.md"
           cat > "$root/WRAPPER-NOTICE.txt" <<'EOF'
-          The FairPlay wrapper is Linux-only. On macOS/Windows, point amc at a remote wrapper (Setup → Wrapper → remote URL).
+          The FairPlay wrapper is Linux-only. On macOS/Windows, point Mordent at a remote wrapper (Setup → Wrapper → remote URL).
           EOF
           tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
           echo "PKG=${pkg}" >> "$GITHUB_ENV"
@@ -232,7 +232,7 @@ jobs:
 
   # ---- 5. the app: Windows ----------------------------------------------
   build-windows:
-    name: amc (windows x86_64)
+    name: mordent (windows x86_64)
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -249,13 +249,13 @@ jobs:
       - name: Package zip
         shell: pwsh
         run: |
-          $pkg = "amc-$env:GITHUB_REF_NAME-windows-x86_64"
+          $pkg = "mordent-$env:GITHUB_REF_NAME-windows-x86_64"
           $root = "dist/$pkg"
           New-Item -ItemType Directory -Force -Path $root | Out-Null
-          Copy-Item "target/release/amc.exe" "$root/amc.exe"
+          Copy-Item "target/release/mordent.exe" "$root/mordent.exe"
           Copy-Item "README.md" "$root/README.md"
           @'
-          The FairPlay wrapper is Linux-only. On macOS/Windows, point amc at a remote wrapper (Setup → Wrapper → remote URL).
+          The FairPlay wrapper is Linux-only. On macOS/Windows, point Mordent at a remote wrapper (Setup → Wrapper → remote URL).
           '@ | Set-Content -Path "$root/WRAPPER-NOTICE.txt" -Encoding utf8NoBOM
           Compress-Archive -Path $root -DestinationPath "$pkg.zip" -Force
           "PKG=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
@@ -272,16 +272,16 @@ jobs:
   # the same tag's release concurrently would race on assets.
   bundle:
     name: bundle + release
-    needs: [build-amc, build-wrapper, build-container, build-macos, build-windows]
+    needs: [build-mordent, build-wrapper, build-container, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download amc binary
+      - name: Download mordent binary
         uses: actions/download-artifact@v4
         with:
-          name: amc-binary
-          path: in/amc
+          name: mordent-binary
+          path: in/mordent
 
       - name: Download wrapper payload
         uses: actions/download-artifact@v4
@@ -303,14 +303,14 @@ jobs:
       - name: Download macos bundles
         uses: actions/download-artifact@v4
         with:
-          pattern: amc-*-macos-*
+          pattern: mordent-*-macos-*
           path: in/release
           merge-multiple: true
 
       - name: Download windows bundle
         uses: actions/download-artifact@v4
         with:
-          pattern: amc-*-windows-*
+          pattern: mordent-*-windows-*
           path: in/release
           merge-multiple: true
 
@@ -318,12 +318,12 @@ jobs:
         run: |
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
-          pkg="amc-${tag}-linux-x86_64"
+          pkg="mordent-${tag}-linux-x86_64"
           root="dist/${pkg}"
           mkdir -p "$root/licenses"
 
           # the app
-          install -m 0755 in/amc/amc "$root/amc"
+          install -m 0755 in/mordent/mordent "$root/mordent"
 
           # the third-party backend (binary + rootfs skeleton)
           install -m 0755 in/wrapper/wrapper-lite "$root/wrapper-lite"
@@ -344,12 +344,12 @@ jobs:
 
           # sanity-check the archive before it goes out
           for p in \
-            amc \
+            mordent \
             wrapper-lite \
             rootfs/system/bin/lite \
             scripts/install-wrapper.sh \
             scripts/login-wrapper.sh \
-            scripts/amc-wrapper.service \
+            scripts/mordent-wrapper.service \
             WRAPPER_COMMIT \
             README.md \
             licenses/LICENSE-DejaVu.txt \

@@ -23,7 +23,7 @@ macOS behaviour is **reasoned, not measured** — there is no Mac in this lab.
   end-user experience (2FA login is the rough edge).
 
 Reason it is not an unqualified GO: the friend needs a *player* that speaks the
-wrapper's HTTP API. The `amc` client is a Rust/egui app that is only built and
+wrapper's HTTP API. The `Mordent` client is a Rust/egui app that is only built and
 tested on Linux (its Cargo.toml gates only the tray icon to Linux; `rodio` and
 `eframe` are cross-platform, so a macOS build is *expected* to work but was not
 attempted here). This container solves the FairPlay half only.
@@ -168,11 +168,11 @@ refresh" → "token cache saved"), which has been running unattended for days.
 
 ### 3b. Playback proof *through the container*
 
-`amc` with `HOME`-isolated config, `wrapper_url = http://127.0.0.1:12341`,
+`Mordent` with `HOME`-isolated config, `wrapper_url = http://127.0.0.1:12341`,
 storefront `ca`, real `media_user_token`:
 
 ```
-$ amc decrypt 697195462 /tmp/amc-proof.m4a     # Daft Punk — One More Time
+$ mordent decrypt 697195462 /tmp/mordent-proof.m4a     # Daft Punk — One More Time
 plan ready in 250.4ms: .../P1479228485_A697195462_audio_en_gr1411_alac_m.mp4 (22 fragments)
 first bytes in 551.2ms
   ... 38 MB decrypted (1.9s)
@@ -190,13 +190,13 @@ container):
 [INFO ] request: GET /key?adamId=697195462&uri=skd%3A%2F%2Fitunes.apple.com%2Fp1479228485%2Fc6
 [INFO ] adamId: 697195462, uri: skd://itunes.apple.com/p1479228485/c6
 ```
-`amc decode` re-reads the container-produced file: ALAC 44.1 kHz/16-bit/2ch,
+`mordent decode` re-reads the container-produced file: ALAC 44.1 kHz/16-bit/2ch,
 3 450 packets, 164x realtime.
 
-`cmp /tmp/amc-proof.m4a /tmp/amc-native-out.m4a` → **byte-identical** to the
+`cmp /tmp/mordent-proof.m4a /tmp/mordent-native-out.m4a` → **byte-identical** to the
 native-wrapper output.
 
-`amc play "one more time"` against the container (streaming path, not file):
+`mordent play "one more time"` against the container (streaming path, not file):
 ```
 ▶ One More Time — Daft Punk [697195462]
 [play] source: CDN stream (ready in 476.4ms)
@@ -259,7 +259,7 @@ Verified with an empty data dir:
 2. **Apple Silicon emulation cost is unmeasured.** Rosetta-translated amd64 is
    typically 50-90 % of native for this kind of code; plain qemu (Rosetta off)
    is much slower but the peer's workload is light. Ask the friend for
-   `amc decrypt <id>` timing on the Mac to confirm.
+   `mordent decrypt <id>` timing on the Mac to confirm.
 3. **Login UX is the weak point.** A fresh Apple session needs the Apple ID
    password **plus 2FA**, and the container has no TTY: the code must be
    written into `data/2fa.txt` and the container restarted. Apple may also
@@ -280,7 +280,7 @@ Verified with an empty data dir:
    image, the friend's own machine, and (on Linux) rootless/user-namespaced
    Docker if desired.
 7. **Player gap.** The container provides the FairPlay backend; the friend still
-   needs a client that speaks `/m3u8`, `/key`, `/lyrics`. `amc` is Linux-first
+   needs a client that speaks `/m3u8`, `/key`, `/lyrics`. `Mordent` is Linux-first
    (only its tray icon is Linux-gated), so a macOS build is plausible but
    unproven. Until that exists, the practical path for the friend is the **home
    server** (see `README-home-server.md`): one wrapper, any client.
@@ -310,7 +310,7 @@ Verified with an empty data dir:
 
 ## 6. Reproduce
 
-The container's build context lives at `docs/macos-container/` in the `amc`
+The container's build context lives at `docs/macos-container/` in the `Mordent`
 repo. Stage the two built inputs next to the committed `Dockerfile` /
 `entrypoint.sh` first (in CI the `build-wrapper` job produces them; locally
 take them from a wrapper `lite` checkout — `wrapper-lite-rootless` and the
@@ -321,7 +321,7 @@ cd docs/macos-container
 docker build -t wrapper-lite:amd64 .
 docker compose up -d                     # stop the native one on 12340 first, or use a port override
 curl 127.0.0.1:12340/status
-HOME=/tmp/amc-ctr-home amc decrypt 697195462 /tmp/out.m4a   # with wrapper_url=127.0.0.1:12340
+HOME=/tmp/mordent-ctr-home mordent decrypt 697195462 /tmp/out.m4a   # with wrapper_url=127.0.0.1:12340
 ```
 
 Equivalent one-shot form used by the release workflow:

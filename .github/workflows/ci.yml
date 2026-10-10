@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
 
 env:
@@ -55,8 +55,8 @@ jobs:
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: amc-linux-x86_64
-          path: target/release/amc
+          name: mordent-linux-x86_64
+          path: target/release/mordent
           if-no-files-found: error
 
   # macOS/Windows are build + test only: no clippy gate, no extra system deps
@@ -84,8 +84,8 @@ jobs:
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: amc-macos-aarch64
-          path: target/release/amc
+          name: mordent-macos-aarch64
+          path: target/release/mordent
           if-no-files-found: error
 
   windows:
@@ -112,6 +112,6 @@ jobs:
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: amc-windows-x86_64
-          path: target/release/amc.exe
+          name: mordent-windows-x86_64
+          path: target/release/mordent.exe
           if-no-files-found: error
