@@ -73,10 +73,51 @@ and the container forensics in the same directory. Prefer an always-on Linux
 box? Run the wrapper natively there and just point `wrapper_url` at it — see
 [`docs/macos-container/README-home-server.md`](docs/macos-container/README-home-server.md).
 
+## First-run setup
+
+`amc` ships a guided setup wizard, so going from zero to playing music needs
+no docs. The first `amc ui` on a machine with **no** `~/.config/amc/config.toml`
+opens the wizard instead of the app; after that it starts normally. Re-run it
+any time with:
+
+```sh
+amc setup
+```
+
+The wizard walks through:
+
+1. **Welcome** — three ways to play: connect to a music helper (a wrapper URL —
+   on this computer, a friend's server or your own VPS), install the bundled
+   helper on this computer (Linux: runs the same `scripts/install-wrapper.sh`
+   through `pkexec`), or skip for now (90-second previews).
+2. **Wrapper URL** — type a URL and hit *Test connection*; on success it shows
+   the regions the helper can serve and lets you pick your storefront.
+3. **Local install** (Linux only) — installs and starts the helper as a system
+   service, streaming the installer's output live.
+4. **Apple login** — first-time sign-in for the helper; when Apple asks for a
+   two-factor code the wizard asks for it and delivers it to the helper.
+   Skipping is allowed (no lossless playback until you sign in).
+5. **Preferences** — storefront, optional `media_user_token`, play reporting
+   and the audio-cache budget.
+6. **Audio check** — confirms an output device opens.
+7. **Finish** — writes `~/.config/amc/config.toml` (atomically; keys the wizard
+   does not collect are preserved) and drops you into the player.
+
+On a Mac, the helper runs in Docker: the wizard's *Connect to a music helper*
+path points at it (or at any always-on Linux box) — see
+[`docs/macos-container/README-friend.md`](docs/macos-container/README-friend.md).
+
+![first-run setup wizard](docs/setup/wizard-welcome.png)
+
+Installing the helper locally streams the installer's output into the wizard:
+
+![local helper install](docs/setup/wizard-local-install.png)
+
 ## Usage
 
 ```sh
 amc ui                    # the app (tabs, queue, seek — see UI section below)
+amc setup                 # guided first-run setup (install helper, log in, prefs)
 amc search "daft punk"    # catalog search
 amc play "get lucky"      # CLI playback with time-to-music stats
 amc lyrics <songId> [--syllable]   # line- or word-timed lyrics

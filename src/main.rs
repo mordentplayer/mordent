@@ -7,6 +7,7 @@ mod player;
 mod prefetch;
 mod queuemodel;
 mod report;
+mod setup;
 mod supervisor;
 mod ui;
 mod fairplay;
@@ -52,6 +53,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Detect FIRST-RUN before Config::load() auto-writes a default file: with
+    // no config.toml, `amc ui` opens the setup wizard instead of the app.
+    let first_run = !config::config_exists();
     let cfg = config::Config::load()?;
     // TTL-clean the metadata cache once per process (audio cache is
     // budget-managed per play attempt).
@@ -92,7 +96,15 @@ fn run() -> Result<()> {
             decode_stats(path)?;
         }
         "ui" => {
-            ui::launch(cfg)?;
+            // No config.toml at launch → run the guided setup first.
+            if first_run {
+                ui::launch_setup(cfg)?;
+            } else {
+                ui::launch(cfg)?;
+            }
+        }
+        "setup" => {
+            ui::launch_setup(cfg)?;
         }
         "play" => {
             let term = if rest.is_empty() {
@@ -468,6 +480,8 @@ fn usage() {
          \x20 album <id|url>    list album tracks\n\
          \x20 wrapper           wrapper-lite status\n\
          \x20 decrypt <songId> [out]  stream + FairPlay-decrypt a track to file\n\
-         \x20 decode <file>     decode a decrypted fragmented file (verify)\n"
+         \x20 decode <file>     decode a decrypted fragmented file (verify)\n\
+         \x20 ui                the app (first run: guided setup wizard)\n\
+         \x20 setup             guided setup wizard (install helper, log in, prefs)\n"
     );
 }

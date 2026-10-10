@@ -43,6 +43,17 @@ fn config_path() -> PathBuf {
     home().join(".config/amc/config.toml")
 }
 
+/// Path of the user config file (`~/.config/amc/config.toml`).
+pub fn config_file() -> PathBuf {
+    config_path()
+}
+
+/// Whether a config file already exists. The setup wizard uses this to decide
+/// first-run entry BEFORE [`Config::load`] auto-writes a default file.
+pub fn config_exists() -> bool {
+    config_path().exists()
+}
+
 impl Config {
     /// Load from `~/.config/amc/config.toml`, creating a default file if absent.
     pub fn load() -> Result<Self> {
@@ -82,6 +93,105 @@ fn default_toml(cfg: &Config) -> String {
         cfg.cache_dir.display(),
         cfg.cache_size_gb
     )
+}
+
+/// Keys the wizard collects and (re)writes; every other key already present in
+/// the file is preserved verbatim, so a write never clobbers keys we did not
+/// collect (e.g. a hand-added comment-bearing option or a future key).
+const KNOWN_KEYS: [&str; 6] = [
+    "storefront",
+    "wrapper_url",
+    "media_user_token",
+    "cache_dir",
+    "report_plays",
+    "cache_size_gb",
+];
+
+/// Render a full `config.toml` body from `cfg`, merging over `existing` (parsed
+/// as TOML; a missing or unparseable file is treated as empty). Pure, so the
+/// wizard's exact write content is unit-tested without touching a HOME.
+///
+/// Comments in the existing file are not preserved (a TOML round-trip drops
+/// them); unknown *keys* are. The wizard only ever writes whole files through
+/// this path, so the header below is restored on every write.
+pub fn merge_config_toml(existing: Option<&str>, cfg: &Config) -> Result<String> {
+    let mut table: toml::Table = match existing {
+        Some(text) => toml::from_str(text).unwrap_or_default(),
+        None => toml::Table::new(),
+    };
+    table.insert("storefront".into(), cfg.storefront.clone().into());
+    table.insert("wrapper_url".into(), cfg.wrapper_url.clone().into());
+    table.insert(
+        "media_user_token".into(),
+        cfg.media_user_token.clone().unwrap_or_default().into(),
+    );
+    table.insert(
+        "cache_dir".into(),
+        cfg.cache_dir.display().to_string().into(),
+    );
+    table.insert("report_plays".into(), cfg.report_plays.into());
+    table.insert("cache_size_gb".into(), (cfg.cache_size_gb as i64).into());
+
+    let mut out = String::from(
+        "# amc configuration — written by the setup wizard (`amc setup`).\n\
+         # Keys not listed here are preserved as-is across writes.\n",
+    );
+    for key in KNOWN_KEYS {
+        if let Some(v) = table.remove(key) {
+            out.push_str(&format!("{key} = {v}\n"));
+        }
+    }
+    // Whatever is left was not collected by the wizard: keep it, sorted.
+    for (key, v) in table {
+        out.push_str(&format!("{key} = {v}\n"));
+    }
+    Ok(out)
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".into());
+    path.with_file_name(format!(".{name}.tmp"))
+}
+
+/// Atomically write `cfg` to `path`, merging over any file already there.
+///
+/// The temp file is created in the same directory and renamed over the target
+/// (atomic on one filesystem); it is created 0600 because the file can hold a
+/// media-user-token.
+pub fn write_config_at(path: &Path, cfg: &Config) -> Result<()> {
+    let existing = std::fs::read_to_string(path).ok();
+    let text = merge_config_toml(existing.as_deref(), cfg)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let tmp = tmp_path(path);
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        use std::io::Write;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        let _ = f.sync_all();
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Write `cfg` to the default `~/.config/amc/config.toml` location.
+pub fn write_config(cfg: &Config) -> Result<()> {
+    write_config_at(&config_path(), cfg)
 }
 
 /// Convenience: expand a path under the cache dir, ensuring it exists.
@@ -127,4 +237,88 @@ pub fn fnv128(data: &[u8]) -> String {
         h2 = (h2 ^ (b as u64).rotate_left(17)).wrapping_mul(PRIME);
     }
     format!("{h1:016x}{h2:016x}")
+}
+
+#[cfg(test)]
+mod wizard_write_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "amc-config-test-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cfg() -> Config {
+        Config {
+            storefront: "de".into(),
+            wrapper_url: "http://music-box.local:12340".into(),
+            media_user_token: Some("tok".into()),
+            cache_dir: PathBuf::from("/tmp/amc-cache"),
+            report_plays: false,
+            cache_size_gb: 7,
+        }
+    }
+
+    #[test]
+    fn merge_writes_every_collected_key() {
+        let text = merge_config_toml(None, &cfg()).unwrap();
+        assert!(text.contains("storefront = \"de\""));
+        assert!(text.contains("wrapper_url = \"http://music-box.local:12340\""));
+        assert!(text.contains("media_user_token = \"tok\""));
+        assert!(text.contains("cache_dir = \"/tmp/amc-cache\""));
+        assert!(text.contains("report_plays = false"));
+        assert!(text.contains("cache_size_gb = 7"));
+        // round-trips through the real parser
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.storefront, "de");
+        assert_eq!(back.cache_size_gb, 7);
+        assert!(!back.report_plays);
+    }
+
+    #[test]
+    fn merge_preserves_unknown_keys_and_overrides_known_ones() {
+        let existing = "storefront = \"jp\"\nfuture_option = \"keep me\"\nnested = { a = 1 }\n";
+        let text = merge_config_toml(Some(existing), &cfg()).unwrap();
+        assert!(text.contains("storefront = \"de\""), "{text}");
+        assert!(!text.contains("jp"), "{text}");
+        assert!(text.contains("future_option = \"keep me\""), "{text}");
+        assert!(text.contains("nested = { a = 1 }"), "{text}");
+    }
+
+    #[test]
+    fn merge_tolerates_a_corrupt_existing_file() {
+        let text = merge_config_toml(Some("this is not toml ==="), &cfg()).unwrap();
+        assert!(text.contains("storefront = \"de\""));
+        assert!(toml::from_str::<Config>(&text).is_ok());
+    }
+
+    #[test]
+    fn write_config_at_is_atomic_and_0600() {
+        let dir = tmpdir("write");
+        let path = dir.join("config.toml");
+        // pre-existing file with an unknown key must survive.
+        std::fs::write(&path, "future_option = 42\nstorefront = \"jp\"\n").unwrap();
+        write_config_at(&path, &cfg()).unwrap();
+        let back: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.storefront, "de");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("future_option = 42"), "{raw}");
+        // no temp file left behind
+        assert!(!dir.join(".config.toml.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "config should be private");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

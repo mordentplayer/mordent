@@ -496,10 +496,15 @@ pub struct App {
     /// thread — under the supervisor's parallel fetches it can stall for
     /// seconds and freeze the frame loop).
     wrapper_cacheable: Arc<std::sync::atomic::AtomicBool>,
+    /// First-run setup wizard; `Some` while the wizard owns the window (see
+    /// setup.rs). Started by `amc setup`, or by `amc ui` when no config.toml
+    /// existed at launch. Never under AMC_SELFTEST; `AMC_DEMO_SETUP=<1..7>`
+    /// lands directly on a step (headless screenshot hook).
+    setup: Option<crate::setup::SetupState>,
 }
 
 impl App {
-    fn new(cfg: Config, egui_ctx: egui::Context) -> Self {
+    fn new(cfg: Config, egui_ctx: egui::Context, start_wizard: bool) -> Self {
         let state = load_state();
         let (theme, theme_warns) = Theme::load();
         for w in &theme_warns {
@@ -566,6 +571,20 @@ impl App {
         );
         // Parked sentinel until the first frame publishes a real delay.
         let wake_ms = Arc::new(AtomicU64::new(WAKE_PARKED));
+        // First-run wizard. AMC_SELFTEST never enters it; AMC_DEMO_SETUP=<1..7>
+        // lands straight on a step (headless screenshot hook).
+        let setup = if selftest {
+            None
+        } else if let Ok(n) = std::env::var("AMC_DEMO_SETUP") {
+            Some(crate::setup::SetupState::demo(
+                n.trim().parse().unwrap_or(1),
+                &cfg,
+            ))
+        } else if start_wizard {
+            Some(crate::setup::SetupState::new(&cfg))
+        } else {
+            None
+        };
         let mut app = Self {
             cfg,
             search: String::new(),
@@ -637,6 +656,7 @@ impl App {
             shuffle_seen: false,
             decode_logged: false,
             wrapper_cacheable,
+            setup,
         };
         // Startup wrapper reachability hint (once, off-thread — see the fn).
         app.spawn_wrapper_check();
@@ -941,8 +961,48 @@ impl App {
             .ok();
     }
 
-    // ---- lyrics (wrapper endpoint; own per-track in-memory cache) ----
+    /// Render the first-run wizard and act on its outcome. Called INSTEAD of
+    /// the normal UI while `self.setup` is `Some` (see `update`).
+    fn setup_screen(&mut self, ctx: &egui::Context) {
+        if self.last_title != "amc — setup" {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title("amc — setup".into()));
+            self.last_title = "amc — setup".into();
+        }
+        let theme = self.theme;
+        let mut action = crate::setup::Action::None;
+        if let Some(setup) = self.setup.as_mut() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = setup.ui(ui, &theme);
+            });
+        }
+        match action {
+            crate::setup::Action::None => {}
+            crate::setup::Action::Finish => {
+                let Some(new_cfg) = self.setup.as_ref().map(|s| s.new_config(&self.cfg)) else {
+                    return;
+                };
+                match crate::config::write_config(&new_cfg) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[setup] wrote {} (wrapper {}, storefront {})",
+                            crate::config::config_file().display(),
+                            new_cfg.wrapper_url,
+                            new_cfg.storefront
+                        );
+                        self.cfg = new_cfg;
+                        self.setup = None;
+                    }
+                    Err(e) => {
+                        if let Some(s) = self.setup.as_mut() {
+                            s.set_error(format!("could not write the config: {e:#}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
+    // ---- lyrics (wrapper endpoint; own per-track in-memory cache) ----
     /// Show/hide the lyrics panel. Hiding drops the follow anchor so reopening
     /// mid-track scrolls back to the active line; showing after a failed fetch
     /// is the user's retry (the wrapper may be back) — the attempt is
@@ -2036,10 +2096,18 @@ impl eframe::App for App {
             self.hidden.store(true, Ordering::Relaxed);
         }
 
+        // First-run wizard owns the window: render it and skip the normal app
+        // (the wizard's own threads keep working; frames are kept flowing).
+        if self.setup.is_some() {
+            self.poll_messages();
+            self.setup_screen(ctx);
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+            return;
+        }
+
         let mut focus_search = self.handle_keys(ctx);
         self.poll_messages();
         self.selftest_step();
-
         // ---- debounced state.toml write (favorite toggles) ----
         if let Some(t) = self.state_dirty
             && t.elapsed() >= std::time::Duration::from_millis(1000)
@@ -3633,7 +3701,7 @@ fn hex_color(hex: &str) -> Option<egui::Color32> {
 /// wrapper can be legitimately slow, so the startup hint only fires on a real
 /// failure (connect/HTTP/timeout error), never a slow-but-alive one. Runs on
 /// the `amc-wrapper-check` startup thread, never the UI thread.
-fn probe_wrapper_reachable(url: &str) -> bool {
+pub(crate) fn probe_wrapper_reachable(url: &str) -> bool {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(5))
@@ -3646,23 +3714,26 @@ fn probe_wrapper_reachable(url: &str) -> bool {
 /// Loopback URLs get the local start command + the config pointer; remote/
 /// tunnel URLs get the connectivity question instead (the local command would
 /// be wrong there).
-fn wrapper_down_hint(url: &str) -> String {
+pub(crate) fn wrapper_down_hint(url: &str) -> String {
     let url = url.trim_end_matches('/');
     if is_loopback_url(url) {
         format!(
             "wrapper not reachable at {url} — start it \
-             (sudo ./wrapper-lite --host 127.0.0.1 --port 12340), or set a remote \
-             URL in ~/.config/amc/config.toml"
+             (sudo ./wrapper-lite --host 127.0.0.1 --port 12340), set a remote \
+             URL in ~/.config/amc/config.toml, or re-run `amc setup`"
         )
     } else {
-        format!("wrapper at {url} isn't responding — is the host up / tunnel connected?")
+        format!(
+            "wrapper at {url} isn't responding — is the host up / tunnel connected? \
+             (re-point amc with `amc setup`)"
+        )
     }
 }
 
 /// Whether `url`'s host is a loopback address (`localhost`, `127.0.0.0/8`,
 /// `[::1]`). Deliberately simple string parsing — the config value is a bare
 /// `scheme://host[:port]`, not worth a url crate.
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = if let Some(v6) = authority.strip_prefix('[') {
@@ -3736,6 +3807,16 @@ fn fmt_pos(d: std::time::Duration) -> String {
 }
 
 pub fn launch(cfg: Config) -> anyhow::Result<()> {
+    launch_with(cfg, false)
+}
+
+/// `amc setup`: open the UI already inside the first-run wizard, whatever the
+/// config situation (this is the entry point for re-running setup).
+pub fn launch_setup(cfg: Config) -> anyhow::Result<()> {
+    launch_with(cfg, true)
+}
+
+fn launch_with(cfg: Config, start_wizard: bool) -> anyhow::Result<()> {
     // Transparent viewport: the window background comes from the theme's
     // `bg` color at `opacity` (see `App::clear_color` / theme.rs).
     //
@@ -3757,7 +3838,7 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
         // Fonts are bundled (`src/fonts.rs`, `include_bytes!`) and installed
         // by the first `App::poll_theme`: nothing is read from the filesystem,
         // so the UI renders identically on a bare system.
-        Box::new(move |cc| Ok(Box::new(App::new(cfg, cc.egui_ctx.clone())))),
+        Box::new(move |cc| Ok(Box::new(App::new(cfg, cc.egui_ctx.clone(), start_wizard)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
 }
@@ -3887,6 +3968,7 @@ mod wrapper_hint_tests {
             assert!(hint.contains(url.trim_end_matches('/')), "{hint}");
             assert!(hint.contains("start it"), "{hint}");
             assert!(hint.contains("~/.config/amc/config.toml"), "{hint}");
+            assert!(hint.contains("amc setup"), "{hint}");
         }
     }
 
@@ -3901,6 +3983,7 @@ mod wrapper_hint_tests {
             let hint = wrapper_down_hint(url);
             assert!(hint.contains("isn't responding"), "{hint}");
             assert!(hint.contains("tunnel connected"), "{hint}");
+            assert!(hint.contains("amc setup"), "{hint}");
             assert!(!hint.contains("start it"), "{hint}");
         }
     }

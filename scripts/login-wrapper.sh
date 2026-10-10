@@ -17,9 +17,10 @@
 #                                 [--port 12340] [--prefix /opt/amc-wrapper]
 #                                 [--twofa-dir DIR] [--timeout SECS]
 #
-# Password resolution order: --password, $AMC_WRAPPER_PASSWORD, interactive
-# prompt (no echo). Prefer the environment variable: a --password argument is
-# briefly visible to other local users via `ps`.
+# Password resolution order: --password, $AMC_WRAPPER_PASSWORD, --password-file,
+# interactive prompt (no echo). Prefer the environment variable when running
+# interactively: a --password argument is briefly visible to other local users
+# via `ps`. The setup wizard uses --password-file (pkexec strips the env).
 #
 set -euo pipefail
 
@@ -28,6 +29,7 @@ PREFIX="${AMC_WRAPPER_PREFIX:-/opt/amc-wrapper}"
 PORT="${AMC_WRAPPER_PORT:-12340}"
 EMAIL="${AMC_WRAPPER_EMAIL:-}"
 PASSWORD="${AMC_WRAPPER_PASSWORD:-}"
+PASSWORD_FILE=""
 TWOFA_DIR=""
 TIMEOUT=300
 
@@ -47,6 +49,10 @@ Options:
   --email EMAIL     Apple ID email (default: $AMC_WRAPPER_EMAIL, else prompt)
   --password PASS   Apple ID password (default: $AMC_WRAPPER_PASSWORD, else
                     prompt; the env var is preferred over this argument)
+  --password-file F Read the password from FILE (first line). This is how the
+                    amc setup wizard passes it: pkexec runs this script with a
+                    minimal environment, so $AMC_WRAPPER_PASSWORD never
+                    arrives, and a 0600 file the wizard owns does.
   --port PORT       Port to report back (default: 12340)
   --prefix DIR      Install prefix (default: /opt/amc-wrapper)
   --twofa-dir DIR   Where the 2FA code file lives
@@ -60,6 +66,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --email) EMAIL="${2:?--email needs a value}"; shift 2 ;;
     --password) PASSWORD="${2:?--password needs a value}"; shift 2 ;;
+    --password-file) PASSWORD_FILE="${2:?--password-file needs a value}"; shift 2 ;;
     --port) PORT="${2:?--port needs a value}"; shift 2 ;;
     --prefix) PREFIX="${2:?--prefix needs a value}"; shift 2 ;;
     --twofa-dir) TWOFA_DIR="${2:?--twofa-dir needs a value}"; shift 2 ;;
@@ -82,6 +89,13 @@ if [[ -z $EMAIL ]]; then
   read -r -p "Apple ID email: " EMAIL || true
 fi
 [[ -n $EMAIL ]] || fail "no Apple ID email given"
+
+if [[ -z $PASSWORD && -n $PASSWORD_FILE ]]; then
+  # The wizard's channel: pkexec gives us a minimal environment, so the file
+  # (readable only by its owner and root) is the only thing that arrives.
+  [[ -r $PASSWORD_FILE ]] || fail "cannot read --password-file '$PASSWORD_FILE'"
+  IFS= read -r PASSWORD <"$PASSWORD_FILE" || true
+fi
 
 if [[ -z $PASSWORD ]]; then
   read -r -s -p "Apple ID password: " PASSWORD || true
