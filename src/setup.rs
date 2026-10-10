@@ -2029,6 +2029,10 @@ mod tests {
 
     // ---- the runner itself (fake program, no PATH tricks) ----
 
+    // Unix-only: spawning a `#!/bin/sh` script relies on shebang exec, which
+    // has no Windows equivalent. The local-install path this covers is
+    // Linux-only by design (the wizard shows that step only on Linux).
+    #[cfg(unix)]
     #[test]
     fn runner_streams_lines_and_parses_base_url() {
         let dir = tmpdir("runner");
@@ -2038,7 +2042,6 @@ mod tests {
             "#!/bin/sh\necho 'hello stdout'\necho 'hello stderr' >&2\necho 'http://127.0.0.1:12340'\n",
         )
         .unwrap();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
