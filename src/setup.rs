@@ -1851,6 +1851,10 @@ mod tests {
 
     // ---- process specs: exact argv, program looked up by name ----
 
+    // Unix-only: these assert the exact POSIX argv (paths joined with `/`) the
+    // wizard hands to pkexec. On Windows `Path::join` yields `\`, so the string
+    // comparison fails; the local-install/login steps are Linux-only by design.
+    #[cfg(unix)]
     #[test]
     fn install_spec_argv_and_name_lookup() {
         let s = install_spec(Path::new("/bundle/scripts"), 12340);
@@ -1869,6 +1873,8 @@ mod tests {
         assert!(s.envs.is_empty());
     }
 
+    // Unix-only: same POSIX-argv-string reason as `install_spec_argv_and_name_lookup`.
+    #[cfg(unix)]
     #[test]
     fn login_spec_passes_password_by_file_not_env() {
         let s = login_spec(
