@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux is the reference platform and the only one with the mandatory clippy
+  # gate (the tree is intentionally not rustfmt-clean, so there is no fmt gate).
+  linux:
+    name: linux (build · clippy · test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 → Rust 1.85 floor; pin to stable (ahead of that floor).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # eframe/winit/glutin (x11 + wayland) and rodio/cpal (alsa) build deps.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The #[ignore]d tests are live smoke tests (network + local wrapper);
+      # cargo test skips them by default. Nothing in the suite opens an audio
+      # device (the player uses rodio's try_default and has no tests).
+      - name: Test
+        run: cargo test --locked
+
+      - name: Upload binary
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: amc-linux-x86_64
+          path: target/release/amc
+          if-no-files-found: error
+
+  # macOS/Windows are build + test only: no clippy gate, no extra system deps
+  # (winit uses the platform backends and cpal picks WASAPI/CoreAudio itself).
+  macos:
+    name: macos (build · test)
+    # macos-14 is arm64 but now marked deprecated by actions/runner-images;
+    # it still works, and macos-15 (also arm64) is the drop-in replacement.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Upload binary
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: amc-macos-aarch64
+          path: target/release/amc
+          if-no-files-found: error
+
+  windows:
+    name: windows (build · test)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # Verified: no test touches an audio device (src/player.rs uses rodio's
+      # try_default and has no tests) and the only socket test is 127.0.0.1-based
+      # (src/api.rs). The #[ignore]d live tests are network/CDN smoke tests.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Upload binary
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: amc-windows-x86_64
+          path: target/release/amc.exe
+          if-no-files-found: error

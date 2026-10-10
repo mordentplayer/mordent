@@ -1,0 +1,300 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  WRAPPER_REPO: https://github.com/WorldObservationLog/wrapper
+  # Canonical NDK r23b URL: dl.google.com is blocked on some networks, the
+  # gvt1 mirror is the documented alternative.
+  NDK_URL: https://redirector.gvt1.com/edgedl/android/repository/android-ndk-r23b-linux.zip
+
+jobs:
+  # ---- 1. the app: linux -------------------------------------------------
+  build-amc:
+    name: amc (linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 → Rust 1.85 floor; pin to stable (ahead of that floor).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # eframe/winit/glutin (x11 + wayland) and rodio/cpal (alsa) build deps.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Upload amc binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: amc-binary
+          path: target/release/amc
+          if-no-files-found: error
+
+  # ---- 2. the third-party wrapper backend (linux only) -------------------
+  build-wrapper:
+    name: wrapper-lite (linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential unzip
+
+      - name: Clone wrapper-lite (lite branch)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch lite "$WRAPPER_REPO" wrapper-src
+          # Pin the exact revision in the bundle so the build is auditable.
+          git -C wrapper-src rev-parse HEAD | tee wrapper-src/WRAPPER_COMMIT
+          git -C wrapper-src log -1 --oneline
+
+      - name: Install Android NDK r23b
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 -o ndk.zip "$NDK_URL"
+          unzip -q ndk.zip -d wrapper-src
+          test -d wrapper-src/android-ndk-r23b
+
+      - name: Build (cmake)
+        working-directory: wrapper-src
+        run: |
+          set -euo pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          test -x wrapper-lite
+          test -x rootfs/system/bin/lite
+
+      - name: Assemble wrapper payload
+        run: |
+          set -euo pipefail
+          mkdir -p wrapper-out
+          cp wrapper-src/wrapper-lite wrapper-out/wrapper-lite
+          cp wrapper-src/WRAPPER_COMMIT wrapper-out/WRAPPER_COMMIT
+          cp wrapper-src/LICENSE wrapper-out/LICENSE-wrapper.txt
+          cp wrapper-src/README.md wrapper-out/README-wrapper.md
+
+          # rootfs skeleton = tracked files only (git archive), so no
+          # per-machine login state (DEV_TOKEN/MUSIC_TOKEN/… ) can leak in.
+          git -C wrapper-src archive HEAD rootfs | tar -x -C wrapper-out
+          # …plus the freshly built Android-layer binary.
+          cp wrapper-src/rootfs/system/bin/lite wrapper-out/rootfs/system/bin/lite
+
+          test ! -e wrapper-out/rootfs/data/MUSIC_TOKEN
+          test ! -e wrapper-out/rootfs/data/DEV_TOKEN
+          test -x wrapper-out/rootfs/system/bin/lite
+          chmod 0755 wrapper-out/wrapper-lite
+          find wrapper-out -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
+
+      - name: Upload wrapper payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrapper-payload
+          path: wrapper-out
+          if-no-files-found: error
+
+  # ---- 3. the app: macOS (macos-14 is arm64; build the Intel slice too) --
+  build-macos:
+    name: amc (macos ${{ matrix.arch }})
+    # macos-14 is arm64 but now marked deprecated by actions/runner-images;
+    # it still works, and macos-15 (also arm64) is the drop-in replacement.
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 → Rust 1.85 floor; pin to stable (ahead of that floor).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          pkg="amc-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
+          root="dist/${pkg}"
+          mkdir -p "$root"
+          cp "target/${{ matrix.target }}/release/amc" "$root/amc"
+          cp README.md "$root/README.md"
+          cat > "$root/WRAPPER-NOTICE.txt" <<'EOF'
+          The FairPlay wrapper is Linux-only. On macOS/Windows, point amc at a remote wrapper (Setup → Wrapper → remote URL).
+          EOF
+          tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+
+      - name: Upload macos bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.tar.gz
+          if-no-files-found: error
+
+  # ---- 4. the app: Windows ----------------------------------------------
+  build-windows:
+    name: amc (windows x86_64)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      # Edition 2024 → Rust 1.85 floor; pin to stable (ahead of that floor).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $pkg = "amc-$env:GITHUB_REF_NAME-windows-x86_64"
+          $root = "dist/$pkg"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item "target/release/amc.exe" "$root/amc.exe"
+          Copy-Item "README.md" "$root/README.md"
+          @'
+          The FairPlay wrapper is Linux-only. On macOS/Windows, point amc at a remote wrapper (Setup → Wrapper → remote URL).
+          '@ | Set-Content -Path "$root/WRAPPER-NOTICE.txt" -Encoding utf8NoBOM
+          Compress-Archive -Path $root -DestinationPath "$pkg.zip" -Force
+          "PKG=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+      - name: Upload windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.zip
+          if-no-files-found: error
+
+  # ---- 5. linux bundle (app + wrapper) and the one release creator -------
+  bundle:
+    name: bundle + release
+    needs: [build-amc, build-wrapper, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download amc binary
+        uses: actions/download-artifact@v4
+        with:
+          name: amc-binary
+          path: in/amc
+
+      - name: Download wrapper payload
+        uses: actions/download-artifact@v4
+        with:
+          name: wrapper-payload
+          path: in/wrapper
+
+      # The macOS/Windows bundles are published as-is; only linux bundles the
+      # wrapper (the FairPlay backend is linux-only).
+      - name: Download macos bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: amc-*-macos-*
+          path: in/release
+          merge-multiple: true
+
+      - name: Download windows bundle
+        uses: actions/download-artifact@v4
+        with:
+          pattern: amc-*-windows-*
+          path: in/release
+          merge-multiple: true
+
+      - name: Assemble bundle
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          pkg="amc-${tag}-linux-x86_64"
+          root="dist/${pkg}"
+          mkdir -p "$root/licenses"
+
+          # the app
+          install -m 0755 in/amc/amc "$root/amc"
+
+          # the third-party backend (binary + rootfs skeleton)
+          install -m 0755 in/wrapper/wrapper-lite "$root/wrapper-lite"
+          cp -a in/wrapper/rootfs "$root/rootfs"
+          cp in/wrapper/WRAPPER_COMMIT "$root/WRAPPER_COMMIT"
+
+          # setup scripts + systemd unit the wizard drives
+          cp -a scripts "$root/scripts"
+
+          # docs + licenses
+          cp README.md "$root/README.md"
+          cp assets/fonts/LICENSE-DejaVu.txt "$root/licenses/LICENSE-DejaVu.txt"
+          cp assets/fonts/LICENSE-Inter.txt "$root/licenses/LICENSE-Inter.txt"
+          cp in/wrapper/LICENSE-wrapper.txt "$root/licenses/LICENSE-wrapper.txt"
+          cp in/wrapper/README-wrapper.md "$root/licenses/README-wrapper.md"
+
+          tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
+
+          # sanity-check the archive before it goes out
+          for p in \
+            amc \
+            wrapper-lite \
+            rootfs/system/bin/lite \
+            scripts/install-wrapper.sh \
+            scripts/login-wrapper.sh \
+            scripts/amc-wrapper.service \
+            WRAPPER_COMMIT \
+            README.md \
+            licenses/LICENSE-DejaVu.txt \
+            licenses/LICENSE-Inter.txt \
+            licenses/LICENSE-wrapper.txt; do
+            tar -tzf "${pkg}.tar.gz" | grep -qx "${pkg}/${p}" ||
+              { echo "::error::bundle is missing ${p}"; exit 1; }
+          done
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.tar.gz
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.PKG }}.tar.gz
+            in/release/*.tar.gz
+            in/release/*.zip
+          generate_release_notes: true

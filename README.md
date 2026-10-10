@@ -1,5 +1,9 @@
 # amc — Apple Music, native and fast
 
+<!-- CI badge (placeholder slug; uncomment + replace once the public owner/repo name is final):
+[![CI](https://github.com/nightly-amc/amc/actions/workflows/ci.yml/badge.svg)](https://github.com/nightly-amc/amc/actions/workflows/ci.yml)
+-->
+
 A lightweight native Apple Music client for Linux (Rust + egui). Goals:
 instant startup, minimal resource use, and the shortest possible path from
 "I want to hear music" to hearing it — mirroring [spotifast]'s philosophy.
