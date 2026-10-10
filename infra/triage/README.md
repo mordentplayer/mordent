@@ -170,7 +170,7 @@ Issues created by the repo's own web-form intake worker are labelled `from-web`
 and titled `[bug] …` / `[feature] …`; the prompt asks for the class to be
 derived from evidence, so those issues still get an independent verdict.
 
-## 5. Provisioning (not done yet — repo is not pushed)
+## 5. Provisioning
 
 The credential is the OpenCode API key (`oc_…`). Source it from the VPS's omp
 store **or** from the OpenCode dashboard, and set it as a repository secret.
@@ -182,15 +182,17 @@ operator's own login.
 omp token opencode-go --raw > /tmp/opencode_cred      # or download from the dashboard
 chmod 600 /tmp/opencode_cred
 gh secret set OPENCODE_CRED --repo sliced-paraiba/mordent < /tmp/opencode_cred
-rm -P /tmp/opencode_cred
+shred -u /tmp/opencode_cred
 
-# Optional guards:
+# Safety switches:
 gh variable set TRIAGE_ALLOWLIST --repo sliced-paraiba/mordent --body "sliced-paraiba"
 gh variable set TRIAGE_DISABLED  --repo sliced-paraiba/mordent --body "true"   # until ready
 ```
 
-`gh auth status` on the ops VPS reports account `sliced-paraiba` with `repo`
-and `workflow` scopes, so `gh secret set` will work once the remote exists.
+The secret is **set** (`OPENCODE_CRED`, 2026-10-10) and both variables exist;
+`TRIAGE_ALLOWLIST=sliced-paraiba`, `TRIAGE_DISABLED=false`. The repo's
+`default_workflow_permissions` was raised from `read` to `write` so the
+`triage-reports` push (and the release job) work.
 
 Recommended: use a **separate, low-budget OpenCode key** for CI so a leak (or a
 runaway loop) can be revoked without touching the operator's key.
@@ -337,11 +339,35 @@ gateway token files, and a filesystem-wide `grep -rEo 'oc_…' /`.
 * `python3 -c yaml.safe_load(...)` on the workflow: parses.
 * `bash -n` and `python3 -m py_compile` on every script: clean.
 
+**(g) Hosted-run verification (GitHub-hosted runner, 2026-10-10).**
+
+Live-fire on the real repo, with `TRIAGE_ALLOWLIST=sliced-paraiba` and
+`TRIAGE_DISABLED=false`:
+
+* Run 1 — https://github.com/sliced-paraiba/mordent/actions/runs/38081570781 —
+  job succeeded but produced **no report**: the gateway container died with
+  `KeyError: 'GW_TOKEN'` because `GW_TOKEN` was a shell variable rather than an
+  exported one, so `docker run -e GW_TOKEN` passed nothing; the health check
+  only warned. Fixed in `f779cd9` (export the token, fail the step when the
+  gateway does not come up, address the gateway by container IP instead of by
+  name).
+* Run 2 — https://github.com/sliced-paraiba/mordent/actions/runs/38081740809 —
+  **success**, all steps green including *Publish report to branch*:
+  * no credential leak: `grep -c "$(omp token opencode-go --raw)"` over
+    `gh run view --log` → **0**; `oc_…`-shaped strings in the logs → **0**; the
+    downloaded artifact (`triage-issue-2`, 1597 B) → **0**.
+  * `triage-reports` branch created at `eb794e6` containing
+    `triage-reports/issue-2.md` — a real analysis of the search-flicker report
+    with `src/ui.rs:811-840`, `:2312-2323`, `:2469-2493` references, the
+    finding that search is Enter-triggered (so the reported per-keystroke
+    mechanism does not exist on `main`), an honest `unverified` verdict, and
+    suggested labels/priority.
+  * artifact `triage-issue-2` uploaded and not expired.
+
+Both smoke-test issues were closed; the `triage-reports` branch is kept.
+
 ## 9. Residual risks / follow-ups
 
-* **Not yet end-to-end on GitHub.** Nothing is pushed and no secret is set.
-  Remaining: create the remote, `gh secret set OPENCODE_CRED`, push, then test
-  with a real issue.
 * **Global flood limit** is not implemented (see §3).
 * **The sandbox has full internet access** (needed for `cargo`). Exfiltration
   of *public* data is therefore possible, but nothing private is reachable.
