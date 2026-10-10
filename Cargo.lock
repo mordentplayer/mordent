@@ -159,8 +159,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "amc"
-version = "0.1.0"
+name = "mordent"
+version = "2026.10.10"
 dependencies = [
  "anyhow",
  "chrono",

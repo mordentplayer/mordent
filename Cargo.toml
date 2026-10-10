@@ -1,7 +1,8 @@
 [package]
-name = "amc"
-version = "0.1.0"
+name = "mordent"
+version = "2026.10.10"
 edition = "2024"
+description = "Mordent — a native, fast Apple Music client"
 
 [dependencies]
 anyhow = "1"

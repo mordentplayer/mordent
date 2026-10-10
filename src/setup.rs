@@ -1,13 +1,13 @@
 //! Guided first-run setup wizard.
 //!
 //! Two entry points, both rendering the same egui wizard:
-//!   * `amc setup` — always starts here (safe to re-run any time).
-//!   * `amc ui` with NO `~/.config/amc/config.toml` — the wizard runs first,
-//!     then the normal app (see `ui::launch`). `AMC_SELFTEST` never enters it.
+//!   * `mordent setup` — always starts here (safe to re-run any time).
+//!   * `mordent ui` with NO `~/.config/mordent/config.toml` — the wizard runs first,
+//!     then the normal app (see `ui::launch`). `MORDENT_SELFTEST` never enters it.
 //!
-//! Debug hook: `AMC_DEMO_SETUP=<1..7>` lands directly on that step (and fires
+//! Debug hook: `MORDENT_DEMO_SETUP=<1..7>` lands directly on that step (and fires
 //! that step's primary async action) for headless screenshots, alongside the
-//! other `AMC_DEMO_*` hooks.
+//! other `MORDENT_DEMO_*` hooks.
 //!
 //! # How the helper scripts are driven
 //!
@@ -19,18 +19,18 @@
 //! pkexec <scripts>/install-wrapper.sh --src <bundle> --port 12340
 //! pkexec <scripts>/login-wrapper.sh --email E --password-file F \
 //!        --port 12340 --twofa-dir <prefix>/rootfs/data
-//! pkexec sh -c 'printf %s "$1" > "$2"' amc-setup-2fa <code> <2fa file>
+//! pkexec sh -c 'printf %s "$1" > "$2"' mordent-setup-2fa <code> <2fa file>
 //! ```
 //!
 //! `pkexec` is invoked BY NAME (PATH lookup), never by an absolute path, so a
 //! fake `pkexec` shim on `PATH` can drive the whole wizard in tests.
-//! `AMC_SETUP_SCRIPTS_DIR` overrides where the scripts are looked up (tests /
-//! unusual bundles); `AMC_SETUP_PREFIX` overrides the helper install prefix.
+//! `MORDENT_SETUP_SCRIPTS_DIR` overrides where the scripts are looked up (tests /
+//! unusual bundles); `MORDENT_SETUP_PREFIX` overrides the helper install prefix.
 //!
 //! pkexec starts the target with a **minimal environment** (the caller's env —
 //! including anything we might set — is discarded), so the Apple ID password
 //! is handed over through a private 0600 temp file named by `--password-file`
-//! rather than `$AMC_WRAPPER_PASSWORD`. The 2FA code is delivered the way
+//! rather than `$MORDENT_WRAPPER_PASSWORD`. The 2FA code is delivered the way
 //! `login-wrapper.sh` expects: written to `<prefix>/rootfs/data/2fa.txt` by a
 //! tiny root shell, since that file lives under a root-owned prefix.
 
@@ -48,7 +48,7 @@ pub const DEFAULT_URL: &str = "http://127.0.0.1:12340";
 /// Default wrapper-lite port.
 pub const DEFAULT_PORT: u16 = 12340;
 /// Default helper install prefix (`install-wrapper.sh --prefix`).
-pub const DEFAULT_PREFIX: &str = "/opt/amc-wrapper";
+pub const DEFAULT_PREFIX: &str = "/opt/mordent-wrapper";
 
 /// Storefront shortcuts offered by the picker (free text stays possible).
 pub const COMMON_STOREFRONTS: &[(&str, &str)] = &[
@@ -147,10 +147,10 @@ pub struct CmdSpec {
     pub envs: Vec<(String, String)>,
 }
 
-/// The helper install prefix (`AMC_SETUP_PREFIX` override, else
+/// The helper install prefix (`MORDENT_SETUP_PREFIX` override, else
 /// [`DEFAULT_PREFIX`]).
 pub fn helper_prefix() -> String {
-    std::env::var("AMC_SETUP_PREFIX").unwrap_or_else(|_| DEFAULT_PREFIX.into())
+    std::env::var("MORDENT_SETUP_PREFIX").unwrap_or_else(|_| DEFAULT_PREFIX.into())
 }
 
 /// `<prefix>/rootfs/data/2fa.txt` — the file `login-wrapper.sh` polls for the
@@ -192,7 +192,7 @@ pub fn install_spec(scripts_dir: &Path, port: u16) -> CmdSpec {
 
 /// `pkexec <scripts>/login-wrapper.sh --email E --password-file F --port P
 ///  --twofa-dir D`. The password travels in a file because pkexec discards the
-/// caller's environment (`$AMC_WRAPPER_PASSWORD` would never arrive).
+/// caller's environment (`$MORDENT_WRAPPER_PASSWORD` would never arrive).
 pub fn login_spec(
     scripts_dir: &Path,
     email: &str,
@@ -220,7 +220,7 @@ pub fn login_spec(
     }
 }
 
-/// `pkexec sh -c 'printf %s "$1" > "$2"' amc-setup-2fa <code> <2fa file>` —
+/// `pkexec sh -c 'printf %s "$1" > "$2"' mordent-setup-2fa <code> <2fa file>` —
 /// the code and path are positional arguments, so neither is ever re-parsed by
 /// a shell.
 pub fn twofa_spec(file: &Path, code: &str) -> CmdSpec {
@@ -230,7 +230,7 @@ pub fn twofa_spec(file: &Path, code: &str) -> CmdSpec {
             "sh".into(),
             "-c".into(),
             r#"printf %s "$1" > "$2""#.into(),
-            "amc-setup-2fa".into(),
+            "mordent-setup-2fa".into(),
             code.to_string(),
             file.to_string_lossy().into_owned(),
         ],
@@ -265,10 +265,10 @@ pub fn find_scripts_dir() -> Option<PathBuf> {
     find_scripts_dir_in(exe_dir, &cwd)
 }
 
-/// Where the helper scripts come from: `AMC_SETUP_SCRIPTS_DIR` when it actually
+/// Where the helper scripts come from: `MORDENT_SETUP_SCRIPTS_DIR` when it actually
 /// contains `install-wrapper.sh`, else the bundle lookup.
 pub fn resolve_scripts_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("AMC_SETUP_SCRIPTS_DIR") {
+    if let Some(dir) = std::env::var_os("MORDENT_SETUP_SCRIPTS_DIR") {
         let dir = PathBuf::from(dir);
         if dir.join("install-wrapper.sh").is_file() {
             return Some(dir);
@@ -475,7 +475,7 @@ fn spawn_proc(
     let handle = Arc::new(Mutex::new(Some(child)));
     let poll = handle.clone();
     std::thread::Builder::new()
-        .name("amc-setup-wait".into())
+        .name("mordent-setup-wait".into())
         .spawn(move || {
             let code = loop {
                 let state = {
@@ -592,7 +592,7 @@ pub struct SetupState {
 
     error: Option<String>,
 
-    /// `AMC_DEMO_SETUP` armed: fire the landing step's async action once.
+    /// `MORDENT_DEMO_SETUP` armed: fire the landing step's async action once.
     demo: bool,
     demo_fired: bool,
 }
@@ -610,7 +610,7 @@ impl SetupState {
         Self::with_step(Step::Welcome, cfg)
     }
 
-    /// `AMC_DEMO_SETUP=<1..7>`: land on a step and fire its async action, for
+    /// `MORDENT_DEMO_SETUP=<1..7>`: land on a step and fire its async action, for
     /// headless screenshots.
     pub fn demo(n: u8, cfg: &Config) -> Self {
         let step = Step::from_number(n).unwrap_or(Step::Welcome);
@@ -814,7 +814,7 @@ impl SetupState {
         self.probe_url = Some(url.clone());
         let tx = self.tx.clone();
         std::thread::Builder::new()
-            .name("amc-setup-probe".into())
+            .name("mordent-setup-probe".into())
             .spawn(move || {
                 let regions = crate::wrapper::Wrapper::new(&url)
                     .regions()
@@ -952,7 +952,7 @@ impl SetupState {
         self.audio_checked = true;
         let tx = self.tx.clone();
         std::thread::Builder::new()
-            .name("amc-setup-audio".into())
+            .name("mordent-setup-audio".into())
             .spawn(move || {
                 let res = rodio::OutputStream::try_default();
                 let (ok, detail) = match res {
@@ -967,7 +967,7 @@ impl SetupState {
     // ---- password staging (0600 temp file, deleted when done) ----
 
     fn pw_path(&self) -> PathBuf {
-        std::env::temp_dir().join(format!("amc-setup-{}-password", std::process::id()))
+        std::env::temp_dir().join(format!("mordent-setup-{}-password", std::process::id()))
     }
 
     fn write_pw_file(&mut self) -> std::io::Result<PathBuf> {
@@ -1154,7 +1154,7 @@ impl SetupState {
         ui.add_space(14.0);
         ui.vertical_centered(|ui| {
             ui.label(
-                egui::RichText::new("amc setup")
+                egui::RichText::new("mordent setup")
                     .size(22.0)
                     .strong()
                     .color(theme.text),
@@ -1231,7 +1231,7 @@ impl SetupState {
     fn welcome_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         step_body(
             ui,
-            "amc plays your Apple Music library natively. Full-quality (lossless) \
+            "Mordent plays your Apple Music library natively. Full-quality (lossless) \
              playback needs a small local decryption helper — pick how you want to \
              set yours up. This takes about two minutes and you can change it later.",
         );
@@ -1243,7 +1243,7 @@ impl SetupState {
         hint(
             ui,
             theme,
-            "Point amc at a helper URL — on this computer, a friend's server, or your own VPS.",
+            "Point Mordent at a helper URL — on this computer, a friend's server, or your own VPS.",
         );
         ui.add_space(10.0);
         if self.local_install_offered() {
@@ -1286,7 +1286,7 @@ impl SetupState {
     fn url_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         step_body(
             ui,
-            "amc talks to a small \"wrapper\" service that decrypts Apple Music audio.",
+            "Mordent talks to a small \"wrapper\" service that decrypts Apple Music audio.",
         );
         hint(
             ui,
@@ -1361,7 +1361,7 @@ impl SetupState {
     fn install_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         step_body(
             ui,
-            "This installs the bundled helper as a system service (amc-wrapper) so it \
+            "This installs the bundled helper as a system service (mordent-wrapper) so it \
              starts with your computer and keeps your Apple session alive. It is a \
              one-time step and needs your admin password.",
         );
@@ -1564,7 +1564,7 @@ impl SetupState {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label("Storefront:");
-            egui::ComboBox::from_id_salt("amc-setup-storefront")
+            egui::ComboBox::from_id_salt("mordent-setup-storefront")
                 .selected_text(self.storefront.to_ascii_uppercase())
                 .show_ui(ui, |ui| {
                     for (code, name) in COMMON_STOREFRONTS {
@@ -1605,7 +1605,7 @@ impl SetupState {
         hint(
             ui,
             theme,
-            "Keeps Recently Played and play counts in sync while amc plays.",
+            "Keeps Recently Played and play counts in sync while Mordent plays.",
         );
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -1619,7 +1619,7 @@ impl SetupState {
     // ---- 6. audio check ----
 
     fn audio_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        step_body(ui, "Checking that amc can open an audio output device.");
+        step_body(ui, "Checking that Mordent can open an audio output device.");
         ui.add_space(12.0);
         match self.audio.clone() {
             Some(Ok(())) => {
@@ -1638,7 +1638,7 @@ impl SetupState {
                 hint(
                     ui,
                     theme,
-                    "amc still runs and tracks advance silently. Plug in / enable an output and restart.",
+                    "Mordent still runs and tracks advance silently. Plug in / enable an output and restart.",
                 );
                 if !detail.is_empty() {
                     hint(ui, theme, &detail);
@@ -1657,7 +1657,7 @@ impl SetupState {
     // ---- 7. finish ----
 
     fn finish_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) -> Action {
-        step_body(ui, "Here is what amc will use. These go to ~/.config/amc/config.toml.");
+        step_body(ui, "Here is what Mordent will use. These go to ~/.config/mordent/config.toml.");
         ui.add_space(10.0);
         let token = if self.media_token.trim().is_empty() {
             "not set".to_string()
@@ -1699,7 +1699,7 @@ impl SetupState {
             {
                 self.back();
             }
-            hint(ui, theme, "  re-run any time with:  amc setup");
+            hint(ui, theme, "  re-run any time with:  mordent setup");
         });
         action
     }
@@ -1715,7 +1715,7 @@ mod tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "amc-setup-test-{}-{tag}-{}",
+            "mordent-setup-test-{}-{tag}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn bundle_dir_is_the_scripts_parent() {
-        assert_eq!(bundle_dir(Path::new("/opt/amc/scripts")), PathBuf::from("/opt/amc"));
+        assert_eq!(bundle_dir(Path::new("/opt/mordent/scripts")), PathBuf::from("/opt/mordent"));
         assert_eq!(bundle_dir(Path::new("scripts")), PathBuf::from("."));
     }
 
@@ -1827,7 +1827,7 @@ mod tests {
 
     #[test]
     fn parse_base_url_takes_the_last_http_line() {
-        let out = "[amc-install] starting\nhttp://127.0.0.1:12340\nnoise trailing\n";
+        let out = "[mordent-install] starting\nhttp://127.0.0.1:12340\nnoise trailing\n";
         assert_eq!(parse_base_url(out).unwrap(), "http://127.0.0.1:12340");
         assert_eq!(
             parse_base_url("https://box:12340/\n").unwrap(),
@@ -1841,12 +1841,12 @@ mod tests {
     #[test]
     fn twofa_line_detection() {
         assert!(line_needs_twofa(
-            "[amc-login] waiting up to 300s for the code"
+            "[mordent-login] waiting up to 300s for the code"
         ));
         assert!(line_needs_twofa("Enter your 2FA code into /data/2fa.txt"));
         assert!(line_needs_twofa("two-factor authentication required"));
-        assert!(!line_needs_twofa("[amc-login] stopping amc-wrapper for login"));
-        assert!(!line_needs_twofa("[amc-install] installing wrapper-lite"));
+        assert!(!line_needs_twofa("[mordent-login] stopping mordent-wrapper for login"));
+        assert!(!line_needs_twofa("[mordent-install] installing wrapper-lite"));
     }
 
     // ---- process specs: exact argv, program looked up by name ----
@@ -1890,24 +1890,24 @@ mod tests {
                 "--port",
                 "12340",
                 "--twofa-dir",
-                "/opt/amc-wrapper/rootfs/data",
+                "/opt/mordent-wrapper/rootfs/data",
             ]
         );
         assert!(
-            s.envs.iter().all(|(k, _)| k != "AMC_WRAPPER_PASSWORD"),
+            s.envs.iter().all(|(k, _)| k != "MORDENT_WRAPPER_PASSWORD"),
             "pkexec discards the environment, so the password must not ride in it"
         );
     }
 
     #[test]
     fn twofa_spec_writes_the_polled_file() {
-        let s = twofa_spec(Path::new("/opt/amc-wrapper/rootfs/data/2fa.txt"), "123456");
+        let s = twofa_spec(Path::new("/opt/mordent-wrapper/rootfs/data/2fa.txt"), "123456");
         assert_eq!(s.program, "pkexec");
         assert_eq!(s.args[0], "sh");
         assert_eq!(s.args[1], "-c");
         assert!(s.args[2].contains("printf"));
         assert_eq!(s.args[4], "123456");
-        assert_eq!(s.args[5], "/opt/amc-wrapper/rootfs/data/2fa.txt");
+        assert_eq!(s.args[5], "/opt/mordent-wrapper/rootfs/data/2fa.txt");
         // no shell interpolation of the code: it is a positional $1
         assert!(!s.args[2].contains("123456"));
     }
@@ -1915,8 +1915,8 @@ mod tests {
     #[test]
     fn twofa_file_layout() {
         assert_eq!(
-            twofa_file("/opt/amc-wrapper"),
-            PathBuf::from("/opt/amc-wrapper/rootfs/data/2fa.txt")
+            twofa_file("/opt/mordent-wrapper"),
+            PathBuf::from("/opt/mordent-wrapper/rootfs/data/2fa.txt")
         );
     }
 
@@ -2078,7 +2078,7 @@ mod tests {
     fn runner_reports_missing_program() {
         let (tx, _rx) = channel();
         let spec = CmdSpec {
-            program: "amc-definitely-not-a-program-xyz".into(),
+            program: "mordent-definitely-not-a-program-xyz".into(),
             args: vec![],
             envs: vec![],
         };

@@ -86,7 +86,7 @@ impl Prefetcher {
             let cfg = cfg.clone();
             let sh = Arc::clone(&sh);
             let _ = std::thread::Builder::new()
-                .name("amc-prefetch".into())
+                .name("mordent-prefetch".into())
                 .spawn(move || worker(cfg, sh));
         }
         Self { sh, enabled }
@@ -271,7 +271,7 @@ mod tests {
     use crate::config::Config;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("amc-prefetch-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("mordent-prefetch-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

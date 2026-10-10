@@ -180,7 +180,7 @@ impl rodio::Source for PacketSource {
 ///
 /// The UI no longer uses this — playback runs on the supervisor thread
 /// (`supervisor.rs`), which talks to rodio directly. `Player` stays for the
-/// CLI paths (`amc play`, and its `PacketSource` for `amc decrypt`/decode).
+/// CLI paths (`mordent play`, and its `PacketSource` for `mordent decrypt`/decode).
 #[derive(Clone)]
 pub struct Player {
     inner: Rc<Inner>,

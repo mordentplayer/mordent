@@ -1,4 +1,4 @@
-//! MPRIS2 (`org.mpris.MediaPlayer2.amc`): desktop media controls — GNOME/KDE
+//! MPRIS2 (`org.mpris.MediaPlayer2.mordent`): desktop media controls — GNOME/KDE
 //! media bar, lock screen, `playerctl`, media keys.
 //!
 //! Shape: the UI thread publishes a small [`Snapshot`] of playback state into
@@ -18,7 +18,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use zbus::zvariant::{Array, ObjectPath, Value};
 
-pub const NAME: &str = "org.mpris.MediaPlayer2.amc";
+pub const NAME: &str = "org.mpris.MediaPlayer2.mordent";
 const PATH: &str = "/org/mpris/MediaPlayer2";
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
@@ -360,12 +360,12 @@ impl Root {
 
     #[zbus(property)]
     fn identity(&self) -> String {
-        "amc".to_string()
+        "Mordent".to_string()
     }
 
     #[zbus(property)]
     fn desktop_entry(&self) -> String {
-        "amc".to_string()
+        "mordent".to_string()
     }
 
     #[zbus(property)]

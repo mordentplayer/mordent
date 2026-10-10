@@ -28,7 +28,7 @@ impl Default for Config {
             storefront: "us".into(),
             wrapper_url: "http://127.0.0.1:12340".into(),
             media_user_token: None,
-            cache_dir: home().join(".cache/amc"),
+            cache_dir: home().join(".cache/mordent"),
             report_plays: true,
             cache_size_gb: 10,
         }
@@ -40,10 +40,10 @@ pub fn home() -> PathBuf {
 }
 
 fn config_path() -> PathBuf {
-    home().join(".config/amc/config.toml")
+    home().join(".config/mordent/config.toml")
 }
 
-/// Path of the user config file (`~/.config/amc/config.toml`).
+/// Path of the user config file (`~/.config/mordent/config.toml`).
 pub fn config_file() -> PathBuf {
     config_path()
 }
@@ -55,7 +55,7 @@ pub fn config_exists() -> bool {
 }
 
 impl Config {
-    /// Load from `~/.config/amc/config.toml`, creating a default file if absent.
+    /// Load from `~/.config/mordent/config.toml`, creating a default file if absent.
     pub fn load() -> Result<Self> {
         let path = config_path();
         if !path.exists() {
@@ -81,7 +81,7 @@ impl Config {
 
 fn default_toml(cfg: &Config) -> String {
     format!(
-        "# amc configuration\n\
+        "# Mordent configuration\n\
          storefront = \"{}\"\n\
          wrapper_url = \"{}\"\n\
          media_user_token = \"\"\n\
@@ -133,7 +133,7 @@ pub fn merge_config_toml(existing: Option<&str>, cfg: &Config) -> Result<String>
     table.insert("cache_size_gb".into(), (cfg.cache_size_gb as i64).into());
 
     let mut out = String::from(
-        "# amc configuration — written by the setup wizard (`amc setup`).\n\
+        "# Mordent configuration — written by the setup wizard (`mordent setup`).\n\
          # Keys not listed here are preserved as-is across writes.\n",
     );
     for key in KNOWN_KEYS {
@@ -189,7 +189,7 @@ pub fn write_config_at(path: &Path, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Write `cfg` to the default `~/.config/amc/config.toml` location.
+/// Write `cfg` to the default `~/.config/mordent/config.toml` location.
 pub fn write_config(cfg: &Config) -> Result<()> {
     write_config_at(&config_path(), cfg)
 }
@@ -245,7 +245,7 @@ mod wizard_write_tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "amc-config-test-{}-{tag}-{}",
+            "mordent-config-test-{}-{tag}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -261,7 +261,7 @@ mod wizard_write_tests {
             storefront: "de".into(),
             wrapper_url: "http://music-box.local:12340".into(),
             media_user_token: Some("tok".into()),
-            cache_dir: PathBuf::from("/tmp/amc-cache"),
+            cache_dir: PathBuf::from("/tmp/mordent-cache"),
             report_plays: false,
             cache_size_gb: 7,
         }
@@ -273,7 +273,7 @@ mod wizard_write_tests {
         assert!(text.contains("storefront = \"de\""));
         assert!(text.contains("wrapper_url = \"http://music-box.local:12340\""));
         assert!(text.contains("media_user_token = \"tok\""));
-        assert!(text.contains("cache_dir = \"/tmp/amc-cache\""));
+        assert!(text.contains("cache_dir = \"/tmp/mordent-cache\""));
         assert!(text.contains("report_plays = false"));
         assert!(text.contains("cache_size_gb = 7"));
         // round-trips through the real parser

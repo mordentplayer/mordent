@@ -38,7 +38,7 @@
 //! the transitions that produce them; the pure pause/scrub decisions
 //! (`applied_source_pause_state`, `seek_scrub_events`) moved with them,
 //! unit-tested in this file. Decode-only mode (no audio device) runs the same
-//! state machine on a fake clock — that is the AMC_SELFTEST path.
+//! state machine on a fake clock — that is the MORDENT_SELFTEST path.
 //!
 //! The supervisor also drains the MPRIS command receiver, so media keys work
 //! while the window is hidden or the frame loop is parked.
@@ -404,7 +404,7 @@ impl Sup {
 
     // ---- Apple play reporting (moved from App verbatim) ----
 
-    /// play-mode triple from the current repeat/shuffle state (amc has no
+    /// play-mode triple from the current repeat/shuffle state (Mordent has no
     /// autoplay-after-queue feature → auto 1).
     fn play_mode(&self) -> crate::api::PlayMode {
         crate::api::PlayMode {
@@ -994,7 +994,7 @@ struct RealFx {
     tx: Sender<Command>,
     ui_tx: Sender<String>,
     ctx: egui::Context,
-    /// `AMC_NO_REPAINT=1` debug hook: suppress ALL repaint requests so the
+    /// `MORDENT_NO_REPAINT=1` debug hook: suppress ALL repaint requests so the
     /// frame loop stays parked on an unfocused window — the decoupling proof
     /// that playback still advances with the UI effectively stopped.
     /// Playback/advance/reporting here do not depend on it at all.
@@ -1083,7 +1083,7 @@ pub fn spawn(
     let snap_thread = snap.clone();
     let tx_thread = tx.clone();
     let spawned = std::thread::Builder::new()
-        .name("amc-supervisor".into())
+        .name("mordent-supervisor".into())
         .spawn(move || {
             run_thread(
                 cfg, queue, snap_thread, repeat, volume, ctx, no_repaint, mpris_rx, prefetch,
@@ -1092,7 +1092,7 @@ pub fn spawn(
         });
     if let Err(e) = spawned {
         // No supervisor = no playback at all; loud failure beats silence.
-        panic!("spawn amc-supervisor thread: {e}");
+        panic!("spawn mordent-supervisor thread: {e}");
     }
     (tx, snap, ui_rx)
 }

@@ -279,7 +279,7 @@ impl ProgressiveSource {
     fn shared_discard() -> Result<Arc<Mutex<Shared>>> {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "amc-prefetch-{}-{}.m4a",
+            "mordent-prefetch-{}-{}.m4a",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
@@ -361,7 +361,7 @@ impl ProgressiveSource {
         let wcv = cv.clone();
         let wcancel = Arc::clone(&cancel);
         let url = url.to_string();
-        std::thread::Builder::new().name("amc-fetch".into()).spawn(move || {
+        std::thread::Builder::new().name("mordent-fetch".into()).spawn(move || {
             let run = || -> Result<()> {
                 let resp = agent.get(&url).call().with_context(|| format!("GET {url}"))?;
                 let mut buf = [0u8; 64 * 1024];
@@ -560,7 +560,7 @@ impl ProgressiveSource {
             None => None,
         };
 
-        std::thread::Builder::new().name("amc-fetch".into()).spawn(move || {
+        std::thread::Builder::new().name("mordent-fetch".into()).spawn(move || {
             let mut run = || -> Result<()> {
                 let resp = agent.get(&media_url).call().context("GET media file")?;
                 let mut r = BufReader::new(resp.into_reader());
@@ -622,7 +622,7 @@ impl ProgressiveSource {
         let media = entry.media.clone();
         let dir = entry.dir.clone();
 
-        std::thread::Builder::new().name("amc-cache".into()).spawn(move || {
+        std::thread::Builder::new().name("mordent-cache".into()).spawn(move || {
             let run = || -> Result<()> {
                 let f = std::fs::File::open(&media)?;
                 let mut r = BufReader::new(f);

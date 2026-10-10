@@ -245,7 +245,7 @@ impl ErrorToast {
     }
 }
 
-/// UI settings persisted to ~/.config/amc/state.toml (atomic write).
+/// UI settings persisted to ~/.config/mordent/state.toml (atomic write).
 #[derive(Serialize, Deserialize, Default)]
 struct UiState {
     volume: Option<f32>,
@@ -258,7 +258,7 @@ struct UiState {
 }
 
 fn state_path() -> std::path::PathBuf {
-    crate::config::home().join(".config/amc/state.toml")
+    crate::config::home().join(".config/mordent/state.toml")
 }
 
 fn load_state() -> UiState {
@@ -340,7 +340,7 @@ fn wake_thread_sleep(ms: u64) -> Option<std::time::Duration> {
     (ms != WAKE_PARKED).then(|| std::time::Duration::from_millis(ms.max(1)))
 }
 
-/// Permanent off-frame wake thread ("amc-wake"). `update`'s in-frame
+/// Permanent off-frame wake thread ("mordent-wake"). `update`'s in-frame
 /// `request_repaint_after` is kept (correct and zero-cost when frames flow),
 /// but it can only speak from INSIDE a frame: on Wayland a redraw withheld
 /// for an unfocused window (niri-family compositors stop delivering them)
@@ -352,7 +352,7 @@ fn wake_thread_sleep(ms: u64) -> Option<std::time::Duration> {
 /// unfocused. Lives until process exit, like the mpris/prefetch threads.
 fn spawn_wake_thread(ctx: egui::Context, wake_ms: Arc<AtomicU64>) {
     std::thread::Builder::new()
-        .name("amc-wake".into())
+        .name("mordent-wake".into())
         .spawn(move || loop {
             match wake_thread_sleep(wake_ms.load(Ordering::Relaxed)) {
                 None => std::thread::sleep(std::time::Duration::from_secs(1)),
@@ -364,7 +364,7 @@ fn spawn_wake_thread(ctx: egui::Context, wake_ms: Arc<AtomicU64>) {
                 }
             }
         })
-        .expect("spawn amc-wake thread");
+        .expect("spawn mordent-wake thread");
 }
 
 pub struct App {
@@ -402,8 +402,8 @@ pub struct App {
     playlists_loading: bool,
     playlists_next: Option<u32>,
     playlist_modal: Option<PlaylistModal>,
-    /// AMC_DEMO_PLAYLIST=<n>: open the n-th playlist once the list loads
-    /// (headless screenshot hook, alongside AMC_DEMO_VIEW).
+    /// MORDENT_DEMO_PLAYLIST=<n>: open the n-th playlist once the list loads
+    /// (headless screenshot hook, alongside MORDENT_DEMO_VIEW).
     demo_playlist: Option<usize>,
     /// Non-consuming queue + pointer to the current entry (see queuemodel),
     /// SHARED with the playback supervisor: the UI mutates list content under
@@ -437,11 +437,11 @@ pub struct App {
     cheatsheet: bool,
     /// Sleep timer deadline (pauses playback when it fires).
     sleep_at: Option<(std::time::Instant, std::time::Duration)>,
-    /// AMC_SELFTEST=1: drive play_now/queue/auto-advance deterministically
+    /// MORDENT_SELFTEST=1: drive play_now/queue/auto-advance deterministically
     /// and print SELFTEST PASS/FAIL (headless CI aid).
     selftest: Option<SelftestState>,
     volume: f32,
-    /// Active theme (built-in defaults + `~/.config/amc/theme.toml`).
+    /// Active theme (built-in defaults + `~/.config/mordent/theme.toml`).
     theme: Theme,
     /// (mtime, size) of theme.toml at last load; `None` when the file is absent.
     theme_stamp: Option<(std::time::SystemTime, u64)>,
@@ -470,9 +470,9 @@ pub struct App {
     /// Supervisor → UI errors (play-worker failures) for the toast.
     sup_rx: Receiver<String>,
     /// Desired next-wake delay in millis, published by `update` every frame
-    /// and read by the "amc-wake" thread (`WAKE_PARKED` = fully idle).
+    /// and read by the "mordent-wake" thread (`WAKE_PARKED` = fully idle).
     wake_ms: Arc<AtomicU64>,
-    /// `AMC_NO_REPAINT=1` debug hook: suppress ALL repaint requests (in-frame
+    /// `MORDENT_NO_REPAINT=1` debug hook: suppress ALL repaint requests (in-frame
     /// driver + wake thread + supervisor wakes) so `update` effectively stops
     /// being scheduled — the decoupling proof that playback still advances.
     no_repaint: bool,
@@ -491,14 +491,14 @@ pub struct App {
     shuffle_seen: bool,
     /// One-shot "decode-only" log flag (the supervisor owns the real state).
     decode_logged: bool,
-    /// AMC_SELFTEST: does the wrapper serve cacheable CDN streams? Probed
+    /// MORDENT_SELFTEST: does the wrapper serve cacheable CDN streams? Probed
     /// once on a background thread (blocking HTTP must never run on the UI
     /// thread — under the supervisor's parallel fetches it can stall for
     /// seconds and freeze the frame loop).
     wrapper_cacheable: Arc<std::sync::atomic::AtomicBool>,
     /// First-run setup wizard; `Some` while the wizard owns the window (see
-    /// setup.rs). Started by `amc setup`, or by `amc ui` when no config.toml
-    /// existed at launch. Never under AMC_SELFTEST; `AMC_DEMO_SETUP=<1..7>`
+    /// setup.rs). Started by `mordent setup`, or by `mordent ui` when no config.toml
+    /// existed at launch. Never under MORDENT_SELFTEST; `MORDENT_DEMO_SETUP=<1..7>`
     /// lands directly on a step (headless screenshot hook).
     setup: Option<crate::setup::SetupState>,
 }
@@ -516,15 +516,15 @@ impl App {
             Some("one") => Repeat::One,
             _ => Repeat::Off,
         };
-        // AMC_NO_REPAINT=1 debug hook: suppress ALL repaint requests (see the
-        // field doc). Meaningless together with AMC_SELFTEST (whose stage
+        // MORDENT_NO_REPAINT=1 debug hook: suppress ALL repaint requests (see the
+        // field doc). Meaningless together with MORDENT_SELFTEST (whose stage
         // machine needs frames) — the selftest wins, this flag is ignored.
-        let no_repaint = std::env::var("AMC_NO_REPAINT").is_ok()
-            && std::env::var("AMC_SELFTEST").is_err();
+        let no_repaint = std::env::var("MORDENT_NO_REPAINT").is_ok()
+            && std::env::var("MORDENT_SELFTEST").is_err();
         if no_repaint {
             eprintln!(
-                "[no-repaint] AMC_NO_REPAINT=1: every repaint request is suppressed \
-                 (in-frame driver, amc-wake thread, supervisor wakes) — the UI stops \
+                "[no-repaint] MORDENT_NO_REPAINT=1: every repaint request is suppressed \
+                 (in-frame driver, mordent-wake thread, supervisor wakes) — the UI stops \
                  being scheduled after the initial frames; playback must not care"
             );
         }
@@ -540,7 +540,7 @@ impl App {
         let queue = Arc::new(parking_lot::Mutex::new(Queue::default()));
         // Mirrored window visibility (✕/tray/MPRIS Raise keep it in sync).
         let hidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // AMC_SELFTEST wrapper probe result (filled on a background thread —
+        // MORDENT_SELFTEST wrapper probe result (filled on a background thread —
         // blocking HTTP must never run on the UI thread).
         let wrapper_cacheable = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cfg_probe = cfg.clone();
@@ -548,18 +548,18 @@ impl App {
         // The playback supervisor owns audio + the advance state machine.
         // The selftest pins repeat-off for its deterministic assertions (the
         // queue-model stage relies on natural advance moving on).
-        let selftest = std::env::var("AMC_SELFTEST").is_ok();
+        let selftest = std::env::var("MORDENT_SELFTEST").is_ok();
         // The selftest stage machine asserts on REAL search results, so it is
         // meaningless without a query. Fail loudly and immediately instead of
         // sitting idle until the (minutes-later) per-stage timeout.
         if selftest
-            && std::env::var("AMC_DEMO_TERM")
+            && std::env::var("MORDENT_DEMO_TERM")
                 .map(|t| t.trim().is_empty())
                 .unwrap_or(true)
         {
             eprintln!(
-                "[selftest] no AMC_DEMO_TERM set — selftest needs a search query \
-                 (e.g. AMC_DEMO_TERM=\"daft punk\"); exiting"
+                "[selftest] no MORDENT_DEMO_TERM set — selftest needs a search query \
+                 (e.g. MORDENT_DEMO_TERM=\"daft punk\"); exiting"
             );
             std::process::exit(2);
         }
@@ -585,11 +585,11 @@ impl App {
         );
         // Parked sentinel until the first frame publishes a real delay.
         let wake_ms = Arc::new(AtomicU64::new(WAKE_PARKED));
-        // First-run wizard. AMC_SELFTEST never enters it; AMC_DEMO_SETUP=<1..7>
+        // First-run wizard. MORDENT_SELFTEST never enters it; MORDENT_DEMO_SETUP=<1..7>
         // lands straight on a step (headless screenshot hook).
         let setup = if selftest {
             None
-        } else if let Ok(n) = std::env::var("AMC_DEMO_SETUP") {
+        } else if let Ok(n) = std::env::var("MORDENT_DEMO_SETUP") {
             Some(crate::setup::SetupState::demo(
                 n.trim().parse().unwrap_or(1),
                 &cfg,
@@ -619,7 +619,7 @@ impl App {
             playlists_loading: false,
             playlists_next: None,
             playlist_modal: None,
-            demo_playlist: std::env::var("AMC_DEMO_PLAYLIST")
+            demo_playlist: std::env::var("MORDENT_DEMO_PLAYLIST")
                 .ok()
                 .and_then(|s| s.parse().ok()),
             queue,
@@ -653,7 +653,7 @@ impl App {
             font: FontChoice::Default,
             // invalid theme keys are surfaced once through the toast
             error: theme_warns.first().map(|w| ErrorToast::new(w.clone())),
-            last_title: "amc".into(),
+            last_title: "Mordent".into(),
             mpris,
             prefetch,
             rx,
@@ -676,7 +676,7 @@ impl App {
         app.spawn_wrapper_check();
         if selftest {
             std::thread::Builder::new()
-                .name("amc-wrapper-probe".into())
+                .name("mordent-wrapper-probe".into())
                 .spawn(move || {
                     let cacheable = crate::wrapper::Wrapper::new(&cfg_probe.wrapper_url)
                         .regions()
@@ -711,37 +711,37 @@ impl App {
             // spawned with Repeat::Off above).
             eprintln!("[selftest] armed (repeat forced off)");
         }
-        // headless verification hooks: AMC_DEMO_TERM=<query> auto-searches,
-        // AMC_DEMO_VIEW=library|albums|favorites|playlists opens that view
-        // ("albums" = the Search view's Albums sub-view), AMC_DEMO_QUEUE=1
+        // headless verification hooks: MORDENT_DEMO_TERM=<query> auto-searches,
+        // MORDENT_DEMO_VIEW=library|albums|favorites|playlists opens that view
+        // ("albums" = the Search view's Albums sub-view), MORDENT_DEMO_QUEUE=1
         // opens the queue panel.
-        if let Ok(term) = std::env::var("AMC_DEMO_TERM") {
+        if let Ok(term) = std::env::var("MORDENT_DEMO_TERM") {
             app.search = term;
             app.spawn_search();
         }
-        if std::env::var("AMC_DEMO_QUEUE").is_ok() {
+        if std::env::var("MORDENT_DEMO_QUEUE").is_ok() {
             app.show_queue = true;
         }
-        // AMC_DEMO_LYRICS=1: open the lyrics panel (headless screenshot hook;
-        // pairs with AMC_DEMO_PLAY so the karaoke highlight has a position).
-        if std::env::var("AMC_DEMO_LYRICS").is_ok() {
+        // MORDENT_DEMO_LYRICS=1: open the lyrics panel (headless screenshot hook;
+        // pairs with MORDENT_DEMO_PLAY so the karaoke highlight has a position).
+        if std::env::var("MORDENT_DEMO_LYRICS").is_ok() {
             app.show_lyrics = true;
         }
-        // AMC_DEMO_PLAY=<n>: frame-INDEPENDENT headless play hook. Searches
-        // AMC_DEMO_TERM (default "daft punk"), queues tracks n..n+3 and plays
+        // MORDENT_DEMO_PLAY=<n>: frame-INDEPENDENT headless play hook. Searches
+        // MORDENT_DEMO_TERM (default "daft punk"), queues tracks n..n+3 and plays
         // track n via the supervisor command channel — deliberately not tied
-        // to poll_messages, so AMC_NO_REPAINT runs (whose frame loop stops
+        // to poll_messages, so MORDENT_NO_REPAINT runs (whose frame loop stops
         // being scheduled) still start playback and exercise natural advance.
-        if let Some(n) = std::env::var("AMC_DEMO_PLAY")
+        if let Some(n) = std::env::var("MORDENT_DEMO_PLAY")
             .ok()
             .and_then(|s| s.parse().ok())
         {
             let cfg = app.cfg.clone();
             let cmd = app.cmd.clone();
             let queue = app.queue.clone();
-            let term = std::env::var("AMC_DEMO_TERM").unwrap_or_else(|_| "daft punk".into());
+            let term = std::env::var("MORDENT_DEMO_TERM").unwrap_or_else(|_| "daft punk".into());
             std::thread::Builder::new()
-                .name("amc-demo-play".into())
+                .name("mordent-demo-play".into())
                 .spawn(move || {
                     let Ok(api) = Api::new(cfg) else { return };
                     let Ok(res) = api.search(&term, 30) else { return };
@@ -759,20 +759,20 @@ impl App {
                         close: 0,
                     });
                 })
-                .expect("spawn amc-demo-play thread");
+                .expect("spawn mordent-demo-play thread");
         }
-        // AMC_DEMO_CLOSE=1: simulate a WM close request
+        // MORDENT_DEMO_CLOSE=1: simulate a WM close request
         // (`ViewportCommand::Close` → `close_requested()` on the next frame) so
         // the window-close policy is testable headlessly. Together with
-        // AMC_DEMO_PLAY the request waits until a track is current — otherwise
+        // MORDENT_DEMO_PLAY the request waits until a track is current — otherwise
         // playback would race the close and the idle branch would win; alone it
         // fires after a short delay that lets the window map.
-        if std::env::var("AMC_DEMO_CLOSE").is_ok() {
+        if std::env::var("MORDENT_DEMO_CLOSE").is_ok() {
             let ctx = egui_ctx.clone();
             let pb = app.pb.clone();
-            let wait_for_play = std::env::var("AMC_DEMO_PLAY").is_ok();
+            let wait_for_play = std::env::var("MORDENT_DEMO_PLAY").is_ok();
             std::thread::Builder::new()
-                .name("amc-demo-close".into())
+                .name("mordent-demo-close".into())
                 .spawn(move || {
                     if wait_for_play {
                         let deadline =
@@ -794,9 +794,9 @@ impl App {
                     );
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 })
-                .expect("spawn amc-demo-close thread");
+                .expect("spawn mordent-demo-close thread");
         }
-        match std::env::var("AMC_DEMO_VIEW").as_deref() {
+        match std::env::var("MORDENT_DEMO_VIEW").as_deref() {
             Ok("library") => app.switch_view(View::Library),
             Ok("albums") => app.search_sub = SearchSub::Albums,
             Ok("favorites") => app.switch_view(View::Favorites),
@@ -1001,7 +1001,7 @@ impl App {
         let url = self.cfg.wrapper_url.clone();
         let tx = self.tx.clone();
         std::thread::Builder::new()
-            .name("amc-wrapper-check".into())
+            .name("mordent-wrapper-check".into())
             .spawn(move || {
                 if !probe_wrapper_reachable(&url) {
                     let _ = tx.send(Msg::Notice(wrapper_down_hint(&url)));
@@ -1013,9 +1013,9 @@ impl App {
     /// Render the first-run wizard and act on its outcome. Called INSTEAD of
     /// the normal UI while `self.setup` is `Some` (see `update`).
     fn setup_screen(&mut self, ctx: &egui::Context) {
-        if self.last_title != "amc — setup" {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title("amc — setup".into()));
-            self.last_title = "amc — setup".into();
+        if self.last_title != "Mordent — setup" {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title("Mordent — setup".into()));
+            self.last_title = "Mordent — setup".into();
         }
         let theme = self.theme;
         let mut action = crate::setup::Action::None;
@@ -1091,7 +1091,7 @@ impl App {
         let cfg = self.cfg.clone();
         let tx = self.tx.clone();
         std::thread::Builder::new()
-            .name("amc-lyrics".into())
+            .name("mordent-lyrics".into())
             .spawn(move || {
                 let result = lyrics::fetch(&cfg, &song, true).map_err(|e| format!("{e:#}"));
                 // one `[lyrics]` line per track: the headless evidence that the
@@ -1656,7 +1656,7 @@ impl App {
         }
     }
 
-    // ---- deterministic selftest (AMC_SELFTEST=1) ----
+    // ---- deterministic selftest (MORDENT_SELFTEST=1) ----
 
     // Selftest observation helpers (snapshot/queue reads that interleave
     // with &mut self actions inside the stage machine).
@@ -2083,7 +2083,7 @@ impl App {
         }
     }
 
-    /// Re-apply the theme when `~/.config/amc/theme.toml` changes. The poll is
+    /// Re-apply the theme when `~/.config/mordent/theme.toml` changes. The poll is
     /// throttled to about once a second (a stat, not a parse) so it stays cheap
     /// even though `update` runs every frame; the theme is (re)applied on the
     /// first frame and whenever the file's identity changes.
@@ -2263,8 +2263,8 @@ impl eframe::App for App {
 
         // ---- window title ----
         let title = match &self.now {
-            Some(t) => format!("amc — {} — {}", t.name, t.artist),
-            None => "amc".to_string(),
+            Some(t) => format!("Mordent — {} — {}", t.name, t.artist),
+            None => "Mordent".to_string(),
         };
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -2276,7 +2276,7 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("amc").strong());
+                ui.label(egui::RichText::new("Mordent").strong());
                 ui.add_space(4.0);
                 if ui
                     .selectable_label(self.view == View::Search, "Search")
@@ -2416,12 +2416,12 @@ impl eframe::App for App {
         if let Some(delay) = next_delay {
             ctx.request_repaint_after(delay);
         }
-        // Mirror the delay to the off-frame wake thread ("amc-wake"): the
+        // Mirror the delay to the off-frame wake thread ("mordent-wake"): the
         // in-frame request above only fires while frames are flowing, so a
         // compositor that stops redrawing an unfocused window (Wayland /
         // niri-family frame-callback throttle) would silence it permanently.
         // The thread re-issues the wake off-frame; when parked it sleeps ~1s
-        // and requests nothing. Under AMC_NO_REPAINT the thread does not
+        // and requests nothing. Under MORDENT_NO_REPAINT the thread does not
         // exist and this request is skipped — the frame loop genuinely parks.
         if !self.no_repaint {
             self.wake_ms
@@ -3816,7 +3816,7 @@ fn hex_color(hex: &str) -> Option<egui::Color32> {
 /// `GET {wrapper_url}/status` with a generous 5 s budget — a remote/tunnel
 /// wrapper can be legitimately slow, so the startup hint only fires on a real
 /// failure (connect/HTTP/timeout error), never a slow-but-alive one. Runs on
-/// the `amc-wrapper-check` startup thread, never the UI thread.
+/// the `mordent-wrapper-check` startup thread, never the UI thread.
 pub(crate) fn probe_wrapper_reachable(url: &str) -> bool {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(5))
@@ -3836,12 +3836,12 @@ pub(crate) fn wrapper_down_hint(url: &str) -> String {
         format!(
             "wrapper not reachable at {url} — start it \
              (sudo ./wrapper-lite --host 127.0.0.1 --port 12340), set a remote \
-             URL in ~/.config/amc/config.toml, or re-run `amc setup`"
+             URL in ~/.config/mordent/config.toml, or re-run `mordent setup`"
         )
     } else {
         format!(
             "wrapper at {url} isn't responding — is the host up / tunnel connected? \
-             (re-point amc with `amc setup`)"
+             (re-point Mordent with `mordent setup`)"
         )
     }
 }
@@ -3926,7 +3926,7 @@ pub fn launch(cfg: Config) -> anyhow::Result<()> {
     launch_with(cfg, false)
 }
 
-/// `amc setup`: open the UI already inside the first-run wizard, whatever the
+/// `mordent setup`: open the UI already inside the first-run wizard, whatever the
 /// config situation (this is the entry point for re-running setup).
 pub fn launch_setup(cfg: Config) -> anyhow::Result<()> {
     launch_with(cfg, true)
@@ -3949,7 +3949,7 @@ fn launch_with(cfg: Config, start_wizard: bool) -> anyhow::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "amc",
+        "mordent",
         native,
         // Fonts are bundled (`src/fonts.rs`, `include_bytes!`) and installed
         // by the first `App::poll_theme`: nothing is read from the filesystem,
@@ -4083,8 +4083,8 @@ mod wrapper_hint_tests {
             assert!(hint.contains("not reachable at"), "{hint}");
             assert!(hint.contains(url.trim_end_matches('/')), "{hint}");
             assert!(hint.contains("start it"), "{hint}");
-            assert!(hint.contains("~/.config/amc/config.toml"), "{hint}");
-            assert!(hint.contains("amc setup"), "{hint}");
+            assert!(hint.contains("~/.config/mordent/config.toml"), "{hint}");
+            assert!(hint.contains("mordent setup"), "{hint}");
         }
     }
 
@@ -4099,7 +4099,7 @@ mod wrapper_hint_tests {
             let hint = wrapper_down_hint(url);
             assert!(hint.contains("isn't responding"), "{hint}");
             assert!(hint.contains("tunnel connected"), "{hint}");
-            assert!(hint.contains("amc setup"), "{hint}");
+            assert!(hint.contains("mordent setup"), "{hint}");
             assert!(!hint.contains("start it"), "{hint}");
         }
     }

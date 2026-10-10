@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn meta_roundtrip_through_disk() {
-        let dir = std::env::temp_dir().join(format!("amc-meta-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mordent-meta-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = Config {
             cache_dir: dir.clone(),
@@ -1466,7 +1466,7 @@ mod tests {
 
     #[test]
     fn meta_future_and_malformed_headers_never_served_fresh() {
-        let dir = std::env::temp_dir().join(format!("amc-meta-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mordent-meta-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = Config {
             cache_dir: dir.clone(),
@@ -1517,7 +1517,7 @@ mod tests {
     /// `take_notice` (visible staleness).
     #[test]
     fn no_cache_on_4xx_and_stale_serve_is_flagged() {
-        let dir = std::env::temp_dir().join(format!("amc-meta-4xx-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mordent-meta-4xx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = Config {
             cache_dir: dir.clone(),
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn auth_error_message_points_at_the_media_user_token() {
-        let dir = std::env::temp_dir().join(format!("amc-meta-auth-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mordent-meta-auth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let with_token = Config {
             cache_dir: dir.clone(),

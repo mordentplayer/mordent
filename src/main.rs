@@ -57,7 +57,7 @@ fn main() {
 
 fn run() -> Result<()> {
     // Detect FIRST-RUN before Config::load() auto-writes a default file: with
-    // no config.toml, `amc ui` opens the setup wizard instead of the app.
+    // no config.toml, `mordent ui` opens the setup wizard instead of the app.
     let first_run = !config::config_exists();
     let cfg = config::Config::load()?;
     // TTL-clean the metadata cache once per process (audio cache is
@@ -77,25 +77,25 @@ fn run() -> Result<()> {
         }
         "search" => {
             let term = if rest.is_empty() {
-                bail!("usage: amc search <term>");
+                bail!("usage: mordent search <term>");
             } else {
                 rest.join(" ")
             };
             cmd_search(&cfg, &term)?;
         }
         "album" => {
-            let arg = rest.first().ok_or_else(|| anyhow::anyhow!("usage: amc album <id|url>"))?;
+            let arg = rest.first().ok_or_else(|| anyhow::anyhow!("usage: mordent album <id|url>"))?;
             cmd_album(&cfg, arg)?;
         }
         "wrapper" => cmd_wrapper(&cfg)?,
         "decrypt" => {
             let mut it = rest.iter();
-            let id = it.next().ok_or_else(|| anyhow::anyhow!("usage: amc decrypt <songId> [outfile]"))?;
-            let out = it.next().cloned().unwrap_or_else(|| "/tmp/amc-decrypted.m4a".into());
+            let id = it.next().ok_or_else(|| anyhow::anyhow!("usage: mordent decrypt <songId> [outfile]"))?;
+            let out = it.next().cloned().unwrap_or_else(|| "/tmp/mordent-decrypted.m4a".into());
             cmd_decrypt(&cfg, id, &out)?;
         }
         "decode" => {
-            let path = rest.first().ok_or_else(|| anyhow::anyhow!("usage: amc decode <file>"))?;
+            let path = rest.first().ok_or_else(|| anyhow::anyhow!("usage: mordent decode <file>"))?;
             decode_stats(path)?;
         }
         "ui" => {
@@ -111,14 +111,14 @@ fn run() -> Result<()> {
         }
         "play" => {
             let term = if rest.is_empty() {
-                bail!("usage: amc play <term>");
+                bail!("usage: mordent play <term>");
             } else {
                 rest.join(" ")
             };
             cmd_play(&cfg, &term)?;
         }
         "lyrics" => {
-            let id = rest.first().ok_or_else(|| anyhow::anyhow!("usage: amc lyrics <songId>"))?;
+            let id = rest.first().ok_or_else(|| anyhow::anyhow!("usage: mordent lyrics <songId>"))?;
             let w = wrapper::Wrapper::new(&cfg.wrapper_url);
             let syllable = rest.iter().any(|a| a == "--syllable");
             let data = w.lyrics(id, syllable)?;
@@ -225,7 +225,7 @@ fn cmd_wrapper(cfg: &config::Config) -> Result<()> {
 fn cmd_library(cfg: &config::Config, rest: &[String]) -> Result<()> {
     let api = api::Api::new(cfg.clone())?;
     if cfg.media_user_token.as_deref().unwrap_or("").is_empty() {
-        bail!("no media_user_token in ~/.config/amc/config.toml");
+        bail!("no media_user_token in ~/.config/mordent/config.toml");
     }
     let sub = rest.first().map(String::as_str).unwrap_or("songs");
     match sub {
@@ -476,7 +476,7 @@ fn fmt_dur(ms: u64) -> String {
 
 fn usage() {
     eprintln!(
-        "amc — Apple Music client (dev CLI)\n\n\
+        "Mordent — Apple Music client (dev CLI)\n\n\
          commands:\n\
          \x20 token             print the cached web bearer token\n\
          \x20 search <term>     search catalog\n\

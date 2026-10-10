@@ -98,14 +98,14 @@ impl TrayItem {
                 let state = if pb.paused { "⏸ " } else { "▶ " };
                 format!("{state}{} — {}", t.name, t.artist)
             }
-            _ => "amc — nothing playing".to_string(),
+            _ => "Mordent — nothing playing".to_string(),
         }
     }
 }
 
 impl Tray for TrayItem {
     fn id(&self) -> String {
-        "amc".into()
+        "mordent".into()
     }
 
     fn category(&self) -> Category {
@@ -156,7 +156,7 @@ impl Tray for TrayItem {
         ToolTip {
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
-            title: "amc".into(),
+            title: "Mordent".into(),
             description,
         }
     }
@@ -179,7 +179,7 @@ impl Tray for TrayItem {
         // disabled and says so rather than lying.
         let visibility_item = if crate::wm::hide_supported() {
             MenuItem::Standard(StdItem {
-                label: if hidden { "Show amc" } else { "Hide amc" }.into(),
+                label: if hidden { "Show Mordent" } else { "Hide Mordent" }.into(),
                 icon_name: if hidden {
                     "view-refresh".into()
                 } else {
@@ -246,7 +246,7 @@ pub fn spawn(
     ctx: egui::Context,
 ) {
     let spawned = std::thread::Builder::new()
-        .name("amc-tray".into())
+        .name("mordent-tray".into())
         .spawn(move || {
             let snap_poll = snap.clone();
             let item = TrayItem {
@@ -272,12 +272,12 @@ pub fn spawn(
             // diffs server-side and only signals real changes, so an idle
             // session costs one cheap D-Bus round-trip per second.
             //
-            // AMC_DEMO_TRAY_TOGGLE=<secs>: headless hook — after N seconds,
+            // MORDENT_DEMO_TRAY_TOGGLE=<secs>: headless hook — after N seconds,
             // invoke the menu's Show/Hide action through the real
             // `Handle::update` path (pointer-clicking the icon is impossible
             // headlessly), exercising `show_toggle` and its hidden-flag
             // bookkeeping in the same run.
-            let mut toggle_at = std::env::var("AMC_DEMO_TRAY_TOGGLE")
+            let mut toggle_at = std::env::var("MORDENT_DEMO_TRAY_TOGGLE")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok());
             let started = std::time::Instant::now();
@@ -291,7 +291,7 @@ pub fn spawn(
                     && started.elapsed().as_secs() >= secs
                 {
                     toggle_at = None; // once
-                    eprintln!("[tray] AMC_DEMO_TRAY_TOGGLE: invoking Show/Hide menu action");
+                    eprintln!("[tray] MORDENT_DEMO_TRAY_TOGGLE: invoking Show/Hide menu action");
                     let _ = handle.update(|item| item.show_toggle());
                 }
                 let pb = snap_poll.lock().clone();

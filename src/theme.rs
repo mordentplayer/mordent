@@ -1,4 +1,4 @@
-//! Runtime theme loaded from `~/.config/amc/theme.toml`, hot-reloadable.
+//! Runtime theme loaded from `~/.config/mordent/theme.toml`, hot-reloadable.
 //!
 //! The file is optional: when absent, the built-in [`Theme::default`] is used.
 //! Every key is optional too and falls back to the built-in default on its
@@ -62,7 +62,7 @@ impl Default for Theme {
 }
 
 pub fn theme_path() -> PathBuf {
-    crate::config::home().join(".config/amc/theme.toml")
+    crate::config::home().join(".config/mordent/theme.toml")
 }
 
 /// Parse `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa` (leading `#` optional) into
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_silent_default() {
-        let p = std::env::temp_dir().join("amc-theme-does-not-exist.toml");
+        let p = std::env::temp_dir().join("mordent-theme-does-not-exist.toml");
         let _ = std::fs::remove_file(&p);
         let (t, warns) = Theme::load_from(&p);
         assert!(warns.is_empty());
@@ -244,7 +244,7 @@ mod tests {
     /// built-in default (inter) and warns once, like a bad colour.
     #[test]
     fn font_key_parses_and_falls_back() {
-        let p = std::env::temp_dir().join("amc-theme-font.toml");
+        let p = std::env::temp_dir().join("mordent-theme-font.toml");
         for (text, want, warn) in [
             ("font = \"inter\"\n", FontChoice::Inter, false),
             ("font = \" dejavu \"\n", FontChoice::DejaVu, false),
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn partial_and_invalid_keys() {
-        let p = std::env::temp_dir().join("amc-theme-test.toml");
+        let p = std::env::temp_dir().join("mordent-theme-test.toml");
         std::fs::write(
             &p,
             "accent = \"#4dd0fa\"\nopacity = 2.0\nweak = \"zz\"\nbg = \"#4dd0fa80\"\n",
