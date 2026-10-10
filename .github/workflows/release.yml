@@ -152,8 +152,15 @@ jobs:
         working-directory: docs/macos-container
         run: |
           set -euo pipefail
+          echo "cwd: $(pwd)"
+          ls -la ../../in/wrapper
           install -m 0755 ../../in/wrapper/wrapper-lite-rootless wrapper-lite-rootless
           cp -a ../../in/wrapper/rootfs rootfs
+          # `actions/download-artifact` extraction does not reliably preserve
+          # the executable bit, so set it explicitly on both staged binaries
+          # before the checks below (the Dockerfile chmods its own copies too).
+          chmod 0755 wrapper-lite-rootless rootfs/system/bin/lite
+          ls -l wrapper-lite-rootless rootfs/system/bin/lite
           test -x wrapper-lite-rootless
           test -x rootfs/system/bin/lite
           # Login state must never reach the image (the Dockerfile also
