@@ -1,0 +1,23 @@
+name = "mordent-intake"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Anonymous intake endpoint for sliced-paraiba/mordent.
+# See README.md for the one-time setup (KV namespace + GH_TOKEN secret).
+
+workers_dev = true
+
+[vars]
+GH_REPO = "sliced-paraiba/mordent"
+# Comma-separated labels applied to every created issue. Set to "" to disable.
+GH_LABELS = "from-web"
+# DRY_RUN=1 logs the would-be issue and returns ok without calling GitHub.
+# MUST be "0" (or removed) in production.
+DRY_RUN = "0"
+
+# Per-IP / global rate limiting and dedupe state. Create with:
+#   wrangler kv namespace create INTAKE_KV
+# then paste the printed id below.
+[[kv_namespaces]]
+binding = "INTAKE_KV"
+id = "64e15885c1594c368e8367e67a9ae6a7"
