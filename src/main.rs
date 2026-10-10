@@ -10,6 +10,7 @@ mod report;
 mod setup;
 mod supervisor;
 mod ui;
+mod wm;
 mod fairplay;
 mod mpris;
 mod stream;
@@ -18,12 +19,14 @@ mod wrapper;
 
 // Tray (collapse-to-tray) is Linux-only: ksni speaks StatusNotifierItem over
 // D-Bus. On macOS/Windows the stub below keeps the callsites compiling — the
-// window ✕ still hides the app there (restore via MPRIS Raise / relaunch).
+// window-close policy in `ui::update` still applies there (quit when nothing
+// has played; hide the window once a track has — restore via MPRIS Raise).
 #[cfg(target_os = "linux")]
 mod tray;
 
 /// Non-Linux tray stub: no StatusNotifierItem host exists there, so no tray
-/// icon is registered. `✕ = hide` (handled in `ui::update`) works unchanged.
+/// icon is registered. The window-close policy in `ui::update` is unchanged
+/// (quit when nothing has played; hide once a track has).
 #[cfg(not(target_os = "linux"))]
 pub mod tray {
     use crate::supervisor::Command;
@@ -39,7 +42,7 @@ pub mod tray {
         _hidden: Arc<AtomicBool>,
         _ctx: egui::Context,
     ) {
-        eprintln!("[tray] not supported on this platform — running without a tray icon; ✕ still hides the window, MPRIS Raise (or a relaunch) restores it");
+        eprintln!("[tray] not supported on this platform — running without a tray icon; window close quits when nothing has played, and hides the window once a track has (restore with MPRIS Raise or a relaunch)");
     }
 }
 

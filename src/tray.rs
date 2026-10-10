@@ -8,16 +8,27 @@
 //! 1 Hz poll refreshes title/tooltip signals while music runs (via
 //! `Handle::update`, which diffs and only emits on change).
 //!
-//! Menu: Show/Hide, Play/Pause (reflects state), Next, Previous, Quit.
-//! Activate (left click) = toggle window visibility. Quit sends
-//! [`Command::Quit`] — the supervisor flushes the report segment and exits,
-//! exactly like Ctrl+Q / MPRIS Quit.
+//! Status is **always `Active`**: hosts (waybar included) hide `Passive`
+//! items, so an idle `Passive` item meant no icon at all until the first
+//! track — the reported bug. The app is alive from launch; that is what the
+//! icon signals. Play/pause state lives in the tooltip and the menu label.
+//!
+//! Menu: Show/Hide (only where the platform can unmap the window — see
+//! below), Play/Pause (reflects state), Next, Previous, Quit. Activate (left
+//! click) toggles window visibility. Quit sends [`Command::Quit`] — the
+//! supervisor flushes the report segment and exits, exactly like Ctrl+Q /
+//! MPRIS Quit.
+//!
+//! HIDE/SHOW SUPPORT (`crate::wm`): X11 can unmap/map the window, so Show/Hide
+//! works. On Wayland winit 0.30.13's `Window::set_visible` is a no-op, so the
+//! item is disabled and labelled "Hide unavailable on Wayland" instead of
+//! lying (niri implements no `xdg_toplevel.set_minimized` fallback either).
 //!
 //! FALLBACKS (never panics the app — every failure path degrades silently):
 //! * no session bus / no StatusNotifierWatcher / no host → `spawn` returns
-//!   `Err`, logged once to stderr, no tray icon; the app behaves as before
-//!   (✕ still hides the window — restore via MPRIS Raise, `playerctl`, or
-//!   simply `amc ui` again / relaunch).
+//!   `Err`, logged once to stderr, no tray icon; the window-close policy in
+//!   `ui::update` still applies (quit when nothing has played; hide on X11
+//!   once a track has — restore via MPRIS Raise, `playerctl`, or a relaunch).
 //! * the watcher going away mid-run is ksni's `watcher_offline` — the
 //!   default keeps the service registered so it re-appears when the watcher
 //!   returns (e.g. waybar restart).
@@ -46,8 +57,26 @@ pub struct TrayItem {
 }
 
 impl TrayItem {
+    /// Toggle the window. Where the platform cannot unmap the toplevel
+    /// (Wayland — see `wm`) this is honest about it instead of pretending.
     fn show_toggle(&mut self) {
+        if !crate::wm::hide_supported() {
+            // winit no-ops `set_visible` on Wayland and `Focus` is a no-op
+            // too, so there is nothing to hide/show; say so, best-effort
+            // raise, and leave the window alone.
+            eprintln!(
+                "[tray] show_toggle: hide/show unavailable on Wayland — the window \
+                 cannot be unmapped; leaving it as is"
+            );
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            return;
+        }
         let show = self.hidden.load(Ordering::Relaxed);
+        eprintln!(
+            "[tray] show_toggle: {} window (hidden {show} → {})",
+            if show { "showing" } else { "hiding" },
+            !show
+        );
         // Visible first: Focus alone does not un-hide the window.
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
         if show {
@@ -84,11 +113,12 @@ impl Tray for TrayItem {
     }
 
     fn status(&self) -> Status {
-        if self.playing() {
-            Status::Active
-        } else {
-            Status::Passive
-        }
+        // Always Active. StatusNotifier hosts (waybar included) typically HIDE
+        // Passive items, so returning Passive while idle made the icon
+        // invisible until the first track (the reported bug). The app is alive
+        // from launch — that is the signal this property carries. Play/pause
+        // state lives in the tooltip and the menu's Play/Pause label.
+        Status::Active
     }
 
     fn title(&self) -> String {
@@ -107,21 +137,27 @@ impl Tray for TrayItem {
 
     fn tool_tip(&self) -> ToolTip {
         let pb = self.snap.lock();
+        let mut description = match &pb.track {
+            Some(t) if pb.has_track => {
+                let state = if pb.paused {
+                    "paused".to_string()
+                } else {
+                    format!("{} / {}", fmt_pos(pb.position), fmt_pos(pb.duration))
+                };
+                format!("{} — {}\n{}", t.artist, t.name, state)
+            }
+            _ => "nothing playing".into(),
+        };
+        if !crate::wm::hide_supported() {
+            // Don't lie: the toplevel cannot be unmapped on Wayland, so the
+            // tray cannot hide/show it (see `wm`).
+            description.push_str("\nWayland: window cannot be hidden — close quits");
+        }
         ToolTip {
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
             title: "amc".into(),
-            description: match &pb.track {
-                Some(t) if pb.has_track => {
-                    let state = if pb.paused {
-                        "paused".to_string()
-                    } else {
-                        format!("{} / {}", fmt_pos(pb.position), fmt_pos(pb.duration))
-                    };
-                    format!("{} — {}\n{}", t.artist, t.name, state)
-                }
-                _ => "nothing playing".into(),
-            },
+            description,
         }
     }
 
@@ -137,7 +173,11 @@ impl Tray for TrayItem {
             ("Play", "media-playback-start")
         };
         use ksni::menu::StandardItem as StdItem;
-        vec![
+        // Hide/Show only where the platform can actually unmap the window
+        // (X11). On Wayland it is impossible (winit 0.30.13 no-ops
+        // `set_visible`; niri has no minimize either), so the item is
+        // disabled and says so rather than lying.
+        let visibility_item = if crate::wm::hide_supported() {
             MenuItem::Standard(StdItem {
                 label: if hidden { "Show amc" } else { "Hide amc" }.into(),
                 icon_name: if hidden {
@@ -147,7 +187,17 @@ impl Tray for TrayItem {
                 },
                 activate: Box::new(|t: &mut Self| t.show_toggle()),
                 ..Default::default()
-            }),
+            })
+        } else {
+            MenuItem::Standard(StdItem {
+                label: "Hide unavailable on Wayland".into(),
+                icon_name: "window-close".into(),
+                enabled: false,
+                ..Default::default()
+            })
+        };
+        vec![
+            visibility_item,
             MenuItem::Separator,
             MenuItem::Standard(StdItem {
                 label: play_label.into(),
@@ -210,7 +260,9 @@ pub fn spawn(
                 Err(e) => {
                     eprintln!(
                         "[tray] unavailable ({e}) — running without a tray icon; \
-                         ✕ still hides the window, MPRIS Raise (or a relaunch) restores it"
+                         window close quits when nothing has played, and on X11 \
+                         hides the window once a track has played (restore with \
+                         MPRIS Raise or a relaunch)"
                     );
                     return;
                 }
@@ -219,11 +271,28 @@ pub fn spawn(
             // 1 Hz refresh: title/tooltip follow the shared snapshot; update()
             // diffs server-side and only signals real changes, so an idle
             // session costs one cheap D-Bus round-trip per second.
+            //
+            // AMC_DEMO_TRAY_TOGGLE=<secs>: headless hook — after N seconds,
+            // invoke the menu's Show/Hide action through the real
+            // `Handle::update` path (pointer-clicking the icon is impossible
+            // headlessly), exercising `show_toggle` and its hidden-flag
+            // bookkeeping in the same run.
+            let mut toggle_at = std::env::var("AMC_DEMO_TRAY_TOGGLE")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok());
+            let started = std::time::Instant::now();
             let mut last = String::new();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 if handle.is_closed() {
                     return;
+                }
+                if let Some(secs) = toggle_at
+                    && started.elapsed().as_secs() >= secs
+                {
+                    toggle_at = None; // once
+                    eprintln!("[tray] AMC_DEMO_TRAY_TOGGLE: invoking Show/Hide menu action");
+                    let _ = handle.update(|item| item.show_toggle());
                 }
                 let pb = snap_poll.lock().clone();
                 let line = match &pb.track {

@@ -687,7 +687,7 @@ impl App {
                 .ok();
         }
         if !no_repaint {
-            spawn_wake_thread(egui_ctx, wake_ms);
+            spawn_wake_thread(egui_ctx.clone(), wake_ms);
         }
         match state.last_view.as_deref() {
             // older builds had Albums as a main tab; map it to the Search
@@ -760,6 +760,41 @@ impl App {
                     });
                 })
                 .expect("spawn amc-demo-play thread");
+        }
+        // AMC_DEMO_CLOSE=1: simulate a WM close request
+        // (`ViewportCommand::Close` → `close_requested()` on the next frame) so
+        // the window-close policy is testable headlessly. Together with
+        // AMC_DEMO_PLAY the request waits until a track is current — otherwise
+        // playback would race the close and the idle branch would win; alone it
+        // fires after a short delay that lets the window map.
+        if std::env::var("AMC_DEMO_CLOSE").is_ok() {
+            let ctx = egui_ctx.clone();
+            let pb = app.pb.clone();
+            let wait_for_play = std::env::var("AMC_DEMO_PLAY").is_ok();
+            std::thread::Builder::new()
+                .name("amc-demo-close".into())
+                .spawn(move || {
+                    if wait_for_play {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        while !pb.lock().has_track && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        // Let the window map and a couple of frames run, so a
+                        // headless observer can see the visible state before
+                        // the close (the real user closes well after this).
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                    eprintln!(
+                        "[demo-close] sending ViewportCommand::Close (simulated WM close; \
+                         ever_played={})",
+                        pb.lock().ever_played
+                    );
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                })
+                .expect("spawn amc-demo-close thread");
         }
         match std::env::var("AMC_DEMO_VIEW").as_deref() {
             Ok("library") => app.switch_view(View::Library),
@@ -2090,6 +2125,54 @@ impl App {
     }
 }
 
+/// What a window-close request (✕ / WM close, e.g. niri's Win+Q) must do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    /// Real exit: flush the report segment and terminate (the supervisor's
+    /// `Command::Quit` path — the same single exit authority as Ctrl+Q).
+    Quit,
+    /// Close to tray: veto the close and hide the window.
+    Hide,
+}
+
+/// The user's policy: a session that has not played anything yet exits on
+/// close; once a track has played, close goes to the tray — but only where the
+/// platform can actually hide the window (X11). On Wayland hiding is
+/// impossible (see `wm`), and silently doing nothing is the exact bug this
+/// replaces, so the played branch quits there too (cleanly, like the idle
+/// branch). Pure so it is unit tested.
+fn close_action(ever_played: bool, hide_supported: bool) -> CloseAction {
+    if ever_played && hide_supported {
+        CloseAction::Hide
+    } else {
+        CloseAction::Quit
+    }
+}
+
+#[cfg(test)]
+mod close_policy_tests {
+    use super::*;
+
+    #[test]
+    fn idle_session_quits_on_close() {
+        // Nothing played yet → real exit, whatever the platform.
+        assert_eq!(close_action(false, true), CloseAction::Quit);
+        assert_eq!(close_action(false, false), CloseAction::Quit);
+    }
+
+    #[test]
+    fn played_session_hides_where_supported() {
+        assert_eq!(close_action(true, true), CloseAction::Hide);
+    }
+
+    #[test]
+    fn played_session_quits_on_wayland() {
+        // Hiding is impossible on Wayland; doing nothing is the bug we are
+        // fixing, so the played branch quits cleanly there too.
+        assert_eq!(close_action(true, false), CloseAction::Quit);
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_theme(ctx);
@@ -2097,17 +2180,36 @@ impl eframe::App for App {
         let pb = self.pb();
         self.now = pb.track.clone();
 
-        // ✕ hides the window (close-to-tray semantics — playback, MPRIS and
-        // the tray live off-frame). With no StatusNotifier host present the
-        // behavior degrades identically: the window hides, restore via MPRIS
-        // Raise / `playerctl play`... or simply relaunch-focus; real exit is
-        // Ctrl+Q / tray Quit / MPRIS Quit. CancelClose must be sent in THIS
-        // pass for eframe to veto the close (see eframe's close_requested
-        // handling).
+        // Window close (✕ / WM close — niri's Win+Q arrives here too).
+        // Policy (see [`close_action`]): no track played yet → quit for real;
+        // a track HAS played → close to tray where the platform can hide the
+        // window (X11), else quit as well (Wayland cannot unmap — `wm`).
+        //
+        // CancelClose is sent on BOTH branches in THIS pass: eframe vetoes the
+        // close (see its `close_requested` handling), which keeps the event
+        // loop alive so the supervisor's flush-then-`process::exit` stays the
+        // single exit authority (letting eframe close would race `main`
+        // returning against the report flush).
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.hidden.store(true, Ordering::Relaxed);
+            match close_action(pb.ever_played, crate::wm::hide_supported()) {
+                CloseAction::Quit => {
+                    if pb.ever_played {
+                        eprintln!(
+                            "[wm] close requested: a track has played but Wayland \
+                             cannot hide the window → quitting (same flush path as Ctrl+Q)"
+                        );
+                    } else {
+                        eprintln!("[wm] close requested: nothing played yet → quitting");
+                    }
+                    self.exit_flush();
+                }
+                CloseAction::Hide => {
+                    eprintln!("[wm] close requested: closing to tray");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    self.hidden.store(true, Ordering::Relaxed);
+                }
+            }
         }
 
         // First-run wizard owns the window: render it and skip the normal app

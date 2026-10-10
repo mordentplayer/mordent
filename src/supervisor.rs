@@ -143,6 +143,11 @@ pub struct PbSnapshot {
     /// A worker is still building the source for the current track.
     pub preparing: bool,
     pub has_track: bool,
+    /// Sticky session flag: at least one track has become current since launch
+    /// (never cleared, even when playback stops). Drives the window-close
+    /// policy in `ui::update`: no track ever played → quit; otherwise → close
+    /// to tray where the platform can hide the window.
+    pub ever_played: bool,
     pub volume: f32,
     pub repeat: Repeat,
     pub shuffle: bool,
@@ -164,6 +169,7 @@ impl Default for PbSnapshot {
             paused: false,
             preparing: false,
             has_track: false,
+            ever_played: false,
             volume: 0.8,
             repeat: Repeat::Off,
             shuffle: false,
@@ -290,6 +296,9 @@ struct Sup {
     volume: f32,
     seek_epoch: u64,
     quit: bool,
+    /// Sticky: a track has become current at least once this session (see
+    /// [`PbSnapshot::ever_played`]).
+    ever_played: bool,
     // ---- report segments ----
     reporter: Option<PlayReporter>,
     report_open: bool,
@@ -342,6 +351,7 @@ impl Sup {
             volume,
             seek_epoch: 0,
             quit: false,
+            ever_played: false,
             reporter,
             report_open: false,
             report_seg_start_ms: 0,
@@ -927,6 +937,9 @@ impl Sup {
     // ---- publication ----
 
     fn publish(&mut self) {
+        // Sticky: any track becoming current latches ever_played for the rest
+        // of the session (drives the window-close policy).
+        self.ever_played |= self.now.is_some();
         let (duration, paused) = match &self.now {
             Some(t) => {
                 let d = if self.decode_only {
@@ -949,6 +962,7 @@ impl Sup {
                 paused,
                 preparing: self.preparing,
                 has_track: self.now.is_some(),
+                ever_played: self.ever_played,
                 volume: self.volume,
                 repeat: self.repeat,
                 shuffle: self.shuffle,

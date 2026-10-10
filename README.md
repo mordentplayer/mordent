@@ -196,6 +196,14 @@ pre-seed the UI for headless screenshots (`albums` opens the Search tab's
 Albums sub-view); `AMC_DEMO_PLAYLIST=<n>` additionally
 opens the n-th library playlist (0-based) once the list loads, and
 `AMC_DEMO_LYRICS=1` opens the lyrics panel.
+`AMC_DEMO_CLOSE=1` simulates a WM close request
+(`ViewportCommand::Close` → the same path as `✕`/niri's `Win+Q`) so the close
+policy is testable headlessly: alone it fires after a short delay (idle
+session → the process exits); combined with `AMC_DEMO_PLAY` it waits until a
+track is current (played session → the window hides on X11, or the process
+exits on Wayland). `AMC_DEMO_TRAY_TOGGLE=<secs>` invokes the tray's Show/Hide
+menu action after N seconds through the real `Handle::update` path (the
+pointer cannot click a tray icon headlessly).
 
 ## Lyrics
 
@@ -272,19 +280,51 @@ playerctl --player=amc shuffle On
 `amc ui` (Linux) registers a StatusNotifierItem tray icon (`ksni`, pure Rust —
 no GTK mainloop): an accent eighth-note painted in-binary, a now-playing
 tooltip, and a menu with **Show/Hide, Play/Pause (reflects state), Next,
-Previous, Quit**. Left-click (Activate) toggles window visibility.
+Previous, Quit**. Left-click (Activate) toggles window visibility. The icon is
+**present from launch** — the item's Status is always `Active`, because hosts
+(waybar included) hide `Passive` items and an idle icon would otherwise not
+appear until the first track.
 
-**✕ (window close) hides to the tray — it does not exit.** Music keeps
-playing from the supervisor thread; real exit is **Ctrl+Q**, the tray's Quit,
-or MPRIS Quit (each flushes the open play-report segment first, then exits).
-No StatusNotifier host (no waybar/GNOME-appindicator, bare X11, VPS)? The
-tray degrades silently — logged once, no icon — and ✕ still hides; restore
-with MPRIS Raise (`playerctl --player=amc open`/`play` on some setups),
-`wmctrl -a amc`, or just start `amc ui` again (single-instance is not
-enforced; the second process plays nothing but the first keeps running).
-Host support: waybar/Hyprland/niri/umbriel native, KDE Plasma native,
-GNOME needs an AppIndicator extension. macOS/Windows builds compile a
-no-tray stub; ✕ still hides there, restore via MPRIS Raise or relaunch.
+**Window close (✕ / the WM's close, e.g. niri's `Win+Q`):**
+
+* **nothing has played yet → amc quits** — the same clean flush path as
+  Ctrl+Q (the open play-report segment is closed, then the process exits);
+* **a track has played → close to the tray** — the close is cancelled and the
+  window is hidden; music keeps playing from the supervisor thread (this
+  branch needs the platform to be able to hide the window — see below).
+
+Real exit is always **Ctrl+Q**, the tray's **Quit**, or **MPRIS Quit** (each
+flushes the report segment first, then exits).
+
+### Hide/Show support (platform matrix)
+
+Hiding the window is a winit capability and it differs per backend
+(winit 0.30.13):
+
+| Backend | Hide/Show (unmap/map) | `Focus`/raise | `Minimize` |
+|---|---|---|---|
+| X11 | ✅ `Window::set_visible` — `x11/window.rs:1123` | ✅ | ✅ |
+| Wayland | ❌ `Window::set_visible` is a **no-op** — `wayland/window/mod.rs:253` | ❌ `focus_window` is empty — `wayland/window/mod.rs:629` | ⚠️ `set_minimized(true)` only; un-minimizing is ignored — `wayland/window/mod.rs:436-445` |
+
+On **X11** Show/Hide works fully: the tray's Hide/Show item, left-click
+(Activate), close-to-tray and MPRIS Raise all map/unmap the window. On
+**Wayland** a client cannot unmap its toplevel at all — winit no-ops it, and
+niri implements no `xdg_toplevel.set_minimized` fallback either — so amc does
+not pretend:
+
+* the tray's Hide/Show item is **disabled and labelled "Hide unavailable on
+  Wayland"** (the tooltip carries the same note), and
+* **window close quits** on Wayland as well, whether or not a track has
+  played: hiding is impossible and silently doing nothing is the bug this
+  replaces. The `ever_played` "close to tray" branch therefore only applies
+  where hiding actually works.
+
+Host support: waybar/Hyprland/niri/umbriel, KDE Plasma — SNI natively; GNOME
+needs an AppIndicator extension. No StatusNotifier host (bare X11, VPS)? The
+tray degrades silently — logged once, no icon — and the close policy above
+still applies; restore a hidden window with MPRIS Raise (`playerctl
+--player=amc open`/`play` on some setups), `wmctrl -a amc`, or a relaunch.
+macOS/Windows builds compile a no-tray stub with the same close policy.
 
 ## Playback is UI-independent
 
