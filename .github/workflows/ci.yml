@@ -106,12 +106,21 @@ jobs:
       # try_default and has no tests) and the only socket test is 127.0.0.1-based
       # (src/api.rs). The #[ignore]d live tests are network/CDN smoke tests.
       #
-      # DIAGNOSTIC: the windows test binary aborts with STATUS_ACCESS_VIOLATION
-      # (0xc0000005) ~160-190 ms into the run, with a disjoint in-flight test set
-      # each time (i.e. it tracks wall-clock, not a specific test). Running
-      # serially is a probe: if it passes, the cause is concurrency-sensitive
-      # process-global state; if it still crashes, the last test printed names
-      # the culprit. Linux/macOS keep normal threading.
+      # DIAGNOSTIC (temporary): the windows test binary aborts with
+      # STATUS_ACCESS_VIOLATION (0xc0000005) ~160-200 ms in, at a *different*
+      # test each run (serial execution landed on a test that passes in parallel
+      # runs) — the classic signature of heap corruption from an earlier test,
+      # not of any single failing test. These probes narrow it down:
+      #   * `--list`  → harness/startup is healthy (no test bodies executed)
+      #   * `--skip api::` → does removing the loopback-socket/HTTP tests stop it?
+      #   * the full serial run is kept last.
+      # Linux/macOS keep normal threading; this block is windows-only.
+      - name: "Probe - harness list (diagnostic)"
+        run: cargo test --locked -- --list
+
+      - name: "Probe - skip api tests (diagnostic)"
+        run: "cargo test --locked -- --skip api::"
+
       - name: Test
         run: cargo test --locked -- --test-threads=1
 
