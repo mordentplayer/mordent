@@ -352,7 +352,11 @@ jobs:
 
           tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
 
-          # sanity-check the archive before it goes out
+          # sanity-check the archive before it goes out. List the archive once
+          # into a file: streaming `tar -t | grep -q` trips `set -o pipefail`
+          # (grep exits on the first match and tar then dies with SIGPIPE, a
+          # false "bundle is missing ...").
+          tar -tzf "${pkg}.tar.gz" >"${pkg}.list"
           for p in \
             mordent \
             wrapper-lite \
@@ -365,9 +369,10 @@ jobs:
             licenses/LICENSE-DejaVu.txt \
             licenses/LICENSE-Inter.txt \
             licenses/LICENSE-wrapper.txt; do
-            tar -tzf "${pkg}.tar.gz" | grep -qx "${pkg}/${p}" ||
+            grep -qx "${pkg}/${p}" "${pkg}.list" ||
               { echo "::error::bundle is missing ${p}"; exit 1; }
           done
+          rm -f "${pkg}.list"
           echo "PKG=${pkg}" >> "$GITHUB_ENV"
 
       - name: Upload bundle artifact
