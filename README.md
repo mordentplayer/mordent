@@ -17,7 +17,7 @@ requires an active Apple Music subscription logged into the wrapper.
 ## Architecture
 
 ```
-┌─────────────────────────────── mordent (single Rust binary) ──────────────────────┐
+┌─────────────────────────────── mordent (single Rust binary) ─────────────────┐
 │  egui UI ── queue / player bar / search                                      │
 │     │                                                                        │
 │  amp-api client          wrapper-lite client        streaming pipeline        │
