@@ -187,6 +187,41 @@ playerctl --player=amc loop Track        # None / Track / Playlist
 playerctl --player=amc shuffle On
 ```
 
+## Tray
+
+`amc ui` (Linux) registers a StatusNotifierItem tray icon (`ksni`, pure Rust —
+no GTK mainloop): an accent eighth-note painted in-binary, a now-playing
+tooltip, and a menu with **Show/Hide, Play/Pause (reflects state), Next,
+Previous, Quit**. Left-click (Activate) toggles window visibility.
+
+**✕ (window close) hides to the tray — it does not exit.** Music keeps
+playing from the supervisor thread; real exit is **Ctrl+Q**, the tray's Quit,
+or MPRIS Quit (each flushes the open play-report segment first, then exits).
+No StatusNotifier host (no waybar/GNOME-appindicator, bare X11, VPS)? The
+tray degrades silently — logged once, no icon — and ✕ still hides; restore
+with MPRIS Raise (`playerctl --player=amc open`/`play` on some setups),
+`wmctrl -a amc`, or just start `amc ui` again (single-instance is not
+enforced; the second process plays nothing but the first keeps running).
+Host support: waybar/Hyprland/niri/umbriel native, KDE Plasma native,
+GNOME needs an AppIndicator extension. macOS/Windows builds compile a
+no-tray stub; ✕ still hides there, restore via MPRIS Raise or relaunch.
+
+## Playback is UI-independent
+
+Playback lives on a **supervisor thread** (`src/supervisor.rs`), not in the
+UI frame loop: it owns the audio output (rodio), the play/pause/seek/advance
+state machine, natural-end queue advance, play reporting, and the MPRIS
+command drain. The UI is a renderer + command sender over a small command
+channel; both sides share the queue (behind a mutex) and one published
+playback snapshot. Hiding the window, an unfocused/compositor-throttled
+window, or a frozen frame loop can therefore never stop or stall playback.
+Debug hook: `AMC_NO_REPAINT=1 amc ui` suppresses **every** repaint request
+(in-frame driver, wake thread, supervisor wakes) — the UI stops being
+scheduled entirely while playback, natural advance and MPRIS keep working
+(see the supervisor's `[sup …]` log lines; most useful together with the
+frame-independent `AMC_DEMO_PLAY=<n>` hook, e.g.
+`AMC_NO_REPAINT=1 AMC_DEMO_PLAY=0 amc ui`).
+
 ## Play reporting
 
 With `media_user_token` set and `report_plays = true` (the default), `amc ui`

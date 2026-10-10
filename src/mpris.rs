@@ -133,7 +133,6 @@ struct Shared {
 
 /// Handle held by the UI thread.
 pub struct Mpris {
-    pub rx: Receiver<Command>,
     shared: Arc<Shared>,
 }
 
@@ -142,7 +141,11 @@ impl Mpris {
     /// is established on the thread, never on the UI thread. Returns `None`
     /// only if the OS refuses to spawn a thread; a missing session bus is
     /// handled inside the thread (log once, disable).
-    pub fn spawn() -> Option<Self> {
+    ///
+    /// Returns `(handle, command receiver)`: the UI keeps the handle to
+    /// publish snapshots, the supervisor drains the receiver so media keys
+    /// work while the UI is hidden or its frame loop is parked.
+    pub fn spawn() -> Option<(Self, Receiver<Command>)> {
         let (tx, rx) = channel();
         let shared = Arc::new(Shared {
             state: Mutex::new(Snapshot::default()),
@@ -154,7 +157,7 @@ impl Mpris {
                 move || run(shared, tx)
             })
             .is_ok();
-        ok.then_some(Self { rx, shared })
+        ok.then_some((Self { shared }, rx))
     }
 
     /// Per-frame publish: lock + move. The D-Bus thread does all diffing.

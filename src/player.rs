@@ -25,6 +25,38 @@ pub struct PacketSource {
 }
 
 impl PacketSource {
+    /// Test-only source that reads nothing (immediate EOF). Supervisor tests
+    /// only need a value to pass through the command channel; the decode-only
+    /// supervisor drops it unread (the fake clock owns everything), so the
+    /// codec behind it never matters — PCM needs no init data.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        use symphonia::core::codecs::CODEC_TYPE_PCM_S16LE;
+        let mut params = symphonia::core::codecs::CodecParameters::new();
+        params
+            .for_codec(CODEC_TYPE_PCM_S16LE)
+            .with_sample_rate(44_100)
+            .with_channels(
+                symphonia::core::audio::Channels::FRONT_LEFT
+                    | symphonia::core::audio::Channels::FRONT_RIGHT,
+            )
+            .with_max_frames_per_packet(1152)
+            .with_bits_per_coded_sample(16);
+        let decoder = symphonia::default::get_codecs()
+            .make(&params, &Default::default())
+            .expect("pcm decoder");
+        Self {
+            reader: Box::new(std::io::empty()),
+            decoder,
+            pending: Vec::new(),
+            pos: 0,
+            sample_rate: 44_100,
+            channels: 2,
+            frames_decoded: 0,
+            cancel: None,
+        }
+    }
+
     pub fn with_cancel(
         reader: Box<dyn Read + Send>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -145,6 +177,10 @@ impl rodio::Source for PacketSource {
 /// Owns the audio output. Falls back to decode-only mode (progress to
 /// stdout) when no device is available — e.g. a headless VPS.
 /// Cheaply cloneable handle (single-threaded; rodio's `OutputStream` is `!Send`).
+///
+/// The UI no longer uses this — playback runs on the supervisor thread
+/// (`supervisor.rs`), which talks to rodio directly. `Player` stays for the
+/// CLI paths (`amc play`, and its `PacketSource` for `amc decrypt`/decode).
 #[derive(Clone)]
 pub struct Player {
     inner: Rc<Inner>,
@@ -191,37 +227,5 @@ impl Player {
         if let Some(sink) = &self.inner.sink {
             sink.append(src);
         }
-    }
-
-    pub fn toggle_pause(&self) {
-        if let Some(sink) = &self.inner.sink {
-            if sink.is_paused() {
-                sink.play();
-            } else {
-                sink.pause();
-            }
-        }
-    }
-
-    pub fn volume(&self, v: f32) {
-        if let Some(sink) = &self.inner.sink {
-            sink.set_volume(v.clamp(0.0, 1.0));
-        }
-    }
-
-    /// Elapsed time of the current source, if playing.
-    pub fn position(&self) -> Option<std::time::Duration> {
-        self.inner.sink.as_ref().map(|s| s.get_pos())
-    }
-
-    /// Drop the current source (skip to next queued one).
-    pub fn skip(&self) {
-        if let Some(sink) = &self.inner.sink {
-            sink.skip_one();
-        }
-    }
-
-    pub fn is_idle(&self) -> bool {
-        self.inner.sink.as_ref().map(|s| s.empty()).unwrap_or(true)
     }
 }

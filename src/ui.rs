@@ -10,20 +10,24 @@
 //! the queue. Album rows open a detail modal; album `+` enqueues the whole
 //! album (tracks fetched on click).
 //!
-//! In decode-only mode (no audio device) a fake playback clock simulates the
-//! running track so queue/auto-advance behaves like a real player.
+//! DECOUPLED PLAYBACK: the UI thread owns NO audio. A playback supervisor
+//! thread (`supervisor.rs`) owns the rodio output, the pending-arrival pause
+//! decisions, natural-end advance and play reporting; the UI mutates the
+//! shared queue under its mutex, sends [`Command`]s, and renders from the
+//! shared [`PbSnapshot`]. Hiding, freezing or never scheduling `update()`
+//! again cannot stop playback — that is the point (see supervisor.rs).
+//!
+//! In decode-only mode (no audio device) the supervisor's fake clock
+//! simulates the running track so queue/auto-advance behaves like a real
+//! player.
 
-use crate::api::{
-    AlbumHit, Api, LibraryPlaylist, PlayEvent, PlayMode, SearchResults, Track, META_TTL_LIBRARY,
-};
+use crate::api::{AlbumHit, Api, LibraryPlaylist, PlayEvent, SearchResults, Track, META_TTL_LIBRARY};
 use crate::config::Config;
 use crate::fonts::FontChoice;
 use crate::mpris;
-use crate::player::{PacketSource, Player};
 use crate::prefetch::Prefetcher;
-use crate::report;
+use crate::supervisor::{self, Command, PbSnapshot};
 use crate::theme::Theme;
-use crate::stream;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -31,15 +35,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-use crate::queuemodel::{Advance, Queue, RemoveEffect, Repeat};
+use crate::queuemodel::{Queue, RemoveEffect, Repeat};
 
 enum Msg {
     Results(Box<SearchResults>),
     /// One page of the user's library albums, tagged with the sort it was
     /// fetched under (mismatched pages are dropped, never mixed).
     Library(Vec<AlbumHit>, Option<u32>, LibrarySort),
-    /// Fully prepared decoder for the given playback generation.
-    Source(u64, Box<PacketSource>),
     /// Tracks of an album, in order, tagged with the album they belong to.
     AlbumTracks {
         id: String,
@@ -94,23 +96,6 @@ enum AlbumJob {
     Queue { id: String },
 }
 
-/// What kind of source application [`App::play_now_at`] performs: it decides
-/// both the report segment semantics and the pause state on arrival.
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-enum PlayKind {
-    /// User-initiated fresh segment (click-replace, album/queue/row play,
-    /// ⏭/⏮ to another entry): PLAY_START at 0; audible unless the user had
-    /// explicitly paused right before.
-    NewSegment,
-    /// Natural-end handover to the next queue entry: PLAY_START at 0;
-    /// always audible.
-    AutoAdvance,
-    /// Reposition inside the current track (seek bar, ±5 s, ⏮ restart):
-    /// no PLAY_START (the segment continues, or the resume opens it); the
-    /// exact pre-seek pause state is restored.
-    SeekRestart,
-}
-
 /// Open album detail modal.
 struct AlbumModal {
     album: AlbumHit,
@@ -141,9 +126,16 @@ enum CentralAction {
 
 struct SelftestState {
     stage: u8,
+    /// Sub-step within a stage: every supervisor-mediated action lands
+    /// asynchronously, so each step awaits its observable state before
+    /// firing the next action (deterministic pass/fail, bounded waits).
+    step: u8,
     /// stage1 / stage2 / stage4 audible targets (now-playing names).
     expect: [String; 3],
     started: std::time::Instant,
+    /// Snapshot seek_epoch when the stage-6 seek was sent; the seek has
+    /// landed once the published epoch passes this.
+    seek_epoch: u64,
     /// Wrapper can serve cacheable CDN streams (regions non-empty) — gates
     /// the stage1 up-next-prefetch assertion; preview-only environments
     /// have nothing to cache.
@@ -355,7 +347,6 @@ fn spawn_wake_thread(ctx: egui::Context, wake_ms: Arc<AtomicU64>) {
 
 pub struct App {
     cfg: Config,
-    player: Player,
     search: String,
     /// Last executed search term (for empty-state copy).
     last_term: String,
@@ -392,40 +383,26 @@ pub struct App {
     /// AMC_DEMO_PLAYLIST=<n>: open the n-th playlist once the list loads
     /// (headless screenshot hook, alongside AMC_DEMO_VIEW).
     demo_playlist: Option<usize>,
-    /// Non-consuming queue + pointer to the current entry (see queuemodel).
-    queue: Queue,
+    /// Non-consuming queue + pointer to the current entry (see queuemodel),
+    /// SHARED with the playback supervisor: the UI mutates list content under
+    /// the lock; the supervisor advances the pointer on natural advance.
+    queue: Arc<parking_lot::Mutex<Queue>>,
+    /// RENDER MIRROR of `PbSnapshot::track`, refreshed from the snapshot at
+    /// the top of every frame. Rendering and labels only — every playback
+    /// decision reads the snapshot (or sends a Command), never this field.
     now: Option<Track>,
-    /// Bumped on every play request; async sources carry the generation so
-    /// stale ones are dropped instead of appended.
-    generation: u64,
-    /// A worker is building the source for the current generation.
-    preparing: bool,
     show_queue: bool,
     /// Queue row currently being dragged by its ⠿ handle, and the slot it
     /// would land in (index among the other rows) — both cleared on release.
     queue_drag: Option<usize>,
     queue_drop: Option<usize>,
-    /// decode-only (no audio device): simulated playback window
-    /// (clock start, remaining duration).
-    fake_play: Option<(std::time::Instant, std::time::Duration)>,
-    /// decode-only pause point (frozen clock).
-    fake_pause_at: Option<std::time::Instant>,
-    /// Sink-mode playback starts at this offset (pre-seek samples were
-    /// discarded by the worker).
-    play_offset: std::time::Duration,
-    /// Pause state the next applied source must start with (see
-    /// [`applied_source_pause_state`]). `None` once consumed or when the user
-    /// acted in between (their action then wins over the pending decision).
-    arrival_paused: Option<bool>,
-    repeat: Repeat,
-    shuffle: bool,
     /// Album being fetched, and what to do with its tracks.
     album_job: Option<AlbumJob>,
     /// Album id whose `+` is pending (shows "adding…").
     album_busy: Option<String>,
     album_modal: Option<AlbumModal>,
     cheatsheet: bool,
-    /// Sleep timer deadline (paused playback when it fires).
+    /// Sleep timer deadline (pauses playback when it fires).
     sleep_at: Option<(std::time::Instant, std::time::Duration)>,
     /// AMC_SELFTEST=1: drive play_now/queue/auto-advance deterministically
     /// and print SELFTEST PASS/FAIL (headless CI aid).
@@ -443,58 +420,121 @@ pub struct App {
     /// Error toast (full text + expiry state); auto-dismisses after TOAST_TTL.
     error: Option<ErrorToast>,
     last_title: String,
-    /// Desktop media controls (MPRIS); `None` if D-Bus is unusable.
+    /// Desktop media controls (MPRIS); `None` if D-Bus is unusable. The UI
+    /// only PUBLISHES here; commands are drained by the supervisor thread.
     mpris: Option<mpris::Mpris>,
-    /// Bumped on every explicit seek so MPRIS emits `Seeked`.
-    seek_epoch: u64,
-    /// Best-effort Apple play reporting; None = gated off (no token / no
-    /// sink / disabled), so nothing is ever sent in decode-only mode.
-    reporter: Option<report::PlayReporter>,
-    /// A segment is open for `now` (START went out; END pending).
-    report_open: bool,
-    /// start-position-in-milliseconds carried by the open segment's events
-    /// (positions chain: each event starts where the previous one ended).
-    report_seg_start_ms: u64,
-    /// Container reported by the previous START, for the 0/1 change hint.
-    report_last_container: Option<Option<String>>,
-    /// track id → numeric catalog album adam id, filled when tracks arrive
-    /// from an album context (album modal fetch / Queue All) so STARTs keep
-    /// their album attribution across queue auto-advance and shuffle.
-    album_ids: HashMap<String, String>,
     /// Background sequential prefetch of the up-next queue (inert when the
-    /// audio cache is disabled).
+    /// audio cache is disabled). Re-scanned by the UI after its own queue
+    /// mutations; the supervisor scans after its own pointer moves.
     prefetch: Prefetcher,
     rx: Receiver<Msg>,
     tx: Sender<Msg>,
+    // ---- supervisor handles ----
+    /// Commands to the playback supervisor (all play/pause/seek/stop/...).
+    cmd: Sender<Command>,
+    /// ONE playback publication read by UI, MPRIS and tray.
+    pb: Arc<parking_lot::Mutex<PbSnapshot>>,
+    /// Supervisor → UI errors (play-worker failures) for the toast.
+    sup_rx: Receiver<String>,
     /// Desired next-wake delay in millis, published by `update` every frame
     /// and read by the "amc-wake" thread (`WAKE_PARKED` = fully idle).
     wake_ms: Arc<AtomicU64>,
+    /// `AMC_NO_REPAINT=1` debug hook: suppress ALL repaint requests (in-frame
+    /// driver + wake thread + supervisor wakes) so `update` effectively stops
+    /// being scheduled — the decoupling proof that playback still advances.
+    no_repaint: bool,
+    /// Mirrored window visibility, kept in sync by the ✕ handler (hide),
+    /// the tray's Show/Hide + Activate, and MPRIS Raise (show).
+    hidden: Arc<std::sync::atomic::AtomicBool>,
+    /// Last volume/repeat values seen in the snapshot: external changes
+    /// (MPRIS / tray) are adopted into the local mirrors + state.toml.
+    vol_seen: f32,
+    repeat_seen: Repeat,
+    /// Optimistic local shuffle mirror: `toggle_shuffle` flips THIS and sends
+    /// the explicit target — deriving it from the snapshot would read the
+    /// pre-command value and send the same `SetShuffle` twice (the supervisor
+    /// dedupes equal targets, so the queue would stay shuffled).
+    shuffle: bool,
+    shuffle_seen: bool,
+    /// One-shot "decode-only" log flag (the supervisor owns the real state).
+    decode_logged: bool,
+    /// AMC_SELFTEST: does the wrapper serve cacheable CDN streams? Probed
+    /// once on a background thread (blocking HTTP must never run on the UI
+    /// thread — under the supervisor's parallel fetches it can stall for
+    /// seconds and freeze the frame loop).
+    wrapper_cacheable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl App {
     fn new(cfg: Config, egui_ctx: egui::Context) -> Self {
-        let player = Player::new();
         let state = load_state();
         let (theme, theme_warns) = Theme::load();
         for w in &theme_warns {
             eprintln!("[theme] {w}");
         }
         let volume = state.volume.unwrap_or(0.8).clamp(0.0, 1.0);
-        player.volume(volume);
-        // Play reporting only with the config switch on, a media-user-token,
-        // and a REAL audio sink — the decode-only fake clock never reports.
-        let reporter = if report::PlayReporter::enabled(&cfg, player.sink().is_some()) {
-            Some(report::PlayReporter::spawn(cfg.clone()))
-        } else {
-            None
+        let repeat = match state.repeat.as_deref() {
+            Some("all") => Repeat::All,
+            Some("one") => Repeat::One,
+            _ => Repeat::Off,
+        };
+        // AMC_NO_REPAINT=1 debug hook: suppress ALL repaint requests (see the
+        // field doc). Meaningless together with AMC_SELFTEST (whose stage
+        // machine needs frames) — the selftest wins, this flag is ignored.
+        let no_repaint = std::env::var("AMC_NO_REPAINT").is_ok()
+            && std::env::var("AMC_SELFTEST").is_err();
+        if no_repaint {
+            eprintln!(
+                "[no-repaint] AMC_NO_REPAINT=1: every repaint request is suppressed \
+                 (in-frame driver, amc-wake thread, supervisor wakes) — the UI stops \
+                 being scheduled after the initial frames; playback must not care"
+            );
+        }
+        // MPRIS: spawn() only starts a thread (the connection is established
+        // there), so this is as safe as the old first-frame lazy start. The
+        // UI keeps the publish handle; the SUPERVISOR drains the commands.
+        let (mpris, mpris_rx) = match mpris::Mpris::spawn() {
+            Some((m, rx)) => (Some(m), Some(rx)),
+            None => (None, None),
         };
         let (tx, rx) = channel();
         let prefetch = Prefetcher::new(&cfg);
+        let queue = Arc::new(parking_lot::Mutex::new(Queue::default()));
+        // Mirrored window visibility (✕/tray/MPRIS Raise keep it in sync).
+        let hidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // AMC_SELFTEST wrapper probe result (filled on a background thread —
+        // blocking HTTP must never run on the UI thread).
+        let wrapper_cacheable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg_probe = cfg.clone();
+        let wc_flag = wrapper_cacheable.clone();
+        // The playback supervisor owns audio + the advance state machine.
+        // The selftest pins repeat-off for its deterministic assertions (the
+        // queue-model stage relies on natural advance moving on).
+        let selftest = std::env::var("AMC_SELFTEST").is_ok();
+        let (cmd, pb, sup_rx) = supervisor::spawn(
+            cfg.clone(),
+            queue.clone(),
+            if selftest { Repeat::Off } else { repeat },
+            volume,
+            egui_ctx.clone(),
+            no_repaint,
+            mpris_rx,
+            prefetch.clone(),
+            hidden.clone(),
+        );
+        // Tray (StatusNotifierItem; stubbed no-op off Linux — see main.rs).
+        // Best-effort by design: any D-Bus/watcher failure degrades to no
+        // icon, and ✕ still hides the window either way.
+        crate::tray::spawn(
+            pb.clone(),
+            cmd.clone(),
+            hidden.clone(),
+            egui_ctx.clone(),
+        );
         // Parked sentinel until the first frame publishes a real delay.
         let wake_ms = Arc::new(AtomicU64::new(WAKE_PARKED));
         let mut app = Self {
             cfg,
-            player,
             search: String::new(),
             last_term: String::new(),
             results: None,
@@ -516,32 +556,22 @@ impl App {
             demo_playlist: std::env::var("AMC_DEMO_PLAYLIST")
                 .ok()
                 .and_then(|s| s.parse().ok()),
-            queue: Queue::default(),
+            queue,
             now: None,
-            generation: 0,
-            preparing: false,
             show_queue: false,
             queue_drag: None,
             queue_drop: None,
-            fake_play: None,
-            fake_pause_at: None,
-            play_offset: std::time::Duration::ZERO,
-            arrival_paused: None,
-            repeat: match state.repeat.as_deref() {
-                Some("all") => Repeat::All,
-                Some("one") => Repeat::One,
-                _ => Repeat::Off,
-            },
-            shuffle: false,
             album_job: None,
             album_busy: None,
             album_modal: None,
             cheatsheet: false,
             sleep_at: None,
-            selftest: std::env::var("AMC_SELFTEST").is_ok().then(|| SelftestState {
+            selftest: selftest.then(|| SelftestState {
                 stage: 0,
+                step: 0,
                 expect: Default::default(),
                 started: std::time::Instant::now(),
+                seek_epoch: 0,
                 wrapper_cacheable: false,
             }),
             volume,
@@ -554,19 +584,38 @@ impl App {
             // invalid theme keys are surfaced once through the toast
             error: theme_warns.first().map(|w| ErrorToast::new(w.clone())),
             last_title: "amc".into(),
-            mpris: None,
-            seek_epoch: 0,
-            reporter,
-            report_open: false,
-            report_seg_start_ms: 0,
-            report_last_container: None,
-            album_ids: HashMap::new(),
+            mpris,
             prefetch,
             rx,
             tx,
+            cmd,
+            pb,
+            sup_rx,
             wake_ms: wake_ms.clone(),
+            no_repaint,
+            hidden,
+            vol_seen: volume,
+            repeat_seen: repeat,
+            shuffle: false,
+            shuffle_seen: false,
+            decode_logged: false,
+            wrapper_cacheable,
         };
-        spawn_wake_thread(egui_ctx, wake_ms);
+        if selftest {
+            std::thread::Builder::new()
+                .name("amc-wrapper-probe".into())
+                .spawn(move || {
+                    let cacheable = crate::wrapper::Wrapper::new(&cfg_probe.wrapper_url)
+                        .regions()
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false);
+                    wc_flag.store(cacheable, std::sync::atomic::Ordering::Relaxed);
+                })
+                .ok();
+        }
+        if !no_repaint {
+            spawn_wake_thread(egui_ctx, wake_ms);
+        }
         match state.last_view.as_deref() {
             // older builds had Albums as a main tab; map it to the Search
             // sub-view. Unknown values fall back to Search (the default).
@@ -585,8 +634,8 @@ impl App {
         if app.selftest.is_some() {
             // The auto-advance stage asserts queue promotion; a persisted
             // repeat-one would restart the same track instead, so pin the
-            // input the deterministic test depends on.
-            app.repeat = Repeat::Off;
+            // input the deterministic test depends on (the supervisor was
+            // spawned with Repeat::Off above).
             eprintln!("[selftest] armed (repeat forced off)");
         }
         // headless verification hooks: AMC_DEMO_TERM=<query> auto-searches,
@@ -599,6 +648,40 @@ impl App {
         }
         if std::env::var("AMC_DEMO_QUEUE").is_ok() {
             app.show_queue = true;
+        }
+        // AMC_DEMO_PLAY=<n>: frame-INDEPENDENT headless play hook. Searches
+        // AMC_DEMO_TERM (default "daft punk"), queues tracks n..n+3 and plays
+        // track n via the supervisor command channel — deliberately not tied
+        // to poll_messages, so AMC_NO_REPAINT runs (whose frame loop stops
+        // being scheduled) still start playback and exercise natural advance.
+        if let Some(n) = std::env::var("AMC_DEMO_PLAY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            let cfg = app.cfg.clone();
+            let cmd = app.cmd.clone();
+            let queue = app.queue.clone();
+            let term = std::env::var("AMC_DEMO_TERM").unwrap_or_else(|_| "daft punk".into());
+            std::thread::Builder::new()
+                .name("amc-demo-play".into())
+                .spawn(move || {
+                    let Ok(api) = Api::new(cfg) else { return };
+                    let Ok(res) = api.search(&term, 30) else { return };
+                    let tracks: Vec<Track> =
+                        res.tracks.into_iter().skip(n).take(4).collect();
+                    if tracks.is_empty() {
+                        eprintln!("[demo-play] no search results for {term:?}");
+                        return;
+                    }
+                    let first = tracks[0].clone();
+                    queue.lock().insert_after_current(tracks);
+                    eprintln!("[demo-play] queued 4 from {term:?}, playing #{n}");
+                    let _ = cmd.send(Command::Play {
+                        track: first,
+                        close: 0,
+                    });
+                })
+                .expect("spawn amc-demo-play thread");
         }
         match std::env::var("AMC_DEMO_VIEW").as_deref() {
             Ok("library") => app.switch_view(View::Library),
@@ -796,205 +879,44 @@ impl App {
         self.error = Some(ErrorToast::new(e));
     }
 
-    // ---- Apple play reporting ----
+    // ---- supervisor plumbing ----
 
-    /// play-mode triple from the current repeat/shuffle state (amc has no
-    /// autoplay-after-queue feature → auto 1).
-    fn play_mode(&self) -> PlayMode {
-        PlayMode {
-            auto: 1,
-            repeat: match self.repeat {
-                Repeat::Off => 1,
-                Repeat::All => 2,
-                Repeat::One => 3,
-            },
-            shuffle: if self.shuffle { 2 } else { 1 },
-        }
+    /// Read-only clone of the ONE playback publication (UI/MPRIS/tray).
+    fn pb(&self) -> PbSnapshot {
+        self.pb.lock().clone()
     }
 
-    /// Numeric catalog album adam id for `track` when it came from an album
-    /// context; library (`i.`/`p.`) album ids are not adam ids → never sent.
-    fn album_context(&self, track: &Track) -> Option<String> {
-        self.album_ids.get(&track.id).cloned()
+    fn send(&self, cmd: Command) {
+        let _ = self.cmd.send(cmd);
     }
 
-    /// Per-send re-gate: any gate dropped mid-track silently discards the
-    /// open segment.
-    fn report_gates_open(&self) -> bool {
-        self.reporter.is_some() && self.player.sink().is_some()
+    /// Best-effort exit: the supervisor closes the open report segment and
+    /// flushes the reporter (bounded by its request timeout), then exits the
+    /// process — the single exit authority every path (ctrl+Q, MPRIS Quit,
+    /// tray Quit, this) shares.
+    fn exit_flush(&self) {
+        self.send(Command::Quit);
     }
 
-    fn report_pos_ms(&self) -> u64 {
-        self.playback_position().as_millis() as u64
-    }
-
-    /// Open a segment for `track` at `pos_ms` (PLAY_START; hint 1 when the
-    /// album container changed vs the previously reported one, else 0).
-    fn report_start(&mut self, track: &Track, pos_ms: u64) {
-        self.report_open = false; // never two open segments
-        if !self.report_gates_open() {
-            return;
-        }
-        let container = self.album_context(track);
-        let hint = if self.report_last_container.as_ref() != Some(&container) {
-            PlayEvent::HINT_CONTAINER_CHANGED
-        } else {
-            PlayEvent::HINT_NONE
-        };
-        self.report_last_container = Some(container.clone());
-        self.report_seg_start_ms = pos_ms;
-        self.report_open = true;
-        if let Some(r) = &self.reporter {
-            r.send(PlayEvent::start(
-                &track.id,
-                track.duration_ms,
-                pos_ms,
-                hint,
-                self.play_mode(),
-                container,
-            ));
-        }
-    }
-
-    /// Close `track`'s segment (PLAY_END) with `reason` at `pos_ms`.
-    fn report_end_for(&mut self, track: &Track, reason: u8, pos_ms: u64) {
-        if !self.report_open {
-            return;
-        }
-        self.report_open = false;
-        if !self.report_gates_open() {
-            return;
-        }
-        let start_ms = self.report_seg_start_ms;
-        let container = self.album_context(track);
-        if let Some(r) = &self.reporter {
-            r.send(PlayEvent::end(
-                &track.id,
-                track.duration_ms,
-                start_ms,
-                pos_ms,
-                reason,
-                self.play_mode(),
-                container,
-            ));
-        }
-    }
-
-    /// Close the current track's segment.
-    fn report_end(&mut self, reason: u8, pos_ms: u64) {
-        match self.now.clone() {
-            Some(t) => self.report_end_for(&t, reason, pos_ms),
-            None => self.report_open = false,
-        }
-    }
-
-    /// Seek while playing: END(12, old) + END(13, new); the segment stays
-    /// open and continues at the new position (no new START).
-    fn report_scrub(&mut self, old_ms: u64, new_ms: u64) {
-        if !self.report_open {
-            return;
-        }
-        self.report_end(PlayEvent::END_SCRUB_BEGIN, old_ms);
-        self.report_open = true; // same segment continues across the scrub pair
-        self.report_end(PlayEvent::END_SCRUB_END, new_ms);
-        self.report_open = true;
-        self.report_seg_start_ms = new_ms;
-    }
-
-    /// Best-effort END(4) at the current position + bounded flush; used by
-    /// every exit path (window close, ctrl+Q, MPRIS Quit).
-    fn exit_flush(&mut self) {
-        let pos = self.report_pos_ms();
-        self.report_end(PlayEvent::END_SUSPENDED, pos);
-        if let Some(r) = self.reporter.take() {
-            r.shutdown(None);
-        }
-    }
-
-    /// Play a track immediately at `offset`: cancels whatever is
-    /// current/preparing by bumping the generation. Queue/pointer changes are
-    /// the caller's job; this only owns audio, `now` and the START report.
-    /// `kind` decides the report segment semantics and the pause state the
-    /// source starts with on arrival.
-    fn play_now_at(&mut self, track: Track, offset: std::time::Duration, kind: PlayKind) {
-        match kind {
-            PlayKind::SeekRestart => {
-                // a seek restart, not a new play — log it distinctly so a
-                // seek is never mistaken for a second dispatch
-                eprintln!(
-                    "[play] {} — {} (seek → {})",
-                    track.name,
-                    track.artist,
-                    fmt_ms(offset.as_millis() as u64)
-                );
-            }
-            PlayKind::NewSegment | PlayKind::AutoAdvance => {
-                eprintln!("[play] {} — {}", track.name, track.artist);
-                self.report_start(&track, 0);
-            }
-        }
-        self.preparing = true;
-        self.now = Some(track.clone());
-        self.play_offset = offset;
-        let pre_pause = if self.player.decode_only {
-            self.fake_pause_at.is_some()
-        } else {
-            self.player.sink().is_some_and(|s| s.is_paused())
-        };
-        let arrival_paused =
-            applied_source_pause_state(pre_pause, kind != PlayKind::AutoAdvance, kind == PlayKind::AutoAdvance);
-        self.fake_play = None;
-        self.fake_pause_at = arrival_paused.then(std::time::Instant::now);
-        self.arrival_paused = Some(arrival_paused);
-        if let Some(s) = self.player.sink() {
-            // rodio 0.20 `Sink::clear()` also pauses the sink; restore the
-            // arrival state right away so the appended source is audible
-            // unless paused-on-arrival is exactly what the user asked for.
-            s.clear();
-            if !arrival_paused {
-                s.play();
-            }
-        }
-        self.generation += 1;
-        let generation = self.generation;
-        let tx = self.tx.clone();
-        let cfg = self.cfg.clone();
-        // prune keep set for the play fetch: current + up-next stay cached
-        let keep = self.queue.eviction_keep();
-        let t = track;
-        let _ = std::thread::Builder::new().name("play-worker".into()).spawn(move || {
-            let res = (|| -> anyhow::Result<()> {
-                let (prog, _mode) = stream::open_track(&cfg, &t.id, &keep)?;
-                let cancel = prog.cancel_flag();
-                let mut src = PacketSource::with_cancel(Box::new(prog), cancel)?;
-                // Seek = restart the stream and discard output before the
-                // offset (decode is ~100x realtime, so this is cheap).
-                if offset.as_nanos() > 0 {
-                    let per_sec = src.sample_rate as u64 * src.channels.max(1) as u64;
-                    let mut left = (offset.as_secs_f64() * per_sec as f64) as u64;
-                    while left > 0 && src.next().is_some() {
-                        left -= 1;
-                    }
-                }
-                tx.send(Msg::Source(generation, Box::new(src)))
-                    .map_err(|_| anyhow::anyhow!("channel closed"))
-            })();
-            if let Err(e) = res {
-                let _ = tx.send(Msg::Error(format!("{e:#}")));
-            }
-        });
-        // every play moved the pointer → re-target the up-next prefetch
-        self.prefetch.scan(&self.queue);
-    }
-
-    fn play_now(&mut self, track: Track) {
+    /// Play a track immediately: the queue pointer is positioned here (under
+    /// the shared lock), the up-next prefetch re-targeted, and the whole
+    /// audio/report side happens in the supervisor. `close` is the END reason
+    /// for the outgoing segment (see [`Command::Play`]).
+    fn play_now_reasoned(&mut self, track: Track, close: u8) {
         self.remember_tracks(std::slice::from_ref(&track));
-        // click-replacing the current track closes its segment (reason 5);
-        // the outgoing current stays listed in the queue (pointer moves on)
-        let pos = self.report_pos_ms();
-        self.report_end(PlayEvent::END_REPLACED, pos);
-        self.queue.insert_after_current(vec![track.clone()]);
-        self.play_now_at(track, std::time::Duration::ZERO, PlayKind::NewSegment);
+        let t = {
+            let mut q = self.queue.lock();
+            q.insert_after_current(vec![track.clone()]);
+            self.prefetch.scan(&q);
+            track
+        };
+        self.send(Command::Play { track: t, close });
+    }
+
+    /// Click-replacing the current track closes its segment (reason 5); the
+    /// outgoing current stays listed in the queue (pointer moves on).
+    fn play_now(&mut self, track: Track) {
+        self.play_now_reasoned(track, PlayEvent::END_REPLACED);
     }
 
     // ---- favorites ----
@@ -1063,13 +985,16 @@ impl App {
             return;
         }
         self.remember_tracks(&new);
-        let idle_finished = self.now.is_none();
-        if let Some(idx) = self.queue.append(new, idle_finished) {
-            let t = self.queue.tracks[idx].clone();
-            self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
-        } else {
-            // append only (no auto-start): the up-next set grew
-            self.prefetch.scan(&self.queue);
+        let idle_finished = !self.pb().has_track;
+        let start = {
+            let mut q = self.queue.lock();
+            let start = q.append(new, idle_finished);
+            self.prefetch.scan(&q);
+            start.map(|idx| q.tracks[idx].clone())
+        };
+        // append-only path: nothing to play; the up-next set grew (scanned)
+        if let Some(t) = start {
+            self.send(Command::Play { track: t, close: 0 });
         }
     }
 
@@ -1081,11 +1006,16 @@ impl App {
             return;
         }
         self.remember_tracks(&tracks);
-        let pos = self.report_pos_ms();
-        self.report_end(PlayEvent::END_REPLACED, pos);
         let first = tracks[0].clone();
-        self.queue.insert_after_current(tracks);
-        self.play_now_at(first, std::time::Duration::ZERO, PlayKind::NewSegment);
+        {
+            let mut q = self.queue.lock();
+            q.insert_after_current(tracks);
+            self.prefetch.scan(&q);
+        }
+        self.send(Command::Play {
+            track: first,
+            close: PlayEvent::END_REPLACED,
+        });
     }
 
     fn spawn_album_fetch(&mut self, id: String, name: String) {
@@ -1136,310 +1066,83 @@ impl App {
         let Some(j) = (i as isize).checked_add(delta) else {
             return;
         };
-        if j < 0 || j as usize >= self.queue.len() {
+        let mut q = self.queue.lock();
+        if j < 0 || j as usize >= q.len() {
             return;
         }
-        self.queue.move_row(i, j as usize);
-        self.prefetch.scan(&self.queue);
+        q.move_row(i, j as usize);
+        self.prefetch.scan(&q);
     }
 
     /// Move queue row `from` to final index `to` (drag-and-drop drop handler).
     fn queue_move_to(&mut self, from: usize, to: usize) {
-        self.queue.move_row(from, to);
-        self.prefetch.scan(&self.queue);
+        let mut q = self.queue.lock();
+        q.move_row(from, to);
+        self.prefetch.scan(&q);
     }
 
     /// Shuffle keeps the played region + current intact and reorders only the
     /// up-next region; toggling off restores the saved order (queuemodel).
+    /// The queue list op runs in the supervisor (shared lock); this sends the
+    /// EXPLICIT target from the optimistic mirror — the snapshot lags a tick
+    /// and would hand back the pre-command value.
     fn toggle_shuffle(&mut self) {
         self.shuffle = !self.shuffle;
-        self.queue.toggle_shuffle();
-        self.prefetch.scan(&self.queue);
-    }
-
-    /// Elapsed time of the current track (fake clock in decode-only mode).
-    fn playback_position(&self) -> std::time::Duration {
-        match (&self.fake_play, &self.fake_pause_at) {
-            (Some((start, cap)), Some(p)) => p
-                .checked_duration_since(*start)
-                .unwrap_or_default()
-                .min(*cap),
-            (Some((start, cap)), None) => start.elapsed().min(*cap),
-            _ => self.player.position().unwrap_or_default() + self.play_offset,
-        }
+        let want = self.shuffle;
+        self.send(Command::SetShuffle(want));
     }
 
     fn is_paused(&self) -> bool {
-        if self.now.is_none() {
-            return true;
-        }
-        if self.player.decode_only {
-            self.fake_play.is_some() && self.fake_pause_at.is_some()
-        } else {
-            self.player.sink().is_some_and(|s| s.is_paused())
-        }
+        let pb = self.pb();
+        !pb.has_track || pb.paused
     }
 
     fn toggle_pause_now(&mut self) {
-        if self.now.is_none() {
-            return;
-        }
-        let was_paused = self.is_paused();
-        if self.player.decode_only {
-            if let Some((start, _)) = &mut self.fake_play {
-                if let Some(p) = self.fake_pause_at.take() {
-                    if let Some(frozen) = p.checked_duration_since(*start) {
-                        *start += frozen;
-                    }
-                } else {
-                    self.fake_pause_at = Some(std::time::Instant::now());
-                }
-            }
-        } else {
-            self.player.toggle_pause();
-        }
-        // the user just acted — a pending source must not override the new state
-        self.arrival_paused = None;
-        // pause closes the segment (3); resume opens one at the paused
-        // position (hint 0 — same container)
-        let pos = self.report_pos_ms();
-        if was_paused {
-            if let Some(t) = self.now.clone() {
-                self.report_start(&t, pos);
-            }
-        } else {
-            self.report_end(PlayEvent::END_PAUSED, pos);
-        }
+        self.send(Command::Toggle);
     }
 
-    /// Skip to the next queue entry (manual ⏭ / N / MPRIS Next): pointer+1
-    /// and play. At the end of the list this is a deliberate no-op — the
-    /// current track keeps playing (manual skips never wrap, whatever the
-    /// repeat mode).
+    /// Skip to the next queue entry (manual ⏭ / N / MPRIS Next): the
+    /// supervisor moves the pointer and plays. At the end of the list this is
+    /// a deliberate no-op — manual skips never wrap, whatever the repeat mode.
     fn skip_current(&mut self) {
-        if self.now.is_none() {
-            return;
-        }
-        let Some(next) = self.queue.peek_next() else {
-            return;
-        };
-        let pos = self.report_pos_ms();
-        self.report_end(PlayEvent::END_SKIPPED_FORWARDS, pos);
-        self.player.skip();
-        self.queue.play_at(next);
-        let t = self.queue.tracks[next].clone();
-        self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
+        self.send(Command::Next);
     }
 
-    /// Natural end of the current track: move the pointer (repeat-one
-    /// replays, repeat-all wraps) and play that entry; with no next entry,
-    /// stop cleanly — the pointer stays on the finished entry so the session
-    /// stays listed, and a later `+` resumes from the new append.
-    fn advance(&mut self) {
-        let Some(finished) = self.now.clone() else {
-            return;
-        };
-        // END 7 at the full duration. Manual skips report END 2 in
-        // skip_current instead.
-        self.report_end_for(&finished, PlayEvent::END_NATURAL, finished.duration_ms);
-        let next = match self.queue.advance(self.repeat) {
-            Advance::Replay => self.queue.current_index(),
-            Advance::Next(i) => Some(i),
-            Advance::Stop => None,
-        };
-        if let Some(i) = next {
-            let t = self.queue.tracks[i].clone();
-            self.play_now_at(t, std::time::Duration::ZERO, PlayKind::AutoAdvance);
-        } else {
-            self.stop_playback();
-        }
-    }
-
-    /// Drop the current track and stop audibly without reporting (the caller
-    /// has already closed the segment); queue and pointer are left alone.
-    fn stop_playback(&mut self) {
-        self.now = None;
-        self.generation += 1; // invalidate any in-flight source
-        self.preparing = false;
-        self.fake_play = None;
-        self.fake_pause_at = None;
-        self.play_offset = std::time::Duration::ZERO;
-        if let Some(s) = self.player.sink() {
-            s.clear();
-            // rodio 0.20 `Sink::clear()` also pauses the sink; nothing is
-            // playing here, so leave the flag clean for the next application
-            s.play();
-        }
-        self.arrival_paused = None;
-    }
-
-    /// ⏮: restart current if >3s elapsed, else the previous entry (pointer-1);
-    /// on the first entry, restart it.
+    /// ⏮: the supervisor restarts current if >3s elapsed, else goes to the
+    /// previous entry (pointer-1); on the first entry, restarts it.
     fn prev_track(&mut self) {
-        if self.now.is_some() && self.playback_position().as_secs_f64() > 3.0 {
-            self.seek_to(std::time::Duration::ZERO);
-            return;
-        }
-        let Some(prev) = self.queue.peek_prev() else {
-            if self.now.is_some() {
-                self.seek_to(std::time::Duration::ZERO);
-            }
-            return;
-        };
-        let pos = self.report_pos_ms();
-        self.report_end(PlayEvent::END_SKIPPED_BACKWARDS, pos);
-        self.queue.play_at(prev);
-        let t = self.queue.tracks[prev].clone();
-        self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
+        self.send(Command::Prev);
     }
 
-    /// Click-to-seek / ±5s. Sink mode restarts the stream at the offset;
-    /// decode-only shifts the fake clock.
+    /// Click-to-seek / ±5s. The supervisor restarts the stream at the offset
+    /// (sink mode) or shifts its fake clock (decode-only).
     fn seek_to(&mut self, target: std::time::Duration) {
-        let Some(t) = self.now.as_ref().map(|t| t.duration_ms) else {
-            return;
-        };
-        self.seek_epoch += 1; // MPRIS emits Seeked
-        let total = std::time::Duration::from_millis(t);
-        let target = target.min(total);
-        // Scrub while PLAYING: END(12, old pos) then END(13, new pos) and the
-        // segment continues at the new position without a new START. Seeking
-        // while paused only repositions — the resume START lands there.
-        let old = self.report_pos_ms();
-        if let Some((o, n)) = seek_scrub_events(
-            self.report_open,
-            !self.is_paused(),
-            old,
-            target.as_millis() as u64,
-        ) {
-            self.report_scrub(o, n);
-        }
-        if self.player.decode_only {
-            let now = std::time::Instant::now();
-            let end = std::time::Duration::from_millis(t.min(8_000));
-            self.fake_play = Some((now.checked_sub(target).unwrap_or(now), end));
-            if self.fake_pause_at.is_some() {
-                self.fake_pause_at = Some(now);
-            }
-            self.play_offset = target;
-        } else if self.now.is_some() {
-            let t = self.now.clone().expect("checked above");
-            self.play_now_at(t, target, PlayKind::SeekRestart);
-        }
+        self.send(Command::Seek(target));
     }
 
     fn change_volume(&mut self, delta: f32) {
         self.volume = (self.volume + delta).clamp(0.0, 1.0);
-        self.player.volume(self.volume);
+        self.send(Command::SetVolume(self.volume));
     }
 
     /// Pause without toggling (sleep timer).
     fn pause_now(&mut self) {
-        let playing = if self.player.decode_only {
-            self.fake_play.is_some() && self.fake_pause_at.is_none()
-        } else {
-            self.player.sink().is_some_and(|s| !s.is_paused())
-        };
-        if self.player.decode_only {
-            if self.fake_play.is_some() && self.fake_pause_at.is_none() {
-                self.fake_pause_at = Some(std::time::Instant::now());
-            }
-        } else {
-            if let Some(s) = self.player.sink()
-                && !s.is_paused()
-            {
-                s.pause();
-            }
-        }
-        // the user just acted — a pending source must not override the new state
-        self.arrival_paused = None;
-        if playing {
-            let pos = self.report_pos_ms();
-            self.report_end(PlayEvent::END_PAUSED, pos);
-        }
+        self.send(Command::Pause);
     }
 
-    /// MPRIS Stop: clear the queue (the queue panel's "clear") and drop the
-    /// current track, cancelling any in-flight source.
+    /// MPRIS Stop / queue panel "clear": the supervisor closes the segment,
+    /// clears the queue (under the shared lock) and drops the current track.
     fn stop_all(&mut self) {
-        let pos = self.report_pos_ms();
-        self.report_end(PlayEvent::END_SUSPENDED, pos);
-        self.queue.clear();
-        self.stop_playback();
-        self.prefetch.scan(&self.queue);
+        self.send(Command::StopAll);
     }
 
-    /// Drain remote MPRIS commands and dispatch them onto the same code
-    /// paths as clicks/shortcuts.
-    fn drain_mpris(&mut self, ctx: &egui::Context) {
-        let cmds: Vec<mpris::Command> = match self.mpris.as_ref() {
-            Some(m) => {
-                let mut v = Vec::new();
-                while let Ok(c) = m.rx.try_recv() {
-                    v.push(c);
-                }
-                v
-            }
-            None => return,
-        };
-        for cmd in cmds {
-            match cmd {
-                mpris::Command::Play => {
-                    if self.now.is_some() && self.is_paused() {
-                        self.toggle_pause_now();
-                    }
-                }
-                mpris::Command::Pause => self.pause_now(),
-                mpris::Command::TogglePause => self.toggle_pause_now(),
-                mpris::Command::Next => self.skip_current(),
-                mpris::Command::Previous => self.prev_track(),
-                mpris::Command::Stop => self.stop_all(),
-                mpris::Command::Seek(us) => {
-                    let step = std::time::Duration::from_micros(us.unsigned_abs());
-                    let target = if us >= 0 {
-                        self.playback_position() + step
-                    } else {
-                        self.playback_position().saturating_sub(step)
-                    };
-                    self.seek_to(target);
-                }
-                mpris::Command::SetPosition(us) => {
-                    self.seek_to(std::time::Duration::from_micros(us))
-                }
-                mpris::Command::SetLoop(l) => {
-                    self.repeat = match l {
-                        mpris::LoopStatus::None => Repeat::Off,
-                        mpris::LoopStatus::Track => Repeat::One,
-                        mpris::LoopStatus::Playlist => Repeat::All,
-                    };
-                    self.save_ui_state();
-                }
-                mpris::Command::SetShuffle(want) => {
-                    if self.shuffle != want {
-                        self.toggle_shuffle();
-                    }
-                }
-                mpris::Command::SetVolume(v) => {
-                    self.volume = v.clamp(0.0, 1.0);
-                    self.player.volume(self.volume);
-                    self.save_ui_state();
-                }
-                mpris::Command::Raise => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
-                mpris::Command::Quit => {
-                    self.exit_flush();
-                    std::process::exit(0);
-                } // same as ctrl+Q
-            }
-        }
-    }
-
-    /// Publish a playback snapshot for the MPRIS thread (per frame; the
+    /// Publish the supervisor's snapshot to the MPRIS thread (per frame; the
     /// D-Bus side diffs and emits only on change).
-    fn publish_mpris(&self) {
+    fn publish_mpris(&self, pb: &PbSnapshot) {
         let Some(m) = self.mpris.as_ref() else {
             return;
         };
-        let (title, artist, album, art_url, track_id, length) = match &self.now {
+        let (title, artist, album, art_url, track_id, length) = match &pb.track {
             Some(t) => (
                 t.name.clone(),
                 t.artist.clone(),
@@ -1457,11 +1160,10 @@ impl App {
                 std::time::Duration::ZERO,
             ),
         };
-        let position = self.playback_position();
         m.publish(mpris::Snapshot {
-            status: if self.now.is_none() {
+            status: if !pb.has_track {
                 mpris::PlaybackStatus::Stopped
-            } else if self.is_paused() {
+            } else if pb.paused {
                 mpris::PlaybackStatus::Paused
             } else {
                 mpris::PlaybackStatus::Playing
@@ -1472,20 +1174,20 @@ impl App {
             art_url,
             track_id,
             length,
-            position,
-            volume: self.volume,
-            shuffle: self.shuffle,
-            loop_status: match self.repeat {
+            position: pb.position,
+            volume: pb.volume,
+            shuffle: pb.shuffle,
+            loop_status: match pb.repeat {
                 Repeat::Off => mpris::LoopStatus::None,
                 Repeat::One => mpris::LoopStatus::Track,
                 Repeat::All => mpris::LoopStatus::Playlist,
             },
-            has_track: self.now.is_some(),
+            has_track: pb.has_track,
             // pure pointer bounds — repeat-all doesn't fake a next entry and
             // the >3 s restart isn't a "go previous"
-            can_next: self.queue.peek_next().is_some(),
-            can_prev: self.queue.peek_prev().is_some(),
-            seek_epoch: self.seek_epoch,
+            can_next: pb.can_next,
+            can_prev: pb.can_prev,
+            seek_epoch: pb.seek_epoch,
         });
     }
 
@@ -1513,7 +1215,7 @@ impl App {
                     .to_string(),
                 ),
                 repeat: Some(
-                    match self.repeat {
+                    match self.repeat_seen {
                         Repeat::Off => "off",
                         Repeat::All => "all",
                         Repeat::One => "one",
@@ -1531,6 +1233,7 @@ impl App {
     fn handle_keys(&mut self, ctx: &egui::Context) -> bool {
         let mut focus_search = false;
         let typing = ctx.wants_keyboard_input();
+        let pb = self.pb();
         ctx.input(|i| {
             // Esc works even while a text field has focus
             if i.key_pressed(egui::Key::Escape) {
@@ -1567,15 +1270,14 @@ impl App {
             if i.key_pressed(egui::Key::Slash) && !i.modifiers.shift {
                 focus_search = true;
             }
-            let total_ms = self.now.as_ref().map(|t| t.duration_ms).unwrap_or(0);
-            if total_ms > 0 {
+            if pb.has_track {
                 let step = std::time::Duration::from_secs(5);
                 if i.key_pressed(egui::Key::ArrowRight) {
-                    let t = self.playback_position() + step;
+                    let t = pb.position + step;
                     self.seek_to(t);
                 }
                 if i.key_pressed(egui::Key::ArrowLeft) {
-                    self.seek_to(self.playback_position().saturating_sub(step));
+                    self.seek_to(pb.position.saturating_sub(step));
                 }
             }
             if i.key_pressed(egui::Key::ArrowUp) {
@@ -1598,8 +1300,8 @@ impl App {
                     self.switch_view(View::Playlists);
                 }
                 if i.key_pressed(egui::Key::Q) {
+                    // the supervisor flushes the report segment and exits
                     self.exit_flush();
-                    std::process::exit(0);
                 }
                 if i.key_pressed(egui::Key::F) {
                     focus_search = true;
@@ -1655,44 +1357,15 @@ impl App {
                         m.loading_more = false;
                     }
                 }
-                Msg::Source(g, src) => {
-                    if g == self.generation {
-                        self.player.enqueue(*src);
-                        self.preparing = false;
-                        // enforce the planned arrival pause state; `None` means
-                        // the user acted during preparation and their action
-                        // (already applied to the sink) must not be overridden
-                        if let Some(true) = self.arrival_paused
-                            && let Some(s) = self.player.sink()
-                        {
-                            s.pause();
-                        }
-                        self.arrival_paused = None;
-                        // start the decode-only fake clock (keep a seek target);
-                        // tuple = (clock start, elapsed-at-end)
-                        if self.player.decode_only
-                            && self.fake_play.is_none()
-                            && let Some(t) = &self.now
-                        {
-                            let end =
-                                std::time::Duration::from_millis(t.duration_ms.min(8_000));
-                            let start = std::time::Instant::now()
-                                .checked_sub(self.play_offset)
-                                .unwrap_or_else(std::time::Instant::now);
-                            self.fake_play = Some((start, end));
-                        }
-                    } // stale: dropping src also cancels its download
-                }
                 Msg::AlbumTracks { id, tracks, .. } => {
-                    // album-context attribution: keep the album adam id for
-                    // these tracks so STARTs stay attributed through queue
-                    // auto-advance / shuffle (library `i.` ids are not adam
-                    // ids and are never reported).
-                    if id.chars().all(|c| c.is_ascii_digit()) {
-                        for t in &tracks {
-                            self.album_ids.insert(t.id.clone(), id.clone());
-                        }
-                    }
+                    // album-context attribution: hand the album adam id to the
+                    // supervisor (library `i.` ids are not adam ids and are
+                    // never reported) so STARTs stay attributed through queue
+                    // auto-advance / shuffle.
+                    self.send(Command::NoteAlbum {
+                        album_id: id.clone(),
+                        track_ids: tracks.iter().map(|t| t.id.clone()).collect(),
+                    });
                     let modal_want =
                         matches!(&self.album_job, Some(AlbumJob::Modal { id: w }) if w.as_str() == id.as_str());
                     let queue_want =
@@ -1715,7 +1388,6 @@ impl App {
                 Msg::Error(e) => {
                     self.fail(e);
                     self.searching = false;
-                    self.preparing = false;
                     self.album_job = None;
                     self.album_busy = None;
                     self.library_loading = false;
@@ -1729,19 +1401,71 @@ impl App {
                 Msg::Notice(note) => self.fail(note),
             }
         }
+        // supervisor → UI (play-worker failures): same toast, no fetch-state
+        // resets — the supervisor already cleared its own preparing flag.
+        while let Ok(e) = self.sup_rx.try_recv() {
+            self.fail(e);
+        }
     }
 
     // ---- deterministic selftest (AMC_SELFTEST=1) ----
 
+    // Selftest observation helpers (snapshot/queue reads that interleave
+    // with &mut self actions inside the stage machine).
+    fn st_now_is(&self, want: &str) -> bool {
+        self.pb
+            .lock()
+            .track
+            .as_ref()
+            .is_some_and(|t| t.name == want)
+    }
+    fn st_q_len(&self) -> usize {
+        self.queue.lock().len()
+    }
+    fn st_q_pos(&self) -> Option<usize> {
+        self.queue.lock().pos
+    }
+    fn st_get_is(&self, i: usize, id: &str) -> bool {
+        self.queue.lock().tracks.get(i).is_some_and(|t| t.id == id)
+    }
+    fn st_front_is(&self, id: &str) -> bool {
+        self.queue.lock().tracks.first().is_some_and(|t| t.id == id)
+    }
+    fn st_ids(&self) -> Vec<String> {
+        self.queue.lock().tracks.iter().map(|t| t.id.clone()).collect()
+    }
+
+    /// Advance the stage machine one step and reset its per-step budget.
+    fn st_advance(&mut self, stage: u8, step: u8) {
+        if let Some(st) = &mut self.selftest {
+            st.stage = stage;
+            st.step = step;
+            st.started = std::time::Instant::now();
+        }
+    }
+
     fn selftest_step(&mut self) {
-        // stage 0 — synchronous queue-model invariants (pointer non-
+        // stage 0 — queue-model invariants end-to-end (pointer non-
         // consumption, +/auto-start rules, reorder/drag/shuffle bookkeeping,
-        // prev/next, ✕ handling). No audio needed; decode-only safe.
+        // prev/next, ✕ handling). Supervisor-mediated actions land
+        // asynchronously now, so each sub-step awaits its observable state
+        // (≤ 15 s, normally the next frame) before firing the next action;
+        // pure list ops still assert in the same frame. No audio needed;
+        // decode-only safe.
         if self
             .selftest
             .as_ref()
             .is_some_and(|st| st.stage == 0 && self.results.as_ref().is_some_and(|r| r.tracks.len() >= 5))
         {
+            let (step, elapsed) = {
+                let st = self.selftest.as_ref().expect("checked");
+                (st.step, st.started.elapsed())
+            };
+            if elapsed > std::time::Duration::from_secs(15) {
+                eprintln!("[selftest] stage0 FAIL (step {step} timed out)");
+                eprintln!("[selftest] RESULT: FAIL");
+                std::process::exit(1);
+            }
             let seed: Vec<Track> = self
                 .results
                 .as_ref()
@@ -1758,139 +1482,195 @@ impl App {
                 seed[4].name.clone(),
             );
             let (id0, id1) = (seed[0].id.clone(), seed[1].id.clone());
-            let now_is = |app: &Self, want: &str| {
-                app.now.as_ref().map(|t| t.name.as_str()) == Some(want)
+
+            // Each arm first checks the state the previous step's action must
+            // have produced (`false` = keep waiting); only then does it fire
+            // the next action.
+            let done = match step {
+                // (0→1) "play now" from idle: pointer lands on the track
+                0 => {
+                    self.play_now(seed[0].clone());
+                    true
+                }
+                1 => {
+                    let ok = self.st_now_is(&n0)
+                        && self.st_q_len() == 1
+                        && self.st_q_pos() == Some(0);
+                    if ok {
+                        // (1→2) `+` while playing: append at the end, never jump
+                        self.enqueue_tracks(vec![seed[1].clone(), seed[2].clone()]);
+                    }
+                    ok
+                }
+                2 => {
+                    let ok = self.st_q_len() == 3
+                        && self.st_q_pos() == Some(0)
+                        && self.st_get_is(1, &id1)
+                        && self.st_now_is(&n0);
+                    if ok {
+                        // (2→3) reorder / drag / shuffle keep the pointer on
+                        // the current row — pure list ops, asserted in-frame
+                        self.queue_move(1, -1);
+                        let ok_up = self.st_front_is(&id1) && self.st_q_pos() == Some(1);
+                        self.queue_move(0, 1);
+                        let ok_down = self.st_get_is(1, &id1) && self.st_q_pos() == Some(0);
+                        // drag-and-drop path: the exact method the drop
+                        // handler calls
+                        self.queue_move_to(0, 2);
+                        let ok_drag_down = self.st_front_is(&id1) && self.st_q_pos() == Some(2);
+                        self.queue_move_to(2, 0);
+                        let ok_drag_up = self.st_front_is(&id0) && self.st_q_pos() == Some(0);
+                        // shuffle toggle must restore the original order
+                        let before = self.st_ids();
+                        self.toggle_shuffle();
+                        self.toggle_shuffle();
+                        let after = self.st_ids();
+                        let ok_shuffle = after == before && self.st_q_pos() == Some(0);
+                        let ok = ok_up && ok_down && ok_drag_down && ok_drag_up && ok_shuffle;
+                        if !ok {
+                            eprintln!(
+                                "[selftest] stage0 FAIL (up={ok_up} down={ok_down} \
+                                 drag_down={ok_drag_down} drag_up={ok_drag_up} \
+                                 shuffle={ok_shuffle})"
+                            );
+                            eprintln!("[selftest] RESULT: FAIL");
+                            std::process::exit(1);
+                        }
+                        // (3→4) manual ⏭ moves the pointer without consuming
+                        self.skip_current();
+                    }
+                    ok
+                }
+                3 => {
+                    let ok = self.st_q_pos() == Some(1)
+                        && self.st_q_len() == 3
+                        && self.st_now_is(&n1);
+                    if ok {
+                        // (4→5) ⏮ (track just started, <3 s) goes to the
+                        // previous entry
+                        self.prev_track();
+                    }
+                    ok
+                }
+                4 => {
+                    let ok = self.st_q_pos() == Some(0)
+                        && self.st_q_len() == 3
+                        && self.st_now_is(&n0);
+                    if ok {
+                        // (5→6) pause for the paused-`+` check
+                        self.pause_now();
+                    }
+                    ok
+                }
+                5 => {
+                    let ok = self.is_paused();
+                    if ok {
+                        // (5→6) paused + `+`: append only, no auto-jump —
+                        // asserted in-frame (pure list op)
+                        self.enqueue_tracks(vec![seed[3].clone()]);
+                        let okp = self.st_q_len() == 4
+                            && self.st_q_pos() == Some(0)
+                            && self.st_now_is(&n0);
+                        if !okp {
+                            eprintln!("[selftest] stage0 FAIL (paused_plus={okp})");
+                            eprintln!("[selftest] RESULT: FAIL");
+                            std::process::exit(1);
+                        }
+                        self.toggle_pause_now();
+                    }
+                    ok
+                }
+                6 => {
+                    let ok = !self.is_paused() && self.st_q_len() == 4;
+                    if ok {
+                        // (6→7) ✕ of a later row leaves playback alone
+                        self.remove_queue_row(3);
+                        let okr = self.st_q_len() == 3 && self.st_q_pos() == Some(0);
+                        if !okr {
+                            eprintln!("[selftest] stage0 FAIL (remove_later={okr})");
+                            eprintln!("[selftest] RESULT: FAIL");
+                            std::process::exit(1);
+                        }
+                    }
+                    ok
+                }
+                // (7→8) ✕ of the current row hands over to its successor
+                7 => {
+                    self.remove_queue_row(0);
+                    true
+                }
+                8 => {
+                    let ok = self.st_now_is(&n1)
+                        && self.st_q_pos() == Some(0)
+                        && self.st_q_len() == 2;
+                    if ok {
+                        // (8→9) "play now" inserts right after the current entry
+                        self.play_now(seed[4].clone());
+                    }
+                    ok
+                }
+                9 => {
+                    let ok = self.st_q_len() == 3
+                        && self.st_q_pos() == Some(1)
+                        && self.st_get_is(1, &seed[4].id)
+                        && self.st_now_is(&n4);
+                    if ok {
+                        eprintln!("[selftest] stage0 queue-model PASS");
+                        if let Some(st) = &mut self.selftest {
+                            st.expect = [n4, n2, n0];
+                            // probed OFF-frame at startup (blocking HTTP — the
+                            // wrapper is busy with the supervisor's fetches)
+                            st.wrapper_cacheable = self
+                                .wrapper_cacheable
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.st_advance(1, 0);
+                    }
+                    ok
+                }
+                _ => false,
             };
-            let front_is =
-                |q: &Queue, id: &str| q.tracks.first().map(|t| t.id.as_str()) == Some(id);
-            let get_is = |q: &Queue, i: usize, id: &str| {
-                q.tracks.get(i).map(|t| t.id.as_str()) == Some(id)
-            };
-
-            // (1) "play now" from idle: pointer lands on the track
-            self.play_now(seed[0].clone());
-            let ok_start =
-                now_is(self, &n0) && self.queue.len() == 1 && self.queue.pos == Some(0);
-
-            // (2) `+` while playing: append at the end, never jump
-            self.enqueue_tracks(vec![seed[1].clone(), seed[2].clone()]);
-            let ok_plus = self.queue.len() == 3
-                && self.queue.pos == Some(0)
-                && get_is(&self.queue, 1, &id1)
-                && now_is(self, &n0);
-
-            // (3) reorder / drag / shuffle keep the pointer on the current row
-            self.queue_move(1, -1);
-            let ok_up = front_is(&self.queue, &id1) && self.queue.pos == Some(1);
-            self.queue_move(0, 1);
-            let ok_down = get_is(&self.queue, 1, &id1) && self.queue.pos == Some(0);
-            // drag-and-drop path: the exact method the drop handler calls
-            self.queue_move_to(0, 2);
-            let ok_drag_down = front_is(&self.queue, &id1) && self.queue.pos == Some(2);
-            self.queue_move_to(2, 0);
-            let ok_drag_up = front_is(&self.queue, &id0) && self.queue.pos == Some(0);
-            // shuffle toggle must restore the original order deterministically
-            let before: Vec<String> = self.queue.tracks.iter().map(|t| t.id.clone()).collect();
-            self.toggle_shuffle();
-            self.toggle_shuffle();
-            let after: Vec<String> = self.queue.tracks.iter().map(|t| t.id.clone()).collect();
-            let ok_shuffle = after == before && self.queue.pos == Some(0);
-
-            // (4) manual ⏭ / ⏮ move the pointer without consuming
-            self.skip_current();
-            let ok_next = self.queue.pos == Some(1) && self.queue.len() == 3;
-            self.prev_track();
-            let ok_prev = self.queue.pos == Some(0) && self.queue.len() == 3;
-
-            // (5) paused + `+`: append only, no auto-jump
-            self.pause_now();
-            self.enqueue_tracks(vec![seed[3].clone()]);
-            let ok_paused_plus = self.queue.len() == 4
-                && self.queue.pos == Some(0)
-                && now_is(self, &n0);
-            self.toggle_pause_now();
-
-            // (6) ✕ of a later row leaves playback alone
-            self.remove_queue_row(3);
-            let ok_remove_later = self.queue.len() == 3 && self.queue.pos == Some(0);
-
-            // (7) ✕ of the current row hands over to its successor
-            self.remove_queue_row(0);
-            let ok_remove_cur = self.queue.pos == Some(0)
-                && self.queue.len() == 2
-                && now_is(self, &n1);
-
-            // (8) "play now" inserts right after the current entry
-            self.play_now(seed[4].clone());
-            let ok_insert = self.queue.len() == 3
-                && self.queue.pos == Some(1)
-                && get_is(&self.queue, 1, &seed[4].id);
-
-            let ok = ok_start
-                && ok_plus
-                && ok_up
-                && ok_down
-                && ok_drag_down
-                && ok_drag_up
-                && ok_shuffle
-                && ok_next
-                && ok_prev
-                && ok_paused_plus
-                && ok_remove_later
-                && ok_remove_cur
-                && ok_insert;
-            if !ok {
-                eprintln!(
-                    "[selftest] stage0 FAIL (start={ok_start} plus={ok_plus} up={ok_up} \
-                     down={ok_down} drag_down={ok_drag_down} drag_up={ok_drag_up} \
-                     shuffle={ok_shuffle} next={ok_next} prev={ok_prev} \
-                     paused_plus={ok_paused_plus} remove_later={ok_remove_later} \
-                     remove_cur={ok_remove_cur} insert={ok_insert})"
-                );
-                eprintln!("[selftest] RESULT: FAIL");
-                std::process::exit(1);
-            }
-            eprintln!("[selftest] stage0 queue-model PASS");
-            if let Some(st) = &mut self.selftest {
-                st.expect = [n4, n2, n0];
-                st.wrapper_cacheable = crate::wrapper::Wrapper::new(&self.cfg.wrapper_url)
-                    .regions()
-                    .map(|r| !r.is_empty())
-                    .unwrap_or(false);
-                st.stage = 1;
-                st.started = std::time::Instant::now();
+            if done && self.selftest.as_ref().is_some_and(|st| st.stage == 0) {
+                self.st_advance(0, step + 1);
             }
         }
         if let Some(st) = &mut self.selftest {
             let elapsed = st.started.elapsed();
-            let now_name = self.now.as_ref().map(|t| t.name.clone()).unwrap_or_default();
+            let pb = self.pb.lock().clone();
+            let now_name = pb.track.as_ref().map(|t| t.name.clone()).unwrap_or_default();
             let matches = |want: &str| now_name == *want;
             match st.stage {
                 // stage 1: the play_now target must eventually play (≤ 15 s);
                 // on a wrapper-backed run the up-next entry must also be
                 // cache-complete by then (sequential prefetch proof).
                 1 => {
-                    if matches(&st.expect[0]) && !self.preparing {
-                        let next_cached = match self
-                            .queue
-                            .current_index()
-                            .and_then(|p| self.queue.tracks.get(p + 1))
-                        {
-                            Some(t) if st.wrapper_cacheable => crate::acache::AudioCache::new(
-                                &self.cfg,
-                            )
-                            .lookup(&t.id)
-                            .is_some(),
-                            _ => true,
+                    if matches(&st.expect[0]) && !pb.preparing {
+                        // NOTE: one lock scope for the whole queue read — a
+                        // `self.queue.lock()...and_then(|p| self.queue.lock()…)`
+                        // would self-deadlock (the scrutinee guard outlives
+                        // the closure).
+                        let next_cached = {
+                            let q = self.queue.lock();
+                            match q
+                                .current_index()
+                                .and_then(|p| q.tracks.get(p + 1).cloned())
+                            {
+                                Some(t) if st.wrapper_cacheable => {
+                                    crate::acache::AudioCache::new(&self.cfg)
+                                        .lookup(&t.id)
+                                        .is_some()
+                                }
+                                _ => true,
+                            }
                         };
                         if next_cached {
-                            eprintln!("[selftest] stage1 PASS (now={now_name:?}, queue={})", self.queue.len());
+                            eprintln!("[selftest] stage1 PASS (now={now_name:?}, queue={})", { self.queue.lock().len() });
                             st.stage = 2;
                             st.started = std::time::Instant::now();
                         } else if elapsed > std::time::Duration::from_secs(30) {
                             eprintln!(
                                 "[selftest] stage1 FAIL (prefetch: up-next not cache-complete, now={now_name:?}, queue={})",
-                                self.queue.len()
+                                { self.queue.lock().len() }
                             );
                             eprintln!("[selftest] RESULT: FAIL");
                             std::process::exit(1);
@@ -1899,7 +1679,7 @@ impl App {
                         eprintln!(
                             "[selftest] stage1 FAIL (now={now_name:?}, want {:?}, queue={})",
                             st.expect[0],
-                            self.queue.len()
+                            { self.queue.lock().len() }
                         );
                         eprintln!("[selftest] RESULT: FAIL");
                         std::process::exit(1);
@@ -1908,16 +1688,16 @@ impl App {
                 // stage 2: natural end auto-advances to the next entry; the
                 // queue is NOT consumed (still 3 rows, pointer moved on)
                 2 => {
-                    if matches(&st.expect[1]) && self.queue.len() == 3 && self.queue.pos == Some(2) {
-                        eprintln!("[selftest] stage2 PASS (now={now_name:?}, queue={})", self.queue.len());
+                    if matches(&st.expect[1]) && { self.queue.lock().len() } == 3 && { self.queue.lock().pos } == Some(2) {
+                        eprintln!("[selftest] stage2 PASS (now={now_name:?}, queue={})", { self.queue.lock().len() });
                         st.stage = 3;
                         st.started = std::time::Instant::now();
                     } else if elapsed > std::time::Duration::from_secs(15) {
                         eprintln!(
                             "[selftest] stage2 FAIL (now={now_name:?}, want {:?}, queue={} pos={:?})",
                             st.expect[1],
-                            self.queue.len(),
-                            self.queue.pos
+                            { self.queue.lock().len() },
+                            { self.queue.lock().pos }
                         );
                         eprintln!("[selftest] RESULT: FAIL");
                         std::process::exit(1);
@@ -1928,15 +1708,15 @@ impl App {
                 // (5 = same check passed; the `+` fires outside this borrow.)
                 3 | 5 => {
                     let done =
-                        self.now.is_none() && self.queue.pos == Some(2) && self.queue.len() == 3;
+                        !pb.has_track && { self.queue.lock().pos } == Some(2) && { self.queue.lock().len() } == 3;
                     if st.stage == 3 && done {
                         st.stage = 5;
                         st.started = std::time::Instant::now();
                     } else if elapsed > std::time::Duration::from_secs(15) {
                         eprintln!(
                             "[selftest] stage3 FAIL (now={now_name:?}, queue={} pos={:?})",
-                            self.queue.len(),
-                            self.queue.pos
+                            { self.queue.lock().len() },
+                            { self.queue.lock().pos }
                         );
                         eprintln!("[selftest] RESULT: FAIL");
                         std::process::exit(1);
@@ -1944,32 +1724,34 @@ impl App {
                 }
                 // stage 4: the post-finish `+` auto-started the appended track
                 4 => {
-                    if matches(&st.expect[2]) && self.queue.len() == 4 && self.queue.pos == Some(3) {
-                        eprintln!("[selftest] stage4 PASS (now={now_name:?}, queue={})", self.queue.len());
+                    if matches(&st.expect[2]) && { self.queue.lock().len() } == 4 && { self.queue.lock().pos } == Some(3) {
+                        eprintln!("[selftest] stage4 PASS (now={now_name:?}, queue={})", { self.queue.lock().len() });
                         // stages 6-8 verify the pause mirror (seek restarts
                         // restore the pre-seek pause state; a paused replace
                         // lands paused) and then finish the run
                         st.stage = 6;
+                        st.step = 0;
                         st.started = std::time::Instant::now();
                     } else if elapsed > std::time::Duration::from_secs(15) {
                         eprintln!(
                             "[selftest] stage4 FAIL (now={now_name:?}, want {:?}, queue={} pos={:?})",
                             st.expect[2],
-                            self.queue.len(),
-                            self.queue.pos
+                            { self.queue.lock().len() },
+                            { self.queue.lock().pos }
                         );
                         eprintln!("[selftest] RESULT: FAIL");
                         std::process::exit(1);
                     }
                 }
-                // stages 6-8: wait for the current source to land; the actual
-                // steps run outside this borrow (below), like trigger (b).
-                // Only the timeout is handled here.
+                // stages 6-8: per-step waits happen outside this borrow
+                // (below), like trigger (b); only the per-step timeout is
+                // handled here.
                 6..=8 if elapsed > std::time::Duration::from_secs(15) => {
                     eprintln!(
-                        "[selftest] stage{} FAIL (now={now_name:?}, preparing={})",
+                        "[selftest] stage{} FAIL (now={now_name:?}, preparing={}, step={})",
                         st.stage,
-                        self.preparing
+                        pb.preparing,
+                        st.step
                     );
                     eprintln!("[selftest] RESULT: FAIL");
                     std::process::exit(1);
@@ -1990,48 +1772,64 @@ impl App {
         // triggers (c)-(e), outside the selftest borrow: the pause-mirror
         // stages. In decode-only mode the mirror is the fake clock; on a real
         // sink it is the sink's pause flag — the same assertions cover both.
-        match self.selftest.as_ref().map(|st| st.stage) {
+        // Every action lands via the supervisor, so each step awaits its
+        // observable state (the 6..=8 timeout arm above bounds each wait).
+        match self.selftest.as_ref().map(|st| (st.stage, st.step)) {
             // (c) stage 6: pause, then a seek restart — the exact pre-seek
             // pause state must be restored; resuming must be audible.
-            Some(6) if !self.preparing => {
+            Some((6, 0)) if !self.pb.lock().preparing => {
                 self.pause_now();
+                self.st_advance(6, 1);
+            }
+            Some((6, 1)) if self.pb.lock().has_track && self.pb.lock().paused => {
+                let epoch = self.pb.lock().seek_epoch;
                 self.seek_to(std::time::Duration::ZERO);
-                let ok_seek = self.is_paused() && self.now.is_some();
-                self.toggle_pause_now();
-                let ok_resume = !self.is_paused();
                 if let Some(st) = &mut self.selftest {
-                    st.started = std::time::Instant::now();
-                    if ok_seek && ok_resume {
-                        eprintln!("[selftest] stage6 PASS (seek restores pause; resume plays)");
-                        st.stage = 7;
-                    } else {
-                        eprintln!("[selftest] stage6 FAIL (seek_paused={ok_seek} resume_playing={ok_resume})");
-                        eprintln!("[selftest] RESULT: FAIL");
-                        std::process::exit(1);
-                    }
+                    st.seek_epoch = epoch;
+                }
+                self.st_advance(6, 2);
+            }
+            Some((6, 2)) => {
+                let pb = self.pb.lock().clone();
+                let seek_landed = pb.seek_epoch > self
+                    .selftest
+                    .as_ref()
+                    .map(|st| st.seek_epoch)
+                    .unwrap_or(0);
+                let ok_seek = pb.has_track && pb.paused && !pb.preparing && seek_landed;
+                if ok_seek {
+                    // resume must be audible again
+                    self.toggle_pause_now();
+                    self.st_advance(6, 3);
                 }
             }
+            Some((6, 3)) if !self.is_paused() => {
+                eprintln!("[selftest] stage6 PASS (seek restores pause; resume plays)");
+                self.st_advance(7, 0);
+            }
             // (d) stage 7: replace the current track while PAUSED.
-            Some(7) if !self.preparing => {
+            Some((7, 0)) if !self.pb.lock().preparing => {
                 self.pause_now();
+                self.st_advance(7, 1);
+            }
+            Some((7, 1)) if self.pb.lock().paused => {
                 let t = self.results.as_ref().expect("checked").tracks[2].clone();
                 self.play_now(t);
-                if let Some(st) = &mut self.selftest {
-                    st.stage = 8;
-                    st.started = std::time::Instant::now();
-                }
+                self.st_advance(8, 0);
             }
             // (e) stage 8: the replacement must land PAUSED (paused-on-arrival
             // is correct when the user had explicitly paused); resuming plays.
-            Some(8) if !self.preparing => {
-                let landed_paused = self.is_paused();
-                self.toggle_pause_now();
-                let resume_plays = !self.is_paused();
-                if landed_paused && resume_plays {
-                    eprintln!("[selftest] stage8 PASS (paused replace lands paused; resume plays)");
-                    eprintln!("[selftest] RESULT: PASS");
-                    std::process::exit(0);
+            Some((8, 0)) => {
+                let pb = self.pb.lock().clone();
+                if pb.has_track && pb.paused && !pb.preparing {
+                    self.toggle_pause_now();
+                    self.st_advance(8, 1);
                 }
+            }
+            Some((8, 1)) if !self.is_paused() => {
+                eprintln!("[selftest] stage8 PASS (paused replace lands paused; resume plays)");
+                eprintln!("[selftest] RESULT: PASS");
+                std::process::exit(0);
             }
             _ => {}
         }
@@ -2082,15 +1880,26 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_theme(ctx);
-        // Lazy MPRIS startup: after the window is up, never blocking the
-        // first frame (spawn() only starts a thread).
-        if self.mpris.is_none() {
-            self.mpris = mpris::Mpris::spawn();
+        // Refresh the render mirror from the ONE playback publication.
+        let pb = self.pb();
+        self.now = pb.track.clone();
+
+        // ✕ hides the window (close-to-tray semantics — playback, MPRIS and
+        // the tray live off-frame). With no StatusNotifier host present the
+        // behavior degrades identically: the window hides, restore via MPRIS
+        // Raise / `playerctl play`... or simply relaunch-focus; real exit is
+        // Ctrl+Q / tray Quit / MPRIS Quit. CancelClose must be sent in THIS
+        // pass for eframe to veto the close (see eframe's close_requested
+        // handling).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hidden.store(true, Ordering::Relaxed);
         }
+
         let mut focus_search = self.handle_keys(ctx);
         self.poll_messages();
         self.selftest_step();
-        self.drain_mpris(ctx);
 
         // ---- debounced state.toml write (favorite toggles) ----
         if let Some(t) = self.state_dirty
@@ -2108,18 +1917,25 @@ impl eframe::App for App {
             self.fail("sleep timer expired — playback paused".into());
         }
 
-        // ---- auto-advance ----
-        let idle = if self.player.decode_only {
-            match &self.fake_play {
-                // playback_position freezes while paused
-                Some((_, end)) => self.playback_position() >= *end,
-                None => true,
+        // ---- adopt external volume/repeat changes (MPRIS / tray) ----
+        if (pb.volume - self.vol_seen).abs() > f32::EPSILON {
+            self.vol_seen = pb.volume;
+            if (pb.volume - self.volume).abs() > f32::EPSILON {
+                self.volume = pb.volume;
+                self.save_ui_state();
             }
-        } else {
-            self.player.is_idle()
-        };
-        if self.now.is_some() && !self.preparing && idle {
-            self.advance();
+        }
+        if pb.repeat != self.repeat_seen {
+            self.repeat_seen = pb.repeat;
+            self.save_ui_state();
+        }
+        if pb.shuffle != self.shuffle_seen {
+            self.shuffle_seen = pb.shuffle;
+            self.shuffle = pb.shuffle;
+        }
+        if pb.decode_only && !self.decode_logged {
+            self.decode_logged = true;
+            eprintln!("[ui] decode-only mode — the supervisor's fake clock drives playback");
         }
 
         // ---- window title ----
@@ -2221,7 +2037,6 @@ impl eframe::App for App {
 
         // ---- central: rows ----
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.player.volume(self.volume);
             let mut act: Option<CentralAction> = None;
             match self.view {
                 View::Search => self.search_central(ui, &mut act),
@@ -2253,18 +2068,18 @@ impl eframe::App for App {
         }
         self.toast_ui(ctx);
 
-        self.publish_mpris();
+        self.publish_mpris(&pb);
 
         // Single repaint driver: one bounded wakeup covers every state where
-        // `update` may still have work (auto-advance, MPRIS drain, toasts), so
-        // playback keeps advancing while the window is unfocused; truly idle
-        // states park. See `next_repaint_delay`.
+        // `update` may still have work (progress ticking, toasts), so the
+        // render keeps up while the window is unfocused; truly idle states
+        // park. The ADVANCE no longer depends on any of this — the supervisor
+        // runs off-frame and wakes us when something changes. See
+        // `next_repaint_delay`.
         let now = std::time::Instant::now();
-        let playing = self.now.is_some() && !self.preparing && !self.is_paused() && !idle;
-        let work_pending = self.now.is_some()
-            || self.preparing
-            || !self.queue.is_empty()
-            || self.state_dirty.is_some();
+        let playing = pb.has_track && !pb.preparing && !pb.paused;
+        let work_pending =
+            pb.has_track || pb.preparing || !self.queue.lock().is_empty() || self.state_dirty.is_some();
         let toast = self.error.as_ref().and_then(|e| e.next_repaint(now));
         let sleep = self.sleep_at.map(|(t0, d)| d.saturating_sub(t0.elapsed()));
         let next_delay = next_repaint_delay(playing, work_pending, toast, sleep);
@@ -2275,10 +2090,13 @@ impl eframe::App for App {
         // in-frame request above only fires while frames are flowing, so a
         // compositor that stops redrawing an unfocused window (Wayland /
         // niri-family frame-callback throttle) would silence it permanently.
-        // The thread re-issues the wake off-frame, keeping playback alive;
-        // when parked it sleeps ~1s and requests nothing.
-        self.wake_ms
-            .store(wake_publish_ms(next_delay), Ordering::Relaxed);
+        // The thread re-issues the wake off-frame; when parked it sleeps ~1s
+        // and requests nothing. Under AMC_NO_REPAINT the thread does not
+        // exist and this request is skipped — the frame loop genuinely parks.
+        if !self.no_repaint {
+            self.wake_ms
+                .store(wake_publish_ms(next_delay), Ordering::Relaxed);
+        }
     }
 
     /// Transparent-viewport clear color: the theme background at the theme's
@@ -2696,10 +2514,11 @@ enum BarIntent {
 
 impl App {
     fn player_bar(&mut self, ctx: &egui::Context) {
+        let pb = self.pb();
         let mut act: Option<BarIntent> = None;
         let mut vol = self.volume;
         egui::TopBottomPanel::bottom("player").show(ctx, |ui| {
-            let paused = self.is_paused();
+            let paused = !pb.has_track || pb.paused;
             ui.add_space(5.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -2713,34 +2532,24 @@ impl App {
                     act = Some(BarIntent::Next);
                 }
                 ui.add_space(6.0);
-                if self.now.is_some() {
+                if let Some(t) = &pb.track {
                     ui.vertical(|ui| {
-                        if let Some(t) = &self.now {
-                            ui.add_sized(
-                                [280.0, 14.0],
-                                egui::Label::new(
-                                    egui::RichText::new(&t.name).strong().size(13.0),
-                                )
-                                .halign(egui::Align::LEFT)
-                                .truncate(),
-                            );
-                        }
-                        let pos = self.playback_position();
-                        let real_ms =
-                            self.now.as_ref().map(|t| t.duration_ms).unwrap_or(0);
-                        // decode-only simulates an 8 s track — make the bar
-                        // and remaining label match the simulation
-                        let total = if self.player.decode_only {
-                            self.fake_play
-                                .map(|(_, e)| e)
-                                .unwrap_or(std::time::Duration::from_millis(real_ms))
-                        } else {
-                            std::time::Duration::from_millis(real_ms)
-                        };
-                        let remain = total.saturating_sub(pos);
+                        ui.add_sized(
+                            [280.0, 14.0],
+                            egui::Label::new(
+                                egui::RichText::new(&t.name).strong().size(13.0),
+                            )
+                            .halign(egui::Align::LEFT)
+                            .truncate(),
+                        );
+                        let pos = pb.position;
+                        // `duration` is the decode-only simulation cap (≤ 8 s)
+                        // when there is no audio device — the bar and the
+                        // remaining label match the simulation
+                        let remain = pb.duration.saturating_sub(pos);
                         ui.horizontal(|ui| {
                             ui.monospace(fmt_pos(pos));
-                            seek_bar_ui(ui, 300.0, pos, total, self.theme.accent, &mut act);
+                            seek_bar_ui(ui, 300.0, pos, pb.duration, self.theme.accent, &mut act);
                             ui.monospace(fmt_pos(remain));
                         });
                     });
@@ -2755,7 +2564,7 @@ impl App {
                         [90.0, 16.0],
                         egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false),
                     );
-                    self.repeat_shuffle_buttons(ui, &mut act);
+                    self.repeat_shuffle_buttons(ui, &pb, &mut act);
                 });
                 ui.add_space(8.0);
             });
@@ -2763,7 +2572,7 @@ impl App {
         });
         if vol != self.volume {
             self.volume = vol;
-            self.player.volume(vol);
+            self.send(Command::SetVolume(vol));
             self.save_ui_state();
         }
         match act {
@@ -2772,11 +2581,14 @@ impl App {
             Some(BarIntent::Next) => self.skip_current(),
             Some(BarIntent::Queue) => self.show_queue = !self.show_queue,
             Some(BarIntent::CycleRepeat) => {
-                self.repeat = match self.repeat {
+                let next = match pb.repeat {
                     Repeat::Off => Repeat::All,
                     Repeat::All => Repeat::One,
                     Repeat::One => Repeat::Off,
                 };
+                // optimistic mirror (the snapshot catches up within a tick)
+                self.repeat_seen = next;
+                self.send(Command::SetRepeat(next));
                 self.save_ui_state();
             }
             Some(BarIntent::ToggleShuffle) => self.toggle_shuffle(),
@@ -2785,13 +2597,13 @@ impl App {
         }
     }
 
-    fn repeat_shuffle_buttons(&self, ui: &mut egui::Ui, act: &mut Option<BarIntent>) {
-        let repeat_txt = match self.repeat {
+    fn repeat_shuffle_buttons(&self, ui: &mut egui::Ui, pb: &PbSnapshot, act: &mut Option<BarIntent>) {
+        let repeat_txt = match pb.repeat {
             Repeat::Off => "repeat",
             Repeat::All => "repeat all",
             Repeat::One => "repeat 1",
         };
-        let col = if self.repeat == Repeat::Off {
+        let col = if pb.repeat == Repeat::Off {
             ui.visuals().weak_text_color()
         } else {
             self.theme.accent
@@ -2801,7 +2613,7 @@ impl App {
         {
             *act = Some(BarIntent::CycleRepeat);
         }
-        let col = if self.shuffle {
+        let col = if pb.shuffle {
             self.theme.accent
         } else {
             ui.visuals().weak_text_color()
@@ -2816,11 +2628,19 @@ impl App {
     fn queue_panel(&mut self, ctx: &egui::Context) {
         let mut clear = false;
         let mut shuf = false;
+        // Per-frame snapshot of the shared queue for rendering; mutations go
+        // through &mut self helpers that lock afresh (the supervisor only
+        // ever holds the lock for microsecond ops).
+        let (tracks, queue_pos) = {
+            let q = self.queue.lock();
+            (q.tracks.clone(), q.pos)
+        };
+        let queue_len = tracks.len();
         egui::SidePanel::right("queue")
             .exact_width(290.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong(format!("Queue · {}", self.queue.len()));
+                    ui.strong(format!("Queue · {queue_len}"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if hand(ui.small_button("clear")).clicked() {
                             clear = true;
@@ -2831,7 +2651,7 @@ impl App {
                     });
                 });
                 ui.separator();
-                if self.queue.is_empty() {
+                if tracks.is_empty() {
                     self.empty_state(ui, "queue empty — add with +".to_string(), false);
                 }
                 let mut remove: Option<usize> = None;
@@ -2844,10 +2664,10 @@ impl App {
                 let mut drag_y: Option<f32> = None;
                 let mut drag_end = false;
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    for (i, t) in self.queue.tracks.iter().enumerate() {
+                    for (i, t) in tracks.iter().enumerate() {
                         // current entry: ▶ marker + accent; played entries dim
-                        let is_cur = self.queue.pos == Some(i);
-                        let played = self.queue.pos.is_some_and(|p| i < p);
+                        let is_cur = queue_pos == Some(i);
+                        let played = queue_pos.is_some_and(|p| i < p);
                         let row = ui.horizontal(|ui| {
                             if self.queue_drag == Some(i) {
                                 ui.visuals_mut().override_text_color =
@@ -2964,11 +2784,9 @@ impl App {
                     self.remove_queue_row(i);
                 }
                 if clear {
-                    let pos = self.report_pos_ms();
-                    self.report_end(PlayEvent::END_SUSPENDED, pos);
-                    self.queue.clear();
-                    self.stop_playback();
-                    self.prefetch.scan(&self.queue);
+                    // the supervisor closes the segment, clears the queue and
+                    // drops the current track (re-scans the prefetcher too)
+                    self.stop_all();
                 }
                 if shuf {
                     self.toggle_shuffle();
@@ -2979,36 +2797,42 @@ impl App {
     /// Click a queue row: move the pointer there and play it (the outgoing
     /// current stays listed, its segment closes with END_REPLACED).
     fn play_queue_row(&mut self, i: usize) {
-        if self.queue.play_at(i).is_none() {
-            return;
-        }
-        let pos = self.report_pos_ms();
-        self.report_end(PlayEvent::END_REPLACED, pos);
-        let t = self.queue.tracks[i].clone();
-        self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
+        let t = {
+            let mut q = self.queue.lock();
+            if q.play_at(i).is_none() {
+                return;
+            }
+            let t = q.tracks[i].clone();
+            self.prefetch.scan(&q);
+            t
+        };
+        self.send(Command::Play {
+            track: t,
+            close: PlayEvent::END_REPLACED,
+        });
     }
 
     /// Queue-row ✕: the pointer-aware removal decides what happens to
     /// playback — a removed current track hands over to its successor (kept
     /// playing) or, with no successor, stops cleanly.
     fn remove_queue_row(&mut self, i: usize) {
-        match self.queue.remove(i) {
-            RemoveEffect::PlayNext(j) => {
-                let pos = self.report_pos_ms();
-                self.report_end(PlayEvent::END_SKIPPED_FORWARDS, pos);
-                self.player.skip();
-                let t = self.queue.tracks[j].clone();
-                self.play_now_at(t, std::time::Duration::ZERO, PlayKind::NewSegment);
+        let handover = {
+            let mut q = self.queue.lock();
+            let effect = q.remove(i);
+            self.prefetch.scan(&q);
+            match effect {
+                RemoveEffect::PlayNext(j) => Some(q.tracks[j].clone()),
+                RemoveEffect::Stopped => None,
+                RemoveEffect::Nothing => return,
             }
-            RemoveEffect::Stopped => {
-                let pos = self.report_pos_ms();
-                self.report_end(PlayEvent::END_SUSPENDED, pos);
-                self.stop_playback();
-            }
-            RemoveEffect::Nothing => {}
+        };
+        match handover {
+            Some(t) => self.send(Command::Play {
+                track: t,
+                close: PlayEvent::END_SKIPPED_FORWARDS,
+            }),
+            None => self.send(Command::Halt),
         }
-        // the up-next set changed even when playback was untouched
-        self.prefetch.scan(&self.queue);
     }
 
     fn album_modal_ui(&mut self, ctx: &egui::Context) {
@@ -3556,39 +3380,6 @@ fn cmp_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
         .cmp(b.chars().flat_map(char::to_lowercase))
 }
 
-/// Pause state a freshly applied source must start with (pure; unit-tested).
-///
-/// * `pre_pause` — did the user explicitly pause right before this application
-/// * `user_initiated` — click/shortcut/MPRIS replace or seek (vs programmatic)
-/// * `auto_advance` — natural-end handover to the next queue entry
-///
-/// | transition                        | audible on arrival?    |
-/// |-----------------------------------|------------------------|
-/// | auto-advance (any)                | yes                    |
-/// | replace/seek, user was playing    | yes                    |
-/// | replace/seek, user was paused     | no (paused-on-arrival) |
-///
-/// Callers must apply the decision both at application time (rodio 0.20's
-/// `Sink::clear()` also pauses the sink — undo it unless `true` is returned)
-/// and on source arrival.
-fn applied_source_pause_state(pre_pause: bool, _user_initiated: bool, auto_advance: bool) -> bool {
-    !auto_advance && pre_pause
-}
-
-/// Whether a user seek emits the scrub pair (pure; unit-tested): END(12) at
-/// the old position + END(13) at the new one — only while a segment is open
-/// AND audibly playing (Cider: the segment continues, no new START). A paused
-/// seek repositions silently; the pause already closed the segment and the
-/// resume START carries the seeked position. Returns the positions to report.
-fn seek_scrub_events(
-    report_open: bool,
-    playing: bool,
-    old_ms: u64,
-    new_ms: u64,
-) -> Option<(u64, u64)> {
-    (report_open && playing).then_some((old_ms, new_ms))
-}
-
 fn fmt_ms(ms: u64) -> String {
     format!("{}:{:02}", ms / 60000, (ms % 60000) / 1000)
 }
@@ -3729,50 +3520,7 @@ mod dnd_tests {
     }
 }
 
-#[cfg(test)]
-mod pause_state_tests {
-    use super::{applied_source_pause_state, seek_scrub_events, PlayKind};
-
-    #[test]
-    fn auto_advance_always_lands_audible() {
-        assert!(!applied_source_pause_state(false, true, true));
-        assert!(!applied_source_pause_state(true, true, true));
-        assert!(!applied_source_pause_state(true, false, true));
-    }
-
-    #[test]
-    fn replace_and_seek_restore_the_pre_action_pause_state() {
-        // user was playing → the new source is audible on arrival
-        assert!(!applied_source_pause_state(false, true, false));
-        // user had explicitly paused → paused-on-arrival is correct
-        assert!(applied_source_pause_state(true, true, false));
-    }
-
-    #[test]
-    fn seek_restart_is_distinct_from_fresh_segments() {
-        // only SeekRestart skips the PLAY_START; a seek-to-zero restart must
-        // not re-START the way an offset==0 fresh segment does
-        assert_ne!(PlayKind::SeekRestart, PlayKind::NewSegment);
-        assert_ne!(PlayKind::SeekRestart, PlayKind::AutoAdvance);
-        assert_ne!(PlayKind::NewSegment, PlayKind::AutoAdvance);
-    }
-
-    #[test]
-    fn scrub_pair_only_while_open_and_playing() {
-        // seek while playing: END(12) at the old pos, END(13) at the new one,
-        // and NO new START (the segment continues)
-        assert_eq!(
-            seek_scrub_events(true, true, 7_971, 146_956),
-            Some((7_971, 146_956))
-        );
-        // seek while paused: the pause already closed the segment — emit
-        // nothing; the resume START carries the seeked position
-        assert_eq!(seek_scrub_events(true, false, 7_971, 146_956), None);
-        // no open segment (gates closed, or nothing reported yet): nothing
-        assert_eq!(seek_scrub_events(false, true, 0, 1_000), None);
-        assert_eq!(seek_scrub_events(false, false, 0, 1_000), None);
-    }
-}
+// (pause_state_tests moved to supervisor.rs with the fns they cover.)
 
 #[cfg(test)]
 mod toast_state_tests {

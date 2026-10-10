@@ -20,6 +20,12 @@ zbus = "5"
 # Local timezone offset for play reporting (seconds east of UTC).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Tray (StatusNotifierItem) is a Linux/desktop-linux concept; macOS/Windows
+# builds compile a stub (`src/tray.rs` is cfg-gated in main.rs) — ✕ still
+# hides the window there, restore via MPRIS Raise or a relaunch.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

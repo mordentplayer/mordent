@@ -6,12 +6,40 @@ mod player;
 mod prefetch;
 mod queuemodel;
 mod report;
+mod supervisor;
 mod ui;
 mod fairplay;
 mod mpris;
 mod stream;
 mod theme;
 mod wrapper;
+
+// Tray (collapse-to-tray) is Linux-only: ksni speaks StatusNotifierItem over
+// D-Bus. On macOS/Windows the stub below keeps the callsites compiling — the
+// window ✕ still hides the app there (restore via MPRIS Raise / relaunch).
+#[cfg(target_os = "linux")]
+mod tray;
+
+/// Non-Linux tray stub: no StatusNotifierItem host exists there, so no tray
+/// icon is registered. `✕ = hide` (handled in `ui::update`) works unchanged.
+#[cfg(not(target_os = "linux"))]
+pub mod tray {
+    use crate::supervisor::Command;
+    use eframe::egui;
+    use parking_lot::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::Sender;
+    use std::sync::Arc;
+
+    pub fn spawn(
+        _snap: Arc<Mutex<crate::supervisor::PbSnapshot>>,
+        _cmd: Sender<Command>,
+        _hidden: Arc<AtomicBool>,
+        _ctx: egui::Context,
+    ) {
+        eprintln!("[tray] not supported on this platform — running without a tray icon; ✕ still hides the window, MPRIS Raise (or a relaunch) restores it");
+    }
+}
 
 use anyhow::{anyhow, bail, Result};
 

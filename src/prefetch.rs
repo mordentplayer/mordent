@@ -64,7 +64,9 @@ struct Sh {
     cv: Condvar,
 }
 
-/// Handle the UI thread holds; cheap to store, no-op when cache is off.
+/// Handle the UI and supervisor threads hold; cheap to clone (Arc inside),
+/// no-op when cache is off.
+#[derive(Clone)]
 pub struct Prefetcher {
     sh: Arc<Sh>,
     enabled: bool,
