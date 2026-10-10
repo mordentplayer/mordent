@@ -117,6 +117,15 @@ fn seek_scrub_events(
     (report_open && playing).then_some((old_ms, new_ms))
 }
 
+/// The `(start, end)` each event of a scrub pair carries: END(12) keeps the
+/// open segment's original start `[seg_start..old]`, END(13) chains from the
+/// scrub-begin position `[old..new]` — "each event's start-position is the
+/// previous event's end-position" (Cider `ws_204_controller.ts:17,368`). Without
+/// the chain the pair reads as overlapping instead of contiguous.
+fn scrub_pair_positions(seg_start_ms: u64, old_ms: u64, new_ms: u64) -> ((u64, u64), (u64, u64)) {
+    ((seg_start_ms, old_ms), (old_ms, new_ms))
+}
+
 /// One publication of playback state; read by the UI renderer, the MPRIS
 /// publisher and the tray. The supervisor re-publishes after every command,
 /// every source arrival and every tick (the position moves).
@@ -483,6 +492,10 @@ impl Sup {
         }
         self.report_end(PlayEvent::END_SCRUB_BEGIN, old_ms);
         self.report_open = true; // same segment continues across the scrub pair
+        // positions chain: END(13) starts where END(12) ended (see the helper)
+        let (_, (chained_start, _)) =
+            scrub_pair_positions(self.report_seg_start_ms, old_ms, new_ms);
+        self.report_seg_start_ms = chained_start;
         self.report_end(PlayEvent::END_SCRUB_END, new_ms);
         self.report_open = true;
         self.report_seg_start_ms = new_ms;
@@ -1663,5 +1676,19 @@ mod tests {
         // no open segment (gates closed, or nothing reported yet): nothing
         assert_eq!(seek_scrub_events(false, true, 0, 1_000), None);
         assert_eq!(seek_scrub_events(false, false, 0, 1_000), None);
+    }
+
+    #[test]
+    fn scrub_pair_positions_chain_end_to_start() {
+        // a scrub at 30 s→120 s in a track started at 0 (the forensics case):
+        // END(12) spans [segStart..old], END(13) chains [old..new] — the two
+        // events are contiguous, never overlapping
+        let (begin, end) = scrub_pair_positions(0, 30_000, 120_000);
+        assert_eq!(begin, (0, 30_000), "END(12): start=segStart, end=old");
+        assert_eq!(end, (30_000, 120_000), "END(13): start=old, end=new");
+        // a mid-segment scrub chains from the current segment start as well
+        let (begin, end) = scrub_pair_positions(7_971, 20_000, 146_956);
+        assert_eq!(begin, (7_971, 20_000));
+        assert_eq!(end, (20_000, 146_956));
     }
 }

@@ -601,6 +601,8 @@ impl App {
             decode_logged: false,
             wrapper_cacheable,
         };
+        // Startup wrapper reachability hint (once, off-thread — see the fn).
+        app.spawn_wrapper_check();
         if selftest {
             std::thread::Builder::new()
                 .name("amc-wrapper-probe".into())
@@ -877,6 +879,24 @@ impl App {
 
     fn fail(&mut self, e: String) {
         self.error = Some(ErrorToast::new(e));
+    }
+
+    /// One-shot startup reachability probe for the wrapper. Off-thread by
+    /// design: blocking HTTP must never run on the UI thread (a slow remote/
+    /// tunnel `/status` would freeze the first frame). Silent when the wrapper
+    /// answers; on failure it sends ONE actionable hint through the normal
+    /// notice/toast path (`Msg::Notice`), once per session.
+    fn spawn_wrapper_check(&self) {
+        let url = self.cfg.wrapper_url.clone();
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("amc-wrapper-check".into())
+            .spawn(move || {
+                if !probe_wrapper_reachable(&url) {
+                    let _ = tx.send(Msg::Notice(wrapper_down_hint(&url)));
+                }
+            })
+            .ok();
     }
 
     // ---- supervisor plumbing ----
@@ -2265,12 +2285,11 @@ impl App {
         act: &mut Option<CentralAction>,
     ) {
         egui::Grid::new(id)
-            .num_columns(6)
+            .num_columns(5)
             .spacing([10.0, 2.0])
             .min_col_width(0.0)
             .show(ui, |ui| {
                 for a in albums {
-                    ui.monospace(" ♫ ");
                     let name = egui::RichText::new(&a.name).size(13.0).strong();
                     if cell(ui, 340.0, 20.0, name, true).clicked() {
                         *act = Some(CentralAction::OpenAlbum(a.clone()));
@@ -2664,81 +2683,106 @@ impl App {
                 let mut drag_y: Option<f32> = None;
                 let mut drag_end = false;
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    for (i, t) in tracks.iter().enumerate() {
-                        // current entry: ▶ marker + accent; played entries dim
-                        let is_cur = queue_pos == Some(i);
-                        let played = queue_pos.is_some_and(|p| i < p);
-                        let row = ui.horizontal(|ui| {
-                            if self.queue_drag == Some(i) {
-                                ui.visuals_mut().override_text_color =
-                                    Some(ui.visuals().weak_text_color());
-                            }
-                            // ⠿ drag handle — its own rect with a pure drag
-                            // sense, so it never conflicts with the buttons'
-                            // click sense (and vice versa).
-                            let (hrect, hresp) = ui.allocate_exact_size(
-                                egui::vec2(11.0, 15.0),
-                                egui::Sense::drag(),
-                            );
-                            let hresp = if hresp.dragged() {
-                                hresp.on_hover_cursor(egui::CursorIcon::Grabbing)
-                            } else {
-                                hresp.on_hover_cursor(egui::CursorIcon::Grab)
-                            };
-                            let hcol = if hresp.dragged() || self.queue_drag == Some(i) {
-                                self.theme.accent
-                            } else {
-                                ui.visuals().weak_text_color()
-                            };
-                            ui.painter().text(
-                                hrect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "⠿",
-                                egui::FontId::proportional(11.0),
-                                hcol,
-                            );
-                            if hresp.dragged() || hresp.drag_stopped() {
-                                drag_from = Some(i);
-                                drag_y = hresp.interact_pointer_pos().map(|p| p.y);
-                                drag_end |= hresp.drag_stopped();
-                            }
-                            if is_cur {
-                                ui.monospace(
-                                    egui::RichText::new("▶")
-                                        .size(11.0)
-                                        .color(self.theme.accent),
+                    // Fixed columns so the ↑ ↓ ✕ cluster sits in the same x
+                    // on every row, whatever the title length: drag | marker |
+                    // heart | name (capped, truncated) | right-aligned cluster.
+                    egui::Grid::new("queue_rows")
+                        .num_columns(5)
+                        .spacing([8.0, 2.0])
+                        .min_col_width(0.0)
+                        .show(ui, |ui| {
+                            for (i, t) in tracks.iter().enumerate() {
+                                // current entry: ▶ marker + accent; played entries dim
+                                let is_cur = queue_pos == Some(i);
+                                let played = queue_pos.is_some_and(|p| i < p);
+                                if self.queue_drag == Some(i) {
+                                    ui.visuals_mut().override_text_color =
+                                        Some(ui.visuals().weak_text_color());
+                                }
+                                // ⠿ drag handle — its own rect with a pure drag
+                                // sense, so it never conflicts with the buttons'
+                                // click sense (and vice versa).
+                                let (hrect, hresp) = ui.allocate_exact_size(
+                                    egui::vec2(11.0, 15.0),
+                                    egui::Sense::drag(),
                                 );
-                            } else {
-                                ui.monospace(
-                                    egui::RichText::new(format!("{:>2}", i + 1))
-                                        .size(11.0)
-                                        .weak(),
+                                let hresp = if hresp.dragged() {
+                                    hresp.on_hover_cursor(egui::CursorIcon::Grabbing)
+                                } else {
+                                    hresp.on_hover_cursor(egui::CursorIcon::Grab)
+                                };
+                                let hcol = if hresp.dragged() || self.queue_drag == Some(i) {
+                                    self.theme.accent
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
+                                ui.painter().text(
+                                    hrect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "⠿",
+                                    egui::FontId::proportional(11.0),
+                                    hcol,
                                 );
-                            }
-                            if fav_button(ui, self.favorites.contains(&t.id), self.theme.accent).clicked() {
-                                fav = Some(t.clone());
-                            }
-                            let mut name = egui::RichText::new(&t.name).size(12.0);
-                            if is_cur {
-                                name = name.strong().color(self.theme.accent);
-                            } else if played {
-                                name = name.weak();
-                            }
-                            if cell(ui, 130.0, 16.0, name, true).clicked() {
-                                jump = Some(i);
-                            }
-                            if hand(ui.small_button("↑")).clicked() {
-                                mv = Some((i, -1));
-                            }
-                            if hand(ui.small_button("↓")).clicked() {
-                                mv = Some((i, 1));
-                            }
-                            if hand(ui.small_button("×")).clicked() {
-                                remove = Some(i);
+                                if hresp.dragged() || hresp.drag_stopped() {
+                                    drag_from = Some(i);
+                                    drag_y = hresp.interact_pointer_pos().map(|p| p.y);
+                                    drag_end |= hresp.drag_stopped();
+                                }
+                                // fixed-width marker column: the ▶ pointer or the
+                                // row number, so the columns after it never shift
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(15.0, 16.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        if is_cur {
+                                            ui.monospace(
+                                                egui::RichText::new("▶")
+                                                    .size(11.0)
+                                                    .color(self.theme.accent),
+                                            );
+                                        } else {
+                                            ui.monospace(
+                                                egui::RichText::new(format!("{:>2}", i + 1))
+                                                    .size(11.0)
+                                                    .weak(),
+                                            );
+                                        }
+                                    },
+                                );
+                                if fav_button(ui, self.favorites.contains(&t.id), self.theme.accent)
+                                    .clicked()
+                                {
+                                    fav = Some(t.clone());
+                                }
+                                let mut name = egui::RichText::new(&t.name).size(12.0);
+                                if is_cur {
+                                    name = name.strong().color(self.theme.accent);
+                                } else if played {
+                                    name = name.weak();
+                                }
+                                let name_resp = cell(ui, 110.0, 16.0, name, true);
+                                rows.push((name_resp.rect.top(), name_resp.rect.bottom()));
+                                if name_resp.clicked() {
+                                    jump = Some(i);
+                                }
+                                // right-anchored fixed cluster: identical x per row
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if hand(ui.small_button("×")).clicked() {
+                                            remove = Some(i);
+                                        }
+                                        if hand(ui.small_button("↓")).clicked() {
+                                            mv = Some((i, 1));
+                                        }
+                                        if hand(ui.small_button("↑")).clicked() {
+                                            mv = Some((i, -1));
+                                        }
+                                    },
+                                );
+                                ui.end_row();
                             }
                         });
-                        rows.push((row.response.rect.top(), row.response.rect.bottom()));
-                    }
                     if let Some(i) = drag_from {
                         self.queue_drag = Some(i);
                         if let Some(y) = drag_y {
@@ -3335,6 +3379,58 @@ fn hex_color(hex: &str) -> Option<egui::Color32> {
     Some(egui::Color32::from_rgb(r, g, b))
 }
 
+/// `GET {wrapper_url}/status` with a generous 5 s budget — a remote/tunnel
+/// wrapper can be legitimately slow, so the startup hint only fires on a real
+/// failure (connect/HTTP/timeout error), never a slow-but-alive one. Runs on
+/// the `amc-wrapper-check` startup thread, never the UI thread.
+fn probe_wrapper_reachable(url: &str) -> bool {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let status_url = format!("{}/status", url.trim_end_matches('/'));
+    agent.get(&status_url).call().is_ok()
+}
+
+/// Actionable startup hint when the wrapper's `/status` does not answer.
+/// Loopback URLs get the local start command + the config pointer; remote/
+/// tunnel URLs get the connectivity question instead (the local command would
+/// be wrong there).
+fn wrapper_down_hint(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    if is_loopback_url(url) {
+        format!(
+            "wrapper not reachable at {url} — start it \
+             (sudo ./wrapper-lite --host 127.0.0.1 --port 12340), or set a remote \
+             URL in ~/.config/amc/config.toml"
+        )
+    } else {
+        format!("wrapper at {url} isn't responding — is the host up / tunnel connected?")
+    }
+}
+
+/// Whether `url`'s host is a loopback address (`localhost`, `127.0.0.0/8`,
+/// `[::1]`). Deliberately simple string parsing — the config value is a bare
+/// `scheme://host[:port]`, not worth a url crate.
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        // drop any userinfo, then the :port
+        authority
+            .rsplit('@')
+            .next()
+            .unwrap_or(authority)
+            .split(':')
+            .next()
+            .unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host == "::1" || host == "127.0.0.1" || host.starts_with("127.")
+}
+
 /// Click-to-seek progress bar; reports the clicked fraction (0..1) via `act`.
 fn seek_bar_ui(
     ui: &mut egui::Ui,
@@ -3521,6 +3617,44 @@ mod dnd_tests {
 }
 
 // (pause_state_tests moved to supervisor.rs with the fns they cover.)
+
+#[cfg(test)]
+mod wrapper_hint_tests {
+    use super::{is_loopback_url, wrapper_down_hint};
+
+    #[test]
+    fn loopback_urls_get_the_local_start_hint() {
+        for url in [
+            "http://127.0.0.1:12340",
+            "http://127.0.0.1:12340/",
+            "http://localhost:12340",
+            "http://[::1]:12340",
+            "127.0.0.1:12340",
+        ] {
+            assert!(is_loopback_url(url), "{url} is loopback");
+            let hint = wrapper_down_hint(url);
+            assert!(hint.contains("not reachable at"), "{hint}");
+            assert!(hint.contains(url.trim_end_matches('/')), "{hint}");
+            assert!(hint.contains("start it"), "{hint}");
+            assert!(hint.contains("~/.config/amc/config.toml"), "{hint}");
+        }
+    }
+
+    #[test]
+    fn remote_urls_get_the_connectivity_hint() {
+        for url in [
+            "https://wrapper.example.com",
+            "http://10.0.0.5:12340",
+            "http://192.168.1.9:8080/wrapper",
+        ] {
+            assert!(!is_loopback_url(url), "{url} is remote");
+            let hint = wrapper_down_hint(url);
+            assert!(hint.contains("isn't responding"), "{hint}");
+            assert!(hint.contains("tunnel connected"), "{hint}");
+            assert!(!hint.contains("start it"), "{hint}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod toast_state_tests {
