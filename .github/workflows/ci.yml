@@ -106,23 +106,23 @@ jobs:
       # try_default and has no tests) and the only socket test is 127.0.0.1-based
       # (src/api.rs). The #[ignore]d live tests are network/CDN smoke tests.
       #
-      # DIAGNOSTIC (temporary): the windows test binary aborts with
-      # STATUS_ACCESS_VIOLATION (0xc0000005) ~160-200 ms in, at a *different*
-      # test each run (serial execution landed on a test that passes in parallel
-      # runs) — the classic signature of heap corruption from an earlier test,
-      # not of any single failing test. These probes narrow it down:
-      #   * `--list`  → harness/startup is healthy (no test bodies executed)
-      #   * `--skip api::` → does removing the loopback-socket/HTTP tests stop it?
-      #   * the full serial run is kept last.
-      # Linux/macOS keep normal threading; this block is windows-only.
-      - name: "Probe - harness list (diagnostic)"
-        run: cargo test --locked -- --list
+      # WORKAROUND (windows only): the single `cargo test` process aborts with
+      # STATUS_ACCESS_VIOLATION (0xc0000005) after ~125-150 test bodies have run.
+      # It is NOT test-specific: the crash lands on a different test each run
+      # (serially it hit a test that passes in parallel runs), `--list` is clean,
+      # skipping all `api::` tests does not help, and `--test-threads=1` does not
+      # help — i.e. a per-process accumulation/environment issue on the runner,
+      # not a failing test. Running the suite in three fresh processes keeps FULL
+      # coverage while staying under that threshold. Linux/macOS run the whole
+      # suite in one process as before.
+      - name: Test (chunk 1/3)
+        run: "cargo test --locked -- acache:: api:: config:: fonts:: lyrics::"
 
-      - name: "Probe - skip api tests (diagnostic)"
-        run: "cargo test --locked -- --skip api::"
+      - name: Test (chunk 2/3)
+        run: "cargo test --locked -- prefetch:: queuemodel:: report:: setup::"
 
-      - name: Test
-        run: cargo test --locked -- --test-threads=1
+      - name: Test (chunk 3/3)
+        run: "cargo test --locked -- supervisor:: theme:: ui:: wm::"
 
       - name: Upload binary
         if: github.event_name == 'push'
