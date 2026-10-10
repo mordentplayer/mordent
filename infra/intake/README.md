@@ -13,7 +13,7 @@ Everything is one dependency-free Worker script plus the static page it serves.
 
 | Item | Value |
 | --- | --- |
-| Cloudflare account | `[redacted]'s Account` (`[redacted]`) |
+| Cloudflare account | a dedicated Cloudflare account (Workers + Workers KV) — account identifiers are intentionally not published here |
 | workers.dev subdomain | `outline2319` |
 | Worker name | `mordent-intake` |
 | **Public URL** | **https://mordent-intake.outline2319.workers.dev** |
