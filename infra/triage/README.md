@@ -2,7 +2,7 @@
 
 Newly opened issues on the public repo are auto-triaged by a cheap model
 (`opencode-go/muse-spark-1.3-contributor`) running inside a throwaway Docker
-sandbox. The agent gets a fresh checkout of public `master` plus the issue
+sandbox. The agent gets a fresh checkout of public `main` plus the issue
 text, attempts to validate the issue, and writes
 `triage-reports/issue-<N>.md`. That report is uploaded as a workflow artifact
 and committed to the `triage-reports` branch.
@@ -254,7 +254,7 @@ docker run --rm -e GW_URL=http://host.docker.internal:4000 -e GW_TOKEN="$GW_TOKE
 
 All of the below was produced on the ops VPS with the credential taken from
 `omp token opencode-go --raw` and injected into the host-side gateway only.
-The repo analysed was an archive of `master` (public content, no `.git`).
+The repo analysed was an archive of `main` (public content, no `.git`).
 
 **(a) The gateway proxies the Responses API, streaming and not.**
 
@@ -281,8 +281,8 @@ $ docker run ... mordent-triage-sandbox bash -lc 'env; cat /proc/1/environ; ls /
 === /proc/1/environ === (same set; no host env)
 === ls / ===  .dockerenv  bin boot dev etc home lib ... usr var work        # plain image rootfs
 === host config attempts ===
-cat: /tmp/.config/amc/config.toml: No such file or directory
-cat: /home/user/.config/amc/config.toml: No such file or directory
+cat: /tmp/.config/mordent/config.toml: No such file or directory
+cat: /home/user/.config/mordent/config.toml: No such file or directory
 cat: /home/user/.omp/auth-gateway.token: No such file or directory
 ls /home -> sandbox
 === docker socket? === ls: cannot access '/var/run/docker.sock': No such file or directory
