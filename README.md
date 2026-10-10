@@ -270,7 +270,6 @@ Transparency caveat: the window is created transparent, but see-through only
 works with a running compositor (X11 compositing manager / Wayland). On a bare
 X server it simply renders solid — neither case errors.
 
-=======
 ## Media keys / MPRIS
 
 `mordent ui` registers `org.mpris.MediaPlayer2.mordent` on the session bus: it shows
