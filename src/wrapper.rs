@@ -31,17 +31,22 @@ impl Wrapper {
         }
     }
 
-    fn get(&self, path: &str, queries: &[(&str, &str)]) -> Result<serde_json::Value> {
+    /// One decoded envelope, non-zero `code` included (callers that treat a
+    /// specific code as data — e.g. `/lyrics` 404 = "no lyrics" — need it).
+    fn envelope(&self, path: &str, queries: &[(&str, &str)]) -> Result<Envelope> {
         let url = format!("{}{}", self.base, path);
         let mut req = self.agent.get(&url);
         for (k, v) in queries {
             req = req.query(k, v);
         }
-        let env: Envelope = req
-            .call()
+        req.call()
             .with_context(|| format!("wrapper GET {path}"))?
             .into_json()
-            .with_context(|| format!("wrapper GET {path} body"))?;
+            .with_context(|| format!("wrapper GET {path} body"))
+    }
+
+    fn get(&self, path: &str, queries: &[(&str, &str)]) -> Result<serde_json::Value> {
+        let env = self.envelope(path, queries)?;
         if env.code != 0 {
             anyhow::bail!("wrapper {path} failed (code {}): {}", env.code, env.msg);
         }
@@ -83,5 +88,27 @@ impl Wrapper {
             "/lyrics",
             &[("adamId", adam_id), ("syllable", if syllable { "1" } else { "0" })],
         )
+    }
+
+    /// Lyrics **TTML** for a track (`data.lyrics` of `/lyrics`). `Ok(None)` is
+    /// the wrapper's own "no lyrics for this track" answer (envelope code 404,
+    /// `{"code":404,"msg":"lyrics not found"}`); `Err` is either a transport
+    /// failure (wrapper down / offline) or any other upstream error code.
+    pub fn lyrics_ttml(&self, adam_id: &str, syllable: bool) -> Result<Option<String>> {
+        let env = self.envelope(
+            "/lyrics",
+            &[("adamId", adam_id), ("syllable", if syllable { "1" } else { "0" })],
+        )?;
+        if env.code == 404 {
+            return Ok(None);
+        }
+        if env.code != 0 {
+            anyhow::bail!("wrapper /lyrics failed (code {}): {}", env.code, env.msg);
+        }
+        Ok(env
+            .data
+            .get("lyrics")
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
     }
 }

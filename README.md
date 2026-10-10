@@ -134,6 +134,7 @@ are explicit, and the pointer turns into a hand over clickable rows.
 | `↑` / `↓` | volume up / down |
 | `N` / `P` | next / previous track |
 | `Q` | toggle queue panel |
+| `L` | toggle lyrics panel |
 | `/` or `ctrl+F` | focus search |
 | `ctrl+1` / `2` / `3` | switch to Search / Library / Favorites |
 | `ctrl+4` | switch to Playlists |
@@ -149,7 +150,28 @@ auto-advance, stop-at-end and resume-on-append) and prints
 `AMC_DEMO_TERM=<query>` / `AMC_DEMO_VIEW=library|albums|favorites|playlists`
 pre-seed the UI for headless screenshots (`albums` opens the Search tab's
 Albums sub-view); `AMC_DEMO_PLAYLIST=<n>` additionally
-opens the n-th library playlist (0-based) once the list loads.
+opens the n-th library playlist (0-based) once the list loads, and
+`AMC_DEMO_LYRICS=1` opens the lyrics panel.
+
+## Lyrics
+
+`L` (or the `lyrics` button in the player bar) opens a lyrics side panel on the
+left (the queue stays on the right, so the two never stack). Lyrics come from
+the wrapper's `/lyrics` endpoint as time-synced **TTML** — line-timed
+(`itunes:timing="Line"`) or word-timed (`"Word"`, when the catalogue has it).
+The panel fetches on track change on a background thread (no `media-user-token`
+needed, and the fetch never blocks a frame), caches the last track's lyrics in
+memory, and shows inline states while it works: a spinner while loading,
+"no lyrics for this track" when the wrapper answers 404, and
+"lyrics unavailable offline" (with the error) when the wrapper cannot be
+reached — plus a "start a track for lyrics" idle state.
+
+The current line is highlighted in the accent colour and auto-scrolls to stay
+in view (only when the active line changes, so a manual scroll is not fought
+back). With word timing the active **word** is highlighted in place and
+background vocals (`ttm:role="x-bg"`) are dimmed and italicised. The highlight
+is driven by the same playback position as the player bar, so pausing freezes
+it and seeking moves it.
 
 ## Theming
 

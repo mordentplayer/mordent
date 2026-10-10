@@ -2,6 +2,7 @@ mod acache;
 mod api;
 mod config;
 mod fonts;
+mod lyrics;
 mod player;
 mod prefetch;
 mod queuemodel;

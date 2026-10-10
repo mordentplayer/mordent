@@ -24,6 +24,7 @@
 use crate::api::{AlbumHit, Api, LibraryPlaylist, PlayEvent, SearchResults, Track, META_TTL_LIBRARY};
 use crate::config::Config;
 use crate::fonts::FontChoice;
+use crate::lyrics::{self, LyricTimeline};
 use crate::mpris;
 use crate::prefetch::Prefetcher;
 use crate::supervisor::{self, Command, PbSnapshot};
@@ -62,6 +63,27 @@ enum Msg {
         tracks: Vec<Track>,
         next: Option<u32>,
     },
+    /// Lyrics for `song` (background fetch, tagged so a late arrival for a
+    /// previous track is dropped).
+    Lyrics {
+        song: String,
+        result: Result<lyrics::Fetched, String>,
+    },
+}
+
+/// Lyrics panel state for the current track (`/lyrics` is a wrapper endpoint,
+/// so it has its own in-memory cache: the last track's lyrics are kept and
+/// refetched on track change — see `App::ensure_lyrics`).
+enum LyricsState {
+    /// No track has been started (or playback stopped).
+    Idle,
+    /// Background fetch in flight.
+    Loading,
+    Ready(LyricTimeline),
+    /// The wrapper answered 404: this track has no lyrics.
+    NoLyrics,
+    /// Wrapper unreachable / upstream error — the offline state.
+    Unavailable(String),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -392,6 +414,17 @@ pub struct App {
     /// decision reads the snapshot (or sends a Command), never this field.
     now: Option<Track>,
     show_queue: bool,
+    /// Lyrics side panel visibility (`L` / the bar's "lyrics" button).
+    show_lyrics: bool,
+    /// Song id `lyrics` belongs to: the fetch tag, and the refetch trigger
+    /// (a different id ⇒ fetch again). The lyrics themselves are a per-track
+    /// in-memory cache — `/lyrics` is a wrapper endpoint, not an amp-api URL,
+    /// so the api.rs metadata cache cannot hold them.
+    lyrics_song: Option<String>,
+    lyrics: LyricsState,
+    /// Line index the karaoke view auto-scrolled to; scrolling is applied only
+    /// when the active line CHANGES so a manual scroll is never fought.
+    lyrics_follow: Option<usize>,
     /// Queue row currently being dragged by its ⠿ handle, and the slot it
     /// would land in (index among the other rows) — both cleared on release.
     queue_drag: Option<usize>,
@@ -559,6 +592,10 @@ impl App {
             queue,
             now: None,
             show_queue: false,
+            show_lyrics: false,
+            lyrics_song: None,
+            lyrics: LyricsState::Idle,
+            lyrics_follow: None,
             queue_drag: None,
             queue_drop: None,
             album_job: None,
@@ -650,6 +687,11 @@ impl App {
         }
         if std::env::var("AMC_DEMO_QUEUE").is_ok() {
             app.show_queue = true;
+        }
+        // AMC_DEMO_LYRICS=1: open the lyrics panel (headless screenshot hook;
+        // pairs with AMC_DEMO_PLAY so the karaoke highlight has a position).
+        if std::env::var("AMC_DEMO_LYRICS").is_ok() {
+            app.show_lyrics = true;
         }
         // AMC_DEMO_PLAY=<n>: frame-INDEPENDENT headless play hook. Searches
         // AMC_DEMO_TERM (default "daft punk"), queues tracks n..n+3 and plays
@@ -895,6 +937,64 @@ impl App {
                 if !probe_wrapper_reachable(&url) {
                     let _ = tx.send(Msg::Notice(wrapper_down_hint(&url)));
                 }
+            })
+            .ok();
+    }
+
+    // ---- lyrics (wrapper endpoint; own per-track in-memory cache) ----
+
+    /// Show/hide the lyrics panel. Hiding drops the follow anchor so reopening
+    /// mid-track scrolls back to the active line.
+    fn toggle_lyrics(&mut self) {
+        self.show_lyrics = !self.show_lyrics;
+        if !self.show_lyrics {
+            self.lyrics_follow = None;
+        }
+    }
+
+    /// Make sure `lyrics`/`lyrics_song` describe the CURRENT track: clears them
+    /// when playback stopped and spawns the background fetch when the track
+    /// changed (never on the UI thread — the `/lyrics` call does real HTTP).
+    /// Cheap per frame: the id comparison short-circuits the common case.
+    fn ensure_lyrics(&mut self, pb: &PbSnapshot) {
+        let song = match &pb.track {
+            Some(t) => t.id.clone(),
+            None => {
+                if self.lyrics_song.take().is_some() {
+                    self.lyrics = LyricsState::Idle;
+                    self.lyrics_follow = None;
+                }
+                return;
+            }
+        };
+        if self.lyrics_song.as_deref() == Some(song.as_str()) {
+            return;
+        }
+        self.lyrics_song = Some(song.clone());
+        self.lyrics = LyricsState::Loading;
+        self.lyrics_follow = None;
+        let cfg = self.cfg.clone();
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("amc-lyrics".into())
+            .spawn(move || {
+                let result = lyrics::fetch(&cfg, &song, true).map_err(|e| format!("{e:#}"));
+                // one `[lyrics]` line per track: the headless evidence that the
+                // fetch ran, how many lines came back and whether words timed
+                match &result {
+                    Ok(lyrics::Fetched::Timeline(tl)) => eprintln!(
+                        "[lyrics] {song}: {} lines, word timing {}",
+                        tl.lines.len(),
+                        if tl.lines.iter().any(|l| !l.words.is_empty()) {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    ),
+                    Ok(lyrics::Fetched::NoLyrics) => eprintln!("[lyrics] {song}: none"),
+                    Err(e) => eprintln!("[lyrics] {song}: unavailable ({e})"),
+                }
+                let _ = tx.send(Msg::Lyrics { song, result });
             })
             .ok();
     }
@@ -1284,6 +1384,9 @@ impl App {
             if i.key_pressed(egui::Key::Q) {
                 self.show_queue = !self.show_queue;
             }
+            if i.key_pressed(egui::Key::L) {
+                self.toggle_lyrics();
+            }
             if i.key_pressed(egui::Key::Slash) && i.modifiers.shift {
                 self.cheatsheet = !self.cheatsheet;
             }
@@ -1419,6 +1522,16 @@ impl App {
                 // a stale-cache hint: same toast slot, non-fatal (no state
                 // reset — the fetch it belongs to succeeded)
                 Msg::Notice(note) => self.fail(note),
+                Msg::Lyrics { song, result } => {
+                    // drop a late arrival for a track we already left
+                    if self.lyrics_song.as_deref() == Some(song.as_str()) {
+                        self.lyrics = match result {
+                            Ok(lyrics::Fetched::Timeline(tl)) => LyricsState::Ready(tl),
+                            Ok(lyrics::Fetched::NoLyrics) => LyricsState::NoLyrics,
+                            Err(e) => LyricsState::Unavailable(e),
+                        };
+                    }
+                }
             }
         }
         // supervisor → UI (play-worker failures): same toast, no fetch-state
@@ -2055,6 +2168,13 @@ impl eframe::App for App {
             self.queue_panel(ctx);
         }
 
+        // ---- left: lyrics panel (own side, so it never stacks with the
+        // right-hand queue). Fetching is (re)triggered on track change.
+        if self.show_lyrics {
+            self.ensure_lyrics(&pb);
+            self.lyrics_panel(ctx, &pb);
+        }
+
         // ---- central: rows ----
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut act: Option<CentralAction> = None;
@@ -2526,6 +2646,7 @@ enum BarIntent {
     Prev,
     Next,
     Queue,
+    Lyrics,
     CycleRepeat,
     ToggleShuffle,
     Seek(std::time::Duration),
@@ -2579,6 +2700,16 @@ impl App {
                     if hand(ui.small_button("queue")).clicked() {
                         act = Some(BarIntent::Queue);
                     }
+                    let lyr_col = if self.show_lyrics {
+                        self.theme.accent
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    if hand(ui.small_button(egui::RichText::new("lyrics").size(11.0).color(lyr_col)))
+                        .clicked()
+                    {
+                        act = Some(BarIntent::Lyrics);
+                    }
                     ui.add_sized(
                         [90.0, 16.0],
                         egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false),
@@ -2599,6 +2730,7 @@ impl App {
             Some(BarIntent::Prev) => self.prev_track(),
             Some(BarIntent::Next) => self.skip_current(),
             Some(BarIntent::Queue) => self.show_queue = !self.show_queue,
+            Some(BarIntent::Lyrics) => self.toggle_lyrics(),
             Some(BarIntent::CycleRepeat) => {
                 let next = match pb.repeat {
                     Repeat::Off => Repeat::All,
@@ -2641,6 +2773,117 @@ impl App {
             .clicked()
         {
             *act = Some(BarIntent::ToggleShuffle);
+        }
+    }
+
+    /// Left-hand lyrics panel: the line-timed karaoke view, with per-word
+    /// highlighting when the document carries word timing. Position comes from
+    /// the same [`PbSnapshot`] the player bar uses, so a paused track freezes
+    /// both the bar and the highlight with no extra state. A left panel (the
+    /// queue is the right one) keeps the two from stacking.
+    fn lyrics_panel(&mut self, ctx: &egui::Context, pb: &PbSnapshot) {
+        // Nominal row height for the auto-scroll math. Lines are laid out at
+        // (at most) this height so the offset tracks the rendered position.
+        const ROW_H: f32 = 22.0;
+        let pos_ms = pb.position.as_millis() as u64;
+        let accent = self.theme.accent;
+        let mut close = false;
+        // Applied after the closure, which only reads `self`.
+        let mut follow: Option<usize> = None;
+        egui::SidePanel::left("lyrics")
+            .exact_width(300.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Lyrics");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if hand(ui.small_button("✕")).clicked() {
+                            close = true;
+                        }
+                        if let Some(t) = &pb.track {
+                            ui.weak(egui::RichText::new(&t.name).size(11.0));
+                        }
+                    });
+                });
+                ui.separator();
+                match &self.lyrics {
+                    LyricsState::Idle => {
+                        self.empty_state(ui, "start a track for lyrics".to_string(), false)
+                    }
+                    LyricsState::Loading => self.empty_state(ui, "loading lyrics…".to_string(), true),
+                    LyricsState::NoLyrics => {
+                        self.empty_state(ui, "no lyrics for this track".to_string(), false)
+                    }
+                    LyricsState::Unavailable(e) => {
+                        self.empty_state(ui, "lyrics unavailable offline".to_string(), false);
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak(egui::RichText::new(e).size(10.0));
+                        });
+                    }
+                    LyricsState::Ready(tl) if tl.is_empty() => {
+                        self.empty_state(ui, "no lyrics for this track".to_string(), false)
+                    }
+                    LyricsState::Ready(tl) => {
+                        let active = tl.line_at(pos_ms);
+                        let view_h = ui.available_height().max(1.0);
+                        let mut sa = egui::ScrollArea::vertical().auto_shrink(false);
+                        // Auto-scroll ONLY when the active line changes: the
+                        // offset is re-applied per line, so a manual scroll in
+                        // between is never fought back.
+                        if let Some(i) = active.filter(|i| Some(*i) != self.lyrics_follow) {
+                            sa = sa.vertical_scroll_offset(
+                                ((i as f32) * ROW_H - view_h * 0.35).max(0.0),
+                            );
+                            follow = Some(i);
+                        }
+                        sa.show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 6.0;
+                            for (i, line) in tl.lines.iter().enumerate() {
+                                let is_active = Some(i) == active;
+                                // Word-timed active line: highlight the active
+                                // word in place (word spans carry the words'
+                                // own spacing; background vocals dim + italic).
+                                if is_active && !line.words.is_empty() {
+                                    let aw = tl.word_at(pos_ms, i);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for (wi, w) in line.words.iter().enumerate() {
+                                            let mut rt = egui::RichText::new(&w.text).size(14.0);
+                                            if Some(wi) == aw {
+                                                rt = rt.color(accent).background_color(
+                                                    accent.gamma_multiply(0.22),
+                                                );
+                                            } else if w.bg {
+                                                rt = rt.weak().italics();
+                                            }
+                                            ui.label(rt);
+                                        }
+                                    });
+                                } else {
+                                    let mut rt = egui::RichText::new(&line.text).size(13.0);
+                                    if is_active {
+                                        rt = rt.strong().color(accent);
+                                        ui.label(rt);
+                                    } else {
+                                        // fixed height keeps the auto-scroll
+                                        // offset in step with the rows
+                                        rt = rt.weak();
+                                        ui.add_sized(
+                                            [ui.available_width(), ROW_H],
+                                            egui::Label::new(rt).truncate(),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        if let Some(i) = follow {
+            self.lyrics_follow = Some(i);
+        }
+        if close {
+            self.toggle_lyrics();
         }
     }
 
@@ -3151,6 +3394,7 @@ impl App {
                             ("↑ / ↓", "volume"),
                             ("N / P", "next / previous track"),
                             ("Q", "toggle queue panel"),
+                            ("L", "toggle lyrics panel"),
                             ("/ or ctrl+F", "focus search"),
                             ("ctrl+1 / 2 / 3", "search / library / favorites"),
                             ("ctrl+4", "playlists"),
