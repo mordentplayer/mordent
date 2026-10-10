@@ -34,3 +34,8 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Auto-generated triage reports (see .github/workflows/triage.yml).
+triage-reports/
+__pycache__/
+*.pyc

@@ -1,0 +1,209 @@
+name: Issue triage
+
+# Auto-triage newly opened issues with a cheap model
+# (opencode-go/muse-spark-1.3-contributor) running in a throwaway Docker
+# sandbox. See infra/triage/README.md for the threat model and design.
+
+on:
+  issues:
+    types: [opened]
+
+# contents: write is only used by the final "publish report" step. The model
+# sandbox never receives these credentials.
+permissions:
+  contents: write
+
+concurrency:
+  # Never triage the same issue twice concurrently; never let a flood of
+  # issues run in parallel (cost/DoS control).
+  group: triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+env:
+  # The sandbox's omp asks for our local provider/model name; the gateway
+  # rewrites the outbound `model` field to the upstream's real id, which is
+  # bare (no provider prefix) on the zen/go endpoint.
+  TRIAGE_MODEL_ID: muse-spark-1.3-contributor
+  TRIAGE_UPSTREAM_MODEL: muse-spark-1.3-contributor
+  TRIAGE_UPSTREAM: https://opencode.ai/zen/go
+
+jobs:
+  triage:
+    # Guards: kill switch, no bot-authored issues, optional author allowlist.
+    if: >-
+      vars.TRIAGE_DISABLED != 'true' &&
+      github.event.issue.user.type != 'Bot' &&
+      !endsWith(github.event.issue.user.login, '[bot]') &&
+      (vars.TRIAGE_ALLOWLIST == '' || contains(vars.TRIAGE_ALLOWLIST, github.event.issue.user.login))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          # CRITICAL: do not leave the workflow token in .git/config -- the
+          # sandbox mounts this tree and the model can read any file in it.
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Read the issue out of the event payload with jq. NEVER interpolate
+      # ${{ github.event.issue.body }} into a shell line: that is a script
+      # injection vector (the body is attacker-controlled).
+      - name: Gate on issue body
+        id: gate
+        run: |
+          set -euo pipefail
+          jq -r '.issue.title // ""' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/issue-title.txt"
+          jq -r '.issue.body  // ""' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/issue.md"
+          bytes=$(wc -c < "$RUNNER_TEMP/issue.md")
+          echo "issue body is ${bytes} bytes"
+          if [ "$bytes" -lt 40 ]; then
+            echo "Body under 40 bytes; skipping triage."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start credential gateway (holds the only real credential)
+        id: gw
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          OPENCODE_CRED: ${{ secrets.OPENCODE_CRED }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENCODE_CRED:-}" ]; then
+            echo "::error::OPENCODE_CRED secret is not set; refusing to run."
+            exit 1
+          fi
+          # Ephemeral, non-sensitive, network-local bearer for the sandbox.
+          GW_TOKEN="$(openssl rand -hex 32)"
+          echo "::add-mask::$GW_TOKEN"
+          echo "gw_token=$GW_TOKEN" >> "$GITHUB_OUTPUT"
+
+          docker network create triage-net
+
+          # `-e OPENCODE_CRED` (no value) copies it from this step's env, so
+          # the value never appears in argv or in the run logs.
+          docker run -d --name triage-gw \
+            --network triage-net \
+            --memory=256m \
+            -e OPENCODE_CRED \
+            -e GW_TOKEN \
+            -e GW_PORT=4000 \
+            -e GW_MODEL="$TRIAGE_UPSTREAM_MODEL" \
+            -e GW_UPSTREAM="$TRIAGE_UPSTREAM" \
+            -e GW_SESSION="triage-issue-${{ github.event.issue.number }}" \
+            -v "$GITHUB_WORKSPACE/infra/triage/bin:/gw:ro" \
+            python:3.12-slim python /gw/gateway.py
+
+          for i in $(seq 1 30); do
+            if docker logs triage-gw 2>&1 | grep -q "listening on"; then break; fi
+            sleep 1
+          done
+          docker logs triage-gw 2>&1 | tail -5
+
+      - name: Build sandbox image
+        if: steps.gate.outputs.skip == 'false'
+        run: docker build -t mordent-triage-sandbox -f infra/triage/Dockerfile.sandbox .
+
+      - name: Run triage agent in sandbox
+        if: steps.gate.outputs.skip == 'false'
+        continue-on-error: true
+        # The ephemeral gateway token is exported here so the container can
+        # inherit it with a bare `-e GW_TOKEN` (no value in argv).
+        env:
+          GW_TOKEN: ${{ steps.gw.outputs.gw_token }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --name triage-agent \
+            --network triage-net \
+            --memory=2g --cpus=2 \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e ISSUE_NUMBER="${{ github.event.issue.number }}" \
+            -e ISSUE_TITLE_FILE=/tmp/issue-title.txt \
+            -e ISSUE_BODY_FILE=/tmp/issue.md \
+            -e GW_URL=http://triage-gw:4000 \
+            -e GW_TOKEN \
+            -e REPO_DIR=/work \
+            -e OUT_DIR=/work \
+            -e TRIAGE_MODEL_ID="$TRIAGE_MODEL_ID" \
+            -e TRIAGE_MAX_TIME=1320 \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$GITHUB_WORKSPACE/infra/triage:/triage:ro" \
+            -v "$RUNNER_TEMP/issue.md:/tmp/issue.md:ro" \
+            -v "$RUNNER_TEMP/issue-title.txt:/tmp/issue-title.txt:ro" \
+            mordent-triage-sandbox \
+            bash /triage/bin/sandbox-entrypoint.sh
+
+      - name: Scrub report
+        id: scrub
+        if: steps.gate.outputs.skip == 'false'
+        # Both secrets are passed by name so their values never land in argv.
+        env:
+          GW_TOKEN: ${{ steps.gw.outputs.gw_token }}
+          OPENCODE_CRED: ${{ secrets.OPENCODE_CRED }}
+        run: |
+          set -euo pipefail
+          report="triage-reports/issue-${{ github.event.issue.number }}.md"
+          if [ ! -f "$report" ]; then
+            echo "::warning::Agent produced no report at $report"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 infra/triage/bin/scrub.py \
+            "$report" "$report.scrubbed" \
+            --redact-env GW_TOKEN \
+            --redact-env OPENCODE_CRED
+          mv "$report.scrubbed" "$report"
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          echo "report_path=$report" >> "$GITHUB_OUTPUT"
+
+      - name: Upload report artifact
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-issue-${{ github.event.issue.number }}
+          path: triage-reports/
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Publish to the triage-reports branch using the workflow token. This
+      # runs on the runner, outside the sandbox, and only stages the single
+      # report path -- nothing the model wrote elsewhere can be committed.
+      - name: Publish report to branch
+        if: steps.gate.outputs.skip == 'false' && steps.scrub.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          report="${{ steps.scrub.outputs.report_path }}"
+          work="$(mktemp -d)"
+          git -C "$work" init -q
+          git -C "$work" config user.name "mordent-triage[bot]"
+          git -C "$work" config user.email "triage@users.noreply.github.com"
+          git -C "$work" remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git -C "$work" fetch --depth=1 origin triage-reports 2>/dev/null; then
+            git -C "$work" checkout -q FETCH_HEAD
+          else
+            git -C "$work" checkout -q --orphan triage-reports
+          fi
+          mkdir -p "$work/triage-reports"
+          cp "$report" "$work/triage-reports/"
+          git -C "$work" add "triage-reports/$(basename "$report")"
+          if git -C "$work" diff --cached --quiet; then
+            echo "No changes to publish."
+          else
+            git -C "$work" commit -q -m "triage: issue #${{ github.event.issue.number }}"
+            git -C "$work" push -q origin HEAD:triage-reports
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f triage-gw triage-agent 2>/dev/null || true
+          docker network rm triage-net 2>/dev/null || true
