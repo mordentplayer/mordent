@@ -77,7 +77,10 @@ jobs:
             exit 1
           fi
           # Ephemeral, non-sensitive, network-local bearer for the sandbox.
-          GW_TOKEN="$(openssl rand -hex 32)"
+          # It MUST be exported: `docker run -e GW_TOKEN` (no value) copies the
+          # variable out of *this process* environment, and a plain shell
+          # assignment would silently pass nothing.
+          export GW_TOKEN="$(openssl rand -hex 32)"
           echo "::add-mask::$GW_TOKEN"
           echo "gw_token=$GW_TOKEN" >> "$GITHUB_OUTPUT"
 
@@ -97,11 +100,23 @@ jobs:
             -v "$GITHUB_WORKSPACE/infra/triage/bin:/gw:ro" \
             python:3.12-slim python /gw/gateway.py
 
+          up=false
           for i in $(seq 1 30); do
-            if docker logs triage-gw 2>&1 | grep -q "listening on"; then break; fi
+            if docker logs triage-gw 2>&1 | grep -q "listening on"; then up=true; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' triage-gw 2>/dev/null)" != "true" ]; then break; fi
             sleep 1
           done
           docker logs triage-gw 2>&1 | tail -5
+          if [ "$up" != "true" ]; then
+            echo "::error::credential gateway did not come up; aborting"
+            exit 1
+          fi
+
+          # Address the gateway by container IP: the sandbox then needs no
+          # embedded-DNS resolution of the container name.
+          gw_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' triage-gw)"
+          echo "gateway ip: $gw_ip"
+          echo "gw_host=$gw_ip" >> "$GITHUB_OUTPUT"
 
       - name: Build sandbox image
         if: steps.gate.outputs.skip == 'false'
@@ -126,7 +141,7 @@ jobs:
             -e ISSUE_NUMBER="${{ github.event.issue.number }}" \
             -e ISSUE_TITLE_FILE=/tmp/issue-title.txt \
             -e ISSUE_BODY_FILE=/tmp/issue.md \
-            -e GW_URL=http://triage-gw:4000 \
+            -e GW_URL="http://${{ steps.gw.outputs.gw_host }}:4000" \
             -e GW_TOKEN \
             -e REPO_DIR=/work \
             -e OUT_DIR=/work \
