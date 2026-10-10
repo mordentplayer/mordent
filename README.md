@@ -164,7 +164,8 @@ needed, and the fetch never blocks a frame), caches the last track's lyrics in
 memory, and shows inline states while it works: a spinner while loading,
 "no lyrics for this track" when the wrapper answers 404, and
 "lyrics unavailable offline" (with the error) when the wrapper cannot be
-reached — plus a "start a track for lyrics" idle state.
+reached — reopening the panel retries such a failed fetch, and there is a
+"start a track for lyrics" idle state.
 
 The current line is highlighted in the accent colour and auto-scrolls to stay
 in view (only when the active line changes, so a manual scroll is not fought

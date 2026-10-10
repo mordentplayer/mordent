@@ -944,10 +944,16 @@ impl App {
     // ---- lyrics (wrapper endpoint; own per-track in-memory cache) ----
 
     /// Show/hide the lyrics panel. Hiding drops the follow anchor so reopening
-    /// mid-track scrolls back to the active line.
+    /// mid-track scrolls back to the active line; showing after a failed fetch
+    /// is the user's retry (the wrapper may be back) — the attempt is
+    /// forgotten so the next frame refetches this track's lyrics.
     fn toggle_lyrics(&mut self) {
         self.show_lyrics = !self.show_lyrics;
-        if !self.show_lyrics {
+        if self.show_lyrics {
+            if matches!(self.lyrics, LyricsState::Unavailable(_)) {
+                self.lyrics_song = None;
+            }
+        } else {
             self.lyrics_follow = None;
         }
     }
