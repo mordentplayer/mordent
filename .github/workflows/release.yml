@@ -2,7 +2,10 @@ name: Release
 
 on:
   push:
-    tags: ["v*.*.*"]
+    # CalVer tags: 2026-10-10.N (see scripts/release.sh). The pattern matches a
+    # YYYY-MM-DD prefix plus any suffix, so each same-day release (.1, .2, …)
+    # fires this workflow.
+    tags: ['20[0-9][0-9]-*']
 
 permissions:
   contents: write
