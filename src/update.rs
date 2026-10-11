@@ -1151,20 +1151,83 @@ pub fn stage(plan: &Plan, log: &mut dyn FnMut(String)) -> Result<Pending> {
     Ok(pending)
 }
 
-/// Move `path` aside into `backup_dir/rel`, creating parents. Missing files
-/// are fine (nothing to back up).
-fn backup_then(backup_dir: &Path, rel: &str, path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
+/// Move the file `from` to `to` (which must not exist), across filesystems if
+/// need be.
+///
+/// `rename` first: atomic and instant inside one filesystem. When `from` and
+/// `to` live on different volumes — the update staging/backup directory can be
+/// on another drive (with `HOME` unset on Windows the resolved cache path is
+/// drive-relative, and an install may simply live on another disk) — `rename`
+/// fails with "cannot move the file to a different disk drive", so fall back to
+/// copy + unlink. `from` is removed only once the copy succeeded, so a failure
+/// leaves it exactly where it was.
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    if to.exists() {
+        bail!("refusing to overwrite {}", to.display());
     }
-    let dest = backup_dir.join(rel);
-    if let Some(dir) = dest.parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let _ = std::fs::remove_file(&dest);
-    std::fs::rename(path, &dest).with_context(|| {
-        format!("backing up {} -> {}", path.display(), dest.display())
-    })?;
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            std::fs::copy(from, to).with_context(|| {
+                format!(
+                    "moving {} -> {} (rename failed: {rename_err})",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+            std::fs::remove_file(from)
+                .with_context(|| format!("removing {}", from.display()))?;
+            Ok(())
+        }
+    }
+}
+
+/// Move `from` to `to`, replacing whatever is at `to` (the previous-version
+/// backup slot): a stale copy from an earlier attempt is dropped first.
+fn move_aside(from: &Path, to: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(to);
+    move_file(from, to)
+}
+
+/// Install one file of the staged bundle over the existing `to`, keeping the
+/// replaced original at `backup_dir/rel`.
+///
+/// The new content is written to a SIBLING temp file first (same directory as
+/// the target, so the final rename never crosses a filesystem), the original is
+/// moved aside, and only then is the temp renamed into place — with a rollback
+/// if that last step fails. Every failure therefore leaves the install exactly
+/// as it was: nothing is moved away before the replacement exists on disk.
+fn swap_file(from: &Path, to: &Path, backup_dir: &Path, rel: &str) -> Result<()> {
+    let staged = to.with_file_name(format!(
+        ".{}.mordent-new",
+        to.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(&staged);
+    install_file(from, &staged).with_context(|| format!("staging {}", to.display()))?;
+
+    let had_old = to.exists();
+    let backup = backup_dir.join(rel);
+    if had_old
+        && let Err(e) = move_aside(to, &backup)
+    {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e).with_context(|| format!("backing up {}", to.display()));
+    }
+    if let Err(e) = std::fs::rename(&staged, to) {
+        // Put the previous file back and drop the staged copy: the install is
+        // left untouched rather than half-swapped.
+        if had_old {
+            let _ = move_aside(&backup, to);
+        }
+        let _ = std::fs::remove_file(&staged);
+        bail!(
+            "installing {} failed ({e}); the previous file was restored",
+            to.display()
+        );
+    }
     Ok(())
 }
 
@@ -1196,13 +1259,34 @@ fn apply_bundle(content: &Path, target: &Path, tag: &str, log: &mut Vec<String>)
         bail!("staged bundle has no files to install");
     }
     std::fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
+    // Files already swapped, so a failure partway through can put them back:
+    // a half-updated install (some new files, some missing) is worse than the
+    // version the user is currently running.
+    let mut done: Vec<(String, bool)> = Vec::new();
     for (rel, from) in files {
         if !is_payload_rel(&rel) {
             continue;
         }
         let to = target.join(&rel);
-        backup_then(&backup, &rel, &to)?;
-        install_file(&from, &to)?;
+        let had_old = to.exists();
+        if let Err(e) = swap_file(&from, &to, &backup, &rel) {
+            let mut rolled_back = 0usize;
+            for (done_rel, had_old) in done.iter().rev() {
+                let back = target.join(done_rel);
+                let ok = if *had_old {
+                    move_aside(&backup.join(done_rel), &back).is_ok()
+                } else {
+                    std::fs::remove_file(&back).is_ok() || !back.exists()
+                };
+                if ok {
+                    rolled_back += 1;
+                }
+            }
+            return Err(e).with_context(|| {
+                format!("installing {rel} failed — rolled back {rolled_back} already-installed file(s)")
+            });
+        }
+        done.push((rel.clone(), had_old));
         log.push(format!("installed {rel}"));
     }
     Ok(())
@@ -1255,13 +1339,16 @@ pub fn apply(p: &Pending, log: &mut Vec<String>) -> Result<()> {
                 std::fs::rename(&target, &bak)
                     .with_context(|| format!("moving {} aside", target.display()))?;
             }
-            if let Err(e) = std::fs::rename(&archive, &target) {
+            // `move_file`, not `rename`: the staged image lives in the cache
+            // directory, which can be on another volume than the user's
+            // AppImage (Windows/macOS refuse a cross-volume rename).
+            if let Err(e) = move_file(&archive, &target) {
                 // Roll back: never leave the user without the image.
                 if bak.exists() {
                     let _ = std::fs::rename(&bak, &target);
                 }
                 bail!(
-                    "replacing {} failed ({e}); the previous image was restored",
+                    "replacing {} failed ({e:#}); the previous image was restored",
                     target.display()
                 );
             }
@@ -1280,13 +1367,17 @@ pub fn apply(p: &Pending, log: &mut Vec<String>) -> Result<()> {
             let _ = std::fs::remove_dir_all(&bak);
             std::fs::rename(&target, &bak)
                 .with_context(|| format!("moving {} aside", target.display()))?;
+            // A directory move has no cheap fallback here: `rename` only works
+            // within one filesystem, and a half-copied bundle is worse than an
+            // honest refusal (the staged bundle lives in the cache; on macOS
+            // that and the .app share the data volume in practice). On failure
+            // the previous bundle is put back and the error says what to do.
             if let Err(e) = std::fs::rename(&content, &target) {
-                // Roll back so the app is never left without a bundle.
                 let _ = std::fs::rename(&bak, &target);
                 return Err(anyhow!(
-                    "installing {} failed ({}); the previous bundle was restored",
-                    target.display(),
-                    e
+                    "installing {} failed ({e}); the previous bundle was restored — \
+                     download the release and replace Mordent.app by hand",
+                    target.display()
                 ));
             }
             log.push(format!("replaced {} (previous kept at {})", target.display(), bak.display()));
@@ -1958,8 +2049,146 @@ mod tests {
         let backup = update_dir().join("backup-2026-10-11.1");
         assert_eq!(std::fs::read(backup.join("mordent")).unwrap(), b"old app");
         assert_eq!(std::fs::read(backup.join("README.md")).unwrap(), b"old readme");
+        // No staging temporaries may survive a successful swap.
+        let leftovers: Vec<String> = std::fs::read_dir(&target)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("mordent-new"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporaries left behind: {leftovers:?}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(update_dir().join("backup-2026-10-11.1"));
+    }
+
+    /// A failure partway through a bundle swap puts the files already installed
+    /// back: the install is never left half-updated.
+    #[test]
+    fn apply_bundle_rolls_back_when_a_file_fails() {
+        let root = tmp("bundle-rollback");
+        let target = root.join("install");
+        let content = root.join("new");
+        fake_payload(&target);
+        fake_payload(&content);
+        std::fs::write(target.join("mordent"), b"old app").unwrap();
+        std::fs::write(content.join("mordent"), b"new app").unwrap();
+
+        // Sabotage the *second* file's backup slot (sorted order: mordent, then
+        // wrapper-lite) with a non-empty directory, so its swap must fail.
+        let backup = update_dir().join("backup-2026-10-12.1");
+        let _ = std::fs::remove_dir_all(&backup);
+        std::fs::create_dir_all(backup.join("wrapper-lite")).unwrap();
+        std::fs::write(backup.join("wrapper-lite/occupied"), b"x").unwrap();
+
+        let err = apply_bundle(&content, &target, "2026-10-12.1", &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rolled back"), "{err}");
+        // The first file was put back, and the failing one was never touched.
+        assert_eq!(std::fs::read(target.join("mordent")).unwrap(), b"old app");
+        assert_eq!(std::fs::read(target.join("wrapper-lite")).unwrap(), b"launcher");
+        // No staging temporaries survive the failure either.
+        let leftovers: Vec<String> = std::fs::read_dir(&target)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("mordent-new"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporaries left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&backup);
+    }
+
+    /// A file that only the new bundle carries is installed without a backup
+    /// (there is nothing to replace), and `move_file` never clobbers.
+    #[test]
+    fn swap_file_adds_new_files_and_move_file_refuses_to_clobber() {
+        let root = tmp("swap-new");
+        let target = root.join("install");
+        let content = root.join("new");
+        let backup = root.join("backup");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(content.join("scripts")).unwrap();
+        std::fs::write(content.join("scripts/install-wrapper.sh"), b"#!/bin/sh\n").unwrap();
+        swap_file(
+            &content.join("scripts/install-wrapper.sh"),
+            &target.join("scripts/install-wrapper.sh"),
+            &backup,
+            "scripts/install-wrapper.sh",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(target.join("scripts/install-wrapper.sh")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        assert!(!backup.exists(), "a new file has nothing to back up");
+
+        // `move_file` is the primitive: refuse to overwrite, `move_aside` may.
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("x"), b"old").unwrap();
+        let a = root.join("a");
+        std::fs::write(&a, b"new").unwrap();
+        let err = move_file(&a, &backup.join("x")).unwrap_err().to_string();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read(&a).unwrap(), b"new");
+        assert_eq!(std::fs::read(backup.join("x")).unwrap(), b"old");
+        move_aside(&a, &backup.join("x")).unwrap();
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(backup.join("x")).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&backup);
+    }
+
+    /// A swap that cannot even stage its replacement must leave the install
+    /// exactly as it was: nothing may be moved to the backup before the new
+    /// file exists on disk.
+    #[test]
+    fn swap_file_leaves_the_install_intact_when_staging_fails() {
+        let root = tmp("swap-intact");
+        let target = root.join("install");
+        let backup = root.join("backup");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("mordent"), b"old app").unwrap();
+        // The staged bundle never wrote this file.
+        let missing = root.join("staged/mordent");
+        let err = swap_file(&missing, &target.join("mordent"), &backup, "mordent")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("staging"), "{err}");
+        assert_eq!(std::fs::read(target.join("mordent")).unwrap(), b"old app");
+        assert!(
+            !backup.exists(),
+            "the previous file must not be moved before staging succeeds"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Windows bug this guards against, reproduced with two real
+    /// filesystems on Linux: `rename` refuses to cross a mount point (Windows:
+    /// "cannot move the file to a different disk drive"), so `move_file` must
+    /// fall back to copy + unlink. Skipped when no second filesystem is
+    /// available (macOS, Windows, a container without /dev/shm).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn move_file_crosses_filesystems() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tmp("move-cross");
+        let from = d.join("payload.bin");
+        std::fs::write(&from, b"payload").unwrap();
+        let other = Path::new("/dev/shm");
+        let Ok(other_meta) = std::fs::metadata(other) else {
+            return; // no /dev/shm here
+        };
+        if std::fs::metadata(&d).unwrap().dev() == other_meta.dev() {
+            return; // same filesystem: nothing to exercise
+        }
+        let to = other.join(format!("mordent-move-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&to);
+        move_file(&from, &to).unwrap_or_else(|e| panic!("cross-filesystem move failed: {e:#}"));
+        assert!(!from.exists(), "the source is removed after a successful copy");
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+        let _ = std::fs::remove_file(&to);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// `download_verified` against a local one-shot HTTP server (the network
