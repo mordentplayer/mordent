@@ -4,7 +4,8 @@
 //!
 //! * [`tray_argb`] — the tray icon (`src/tray.rs`): a transparent accent mark
 //!   sized for 16–24 px panels, in the ARGB byte order ksni/StatusNotifierItem
-//!   wants.
+//!   wants.  `src/tray.rs` is Linux-only, so everything only it uses is
+//!   `#[cfg(target_os = "linux")]` — the window half is not.
 //! * [`app_icon_rgba`] — the window icon (`src/ui.rs`): the rounded-square app
 //!   mark, in the RGBA byte order egui's `IconData` wants.
 //!
@@ -29,6 +30,7 @@ const PANEL_LO: [u8; 3] = [0x16, 0x16, 0x19];
 
 /// Tray pixmap edge, in pixels: the wide end of the range hosts use for panel
 /// icons, and the size where the mark's five vertices are tightest.
+#[cfg(target_os = "linux")]
 pub const TRAY_SIZE: u32 = 24;
 
 /// Window-icon edge, in pixels (egui wants a multiple of 4).  Taskbars and
@@ -51,6 +53,7 @@ const MARK: [[f32; 2]; 10] = [
 
 /// Tray variant: the same figure with the ribbon thickened 0.56 → 0.70, so the
 /// four strokes stay separate once the ink is ~20 px wide.
+#[cfg(target_os = "linux")]
 const MARK_TRAY: [[f32; 2]; 10] = [
     [0.188576, 0.615643],
     [0.327590, 0.374863],
@@ -68,6 +71,7 @@ const MARK_TRAY: [[f32; 2]; 10] = [
 const SS: u32 = 4;
 
 /// Fraction of the tray box the mark's ink fills.
+#[cfg(target_os = "linux")]
 const TRAY_INK: f32 = 0.92;
 
 /// App icon: panel inset, corner radius and mark width, as fractions of the
@@ -78,6 +82,7 @@ const PANEL_RADIUS: f32 = 0.20703125;
 const PANEL_MARK_W: f32 = 0.6525;
 
 /// The tray icon: [`TRAY_SIZE`]², transparent, ARGB network byte order.
+#[cfg(target_os = "linux")]
 pub fn tray_argb() -> Vec<u8> {
     let n = TRAY_SIZE as usize;
     let nf = TRAY_SIZE as f32;
