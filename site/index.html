@@ -41,7 +41,7 @@ a:hover{text-decoration:underline}
 :focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
 .skip{position:absolute;left:-9999px;top:0;background:var(--panel);color:var(--text);padding:.6rem 1rem;border-radius:0 0 8px 0;z-index:10}
 .skip:focus{left:0}
-.wrap{max-width:var(--maxw);margin:0 auto;padding:0 1.25rem}
+.wrap{max-width:var(--maxw);margin:0 auto;padding-inline:1.25rem}
 header.site{
   display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.6rem 1rem;
   padding:1rem 0;position:sticky;top:0;z-index:5;
@@ -58,7 +58,7 @@ nav.top a{color:var(--weak)}
 nav.top a:hover{color:var(--text);text-decoration:none}
 
 main{display:block}
-section{padding:3.2rem 0;border-bottom:1px solid var(--line)}
+section{padding-block:3.2rem;border-bottom:1px solid var(--line)}
 section:last-of-type{border-bottom:0}
 
 h1,h2,h3{line-height:1.2;margin:0 0 .6rem;font-weight:650;letter-spacing:-.01em}
@@ -67,7 +67,7 @@ h3{font-size:1.05rem;margin-bottom:.35rem}
 p{margin:0 0 1rem;color:var(--weak)}
 .lead{font-size:1.12rem;color:var(--text)}
 
-.hero{padding:4.5rem 0 3.5rem;text-align:center;border-bottom:1px solid var(--line)}
+.hero{padding-block:4.5rem 3.5rem;text-align:center;border-bottom:1px solid var(--line)}
 .hero .icon{width:100px;height:100px;margin:0 auto 1.4rem;filter:drop-shadow(0 6px 18px rgba(0,0,0,.45))}
 .hero h1{font-size:clamp(2.1rem,6vw,3.2rem);margin-bottom:.7rem}
 .hero .tag{font-size:clamp(1.05rem,2.6vw,1.35rem);color:var(--text);max-width:38ch;margin:0 auto 1rem}
@@ -140,7 +140,7 @@ footer.site p{margin:.3rem 0}
 
 @media (max-width:560px){
   pre{white-space:pre-wrap;overflow-wrap:anywhere}
-  .hero{padding:3.2rem 0 2.6rem}
+  .hero{padding-block:3.2rem 2.6rem}
 }
 @media (prefers-reduced-motion:reduce){
   *{transition:none!important;animation:none!important;scroll-behavior:auto!important}
