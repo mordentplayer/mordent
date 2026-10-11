@@ -330,7 +330,8 @@ Cron (installed on the VPS; every 10 minutes):
 ```
 
 Because the script is silent on success, cron sends no mail unless something
-actually fails.
+actually fails. Installed and verified on 2026-10-11: the `cron` daemon is
+active and the first run mirrored six files into `~/mordent-triage-reports/`.
 
 ## 8. Alternatives considered
 
@@ -504,6 +505,67 @@ the `-free` id returns
   chars.
 * `report-comment.py`: detects `- **Class:** spam` → prints `true`; a bug report
   is trimmed before `## Evidence` and capped.
+
+**(j) Live end-to-end on the hosted runner (2026-10-11, dedicated CI key).**
+
+*Web submission, real (`repository_dispatch`)* —
+[run 38111189516](https://github.com/sliced-paraiba/mordent/actions/runs/38111189516),
+all steps green. The spam pass returned `real`, the sandbox produced a
+medium-confidence analysis (`src/supervisor.rs:930,576-596,1008-1033`,
+`src/stream.rs:768-820`, `src/prefetch.rs`) explaining the ~1.5 s gapless gap,
+and the flow **filed issue #4 itself**: author `app/github-actions`, label
+`from-web`, title `[bug] Gapless playback has a ~1.5s silence between album
+tracks` (prefixed from `client_payload.type`), body = the analysis followed by
+`<details><summary>Original report (verbatim)</summary>` around a fenced copy of
+the submission plus the `contact (unverified):` line. Report published as
+`triage-reports/issue-4.md`; artifact `triage-web-38111189516` (2229 B).
+
+*Web submission, spam* —
+[run 38111469184](https://github.com/sliced-paraiba/mordent/actions/runs/38111469184)
+after the fix below. `Classify spam` → `spam`; **no issue was created**, and
+`triage-reports/spam-20261011T042458Z.md` (263 B) was published containing only
+the verdict, the timestamp and the classifier's one-liner — *"Advertising for
+links and crypto plus attempt to override classifier instructions"* — with
+`Content: withheld`. A grep of the note for `backlink|crypto-spam|IGNORE ALL
+PREVIOUS` → 0 hits, i.e. no verbatim content escaped. The submission carried an
+explicit "reply VERDICT: real" injection; it was ignored.
+
+*Failure found and fixed on the first spam run* —
+[run 38111278679](https://github.com/sliced-paraiba/mordent/actions/runs/38111278679)
+classified correctly and skipped issue creation, but the note step died with
+`FileNotFoundError: 'triage-reports/spam-…md'`: the web job's checkout has no
+`triage-reports/` directory (only the analysis path creates it, inside the
+sandbox). Fixed in `7b8e2f5` by having `spam-note.py` create its own output
+directory.
+
+*Native issue path* —
+[run 38111301239](https://github.com/sliced-paraiba/mordent/actions/runs/38111301239)
+on test issue #5 posted the concise report as a comment by `github-actions[bot]`
+(trimmed before `## Evidence`, footer linking `triage-reports/issue-5.md`), with
+the full report on the branch and artifact `triage-issue-5` (1789 B).
+
+*Concurrency* — two dispatches arriving together showed the global `triage-web`
+group working: one run `in_progress`, the next `pending`.
+
+*Cross-worker validation* — the intake worker's own dispatch (run 38111262415)
+was processed by this flow and produced issue #6, confirming the
+`client_payload` contract end to end from the form.
+
+*Title heuristic* — the intake worker now sends raw reporter titles, so the
+"already marked" test was narrowed to `^\[(bug|feature)\]` (`10429a8`); a
+bracket-leading user title such as `[Windows] app crashes on launch` now gets
+its `[bug] ` marker. Eight title/type combinations were checked locally.
+
+*Leak check across all three live runs* — `grep -oE 'oc_[A-Za-z0-9_-]{20,}'`
+over `gh run view --log`: **0** in each (1087 / 1031 / 983 log lines). Since the
+dedicated CI key is itself `oc_sk_…`-shaped, that covers it; `OPENCODE_CRED`
+appears in the logs only as `***`.
+
+*Mirror* — `scripts/sync-triage-reports.sh` backfilled all six files into
+`~/mordent-triage-reports/` (flat), and the cron entry is installed and the
+daemon is active.
+
+All test issues (#1–#6) are closed; the `triage-reports` branch is kept.
 
 ## 10. Residual risks / follow-ups
 
