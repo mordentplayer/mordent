@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Mordent — a native, fast Apple Music client</title>
+<meta name="description" content="Mordent is a lightweight, native Apple Music client for Linux, macOS and Windows: instant startup, full-quality ALAC playback, word-synced lyrics, search, library and queue — built in Rust with egui.">
+<meta property="og:title" content="Mordent — a native, fast Apple Music client">
+<meta property="og:description" content="Lightweight native Apple Music client: instant startup, full-quality playback, lyrics, search, library and queue.">
+<meta property="og:type" content="website">
+<link rel="canonical" href="https://mordent.app/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024'%3E%3Crect x='48' y='48' width='928' height='928' rx='212' fill='%23161619'/%3E%3Cpath d='M 282.7 665.7 L 392.3 475.8 L 554.4 756.5 L 700.9 502.6 L 752.1 693.8 L 846.1 693.8 L 731.9 267.5 L 554.4 575.0 L 392.3 294.3 L 177.9 665.7 Z' fill='%23fa4d6a'/%3E%3C/svg%3E">
+<style>
+:root{
+  --accent:#fa4d6a;
+  --accent-soft:#fa4d6a22;
+  --bg:#1b1b1b;
+  --bg-2:#141414;
+  --panel:#232323;
+  --panel-2:#2a2a2a;
+  --line:#333;
+  --text:#e9e9e9;
+  --weak:#a3a3a3;
+  --lossless:#6ad1a8;
+  --radius:14px;
+  --maxw:960px;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
+.skip{position:absolute;left:-9999px;top:0;background:var(--panel);color:var(--text);padding:.6rem 1rem;border-radius:0 0 8px 0;z-index:10}
+.skip:focus{left:0}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 1.25rem}
+header.site{
+  display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.6rem 1rem;
+  padding:1rem 0;position:sticky;top:0;z-index:5;
+  background:rgba(27,27,27,.92);
+  background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--line);
+}
+header.site .brand{display:flex;align-items:center;gap:.6rem;font-weight:600;letter-spacing:.01em}
+header.site .brand:hover{text-decoration:none}
+header.site svg{display:block}
+nav.top{display:flex;flex-wrap:wrap;gap:.4rem 1.1rem;font-size:.92rem}
+nav.top a{color:var(--weak)}
+nav.top a:hover{color:var(--text);text-decoration:none}
+
+main{display:block}
+section{padding:3.2rem 0;border-bottom:1px solid var(--line)}
+section:last-of-type{border-bottom:0}
+
+h1,h2,h3{line-height:1.2;margin:0 0 .6rem;font-weight:650;letter-spacing:-.01em}
+h2{font-size:1.5rem}
+h3{font-size:1.05rem;margin-bottom:.35rem}
+p{margin:0 0 1rem;color:var(--weak)}
+.lead{font-size:1.12rem;color:var(--text)}
+
+.hero{padding:4.5rem 0 3.5rem;text-align:center;border-bottom:1px solid var(--line)}
+.hero .icon{width:100px;height:100px;margin:0 auto 1.4rem;filter:drop-shadow(0 6px 18px rgba(0,0,0,.45))}
+.hero h1{font-size:clamp(2.1rem,6vw,3.2rem);margin-bottom:.7rem}
+.hero .tag{font-size:clamp(1.05rem,2.6vw,1.35rem);color:var(--text);max-width:38ch;margin:0 auto 1rem}
+.hero .sub{max-width:52ch;margin:0 auto 1.8rem}
+.cta{display:flex;flex-wrap:wrap;gap:.8rem;justify-content:center}
+.btn{
+  display:inline-flex;align-items:center;gap:.5rem;
+  padding:.72rem 1.25rem;border-radius:999px;border:1px solid var(--line);
+  background:var(--panel);color:var(--text);font-weight:600;font-size:.97rem;
+  cursor:pointer;transition:background .15s ease,border-color .15s ease,transform .15s ease;
+}
+.btn:hover{text-decoration:none;background:var(--panel-2);border-color:#454545}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#200307}
+.btn.primary:hover{background:#ff6079;border-color:#ff6079}
+.btn svg{flex:none}
+
+.grid{display:grid;gap:1rem}
+@media (min-width:640px){.grid.two{grid-template-columns:1fr 1fr}.grid.three{grid-template-columns:repeat(3,1fr)}}
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:1.15rem 1.2rem;
+}
+.card p:last-child{margin-bottom:0}
+.card .k{color:var(--text);font-weight:600}
+
+.badge{
+  display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--lossless);background:rgba(106,209,168,.15);
+  background:color-mix(in srgb,var(--lossless) 15%,transparent);
+  border:1px solid rgba(106,209,168,.35);
+  border:1px solid color-mix(in srgb,var(--lossless) 35%,transparent);
+  padding:.1rem .5rem;border-radius:999px;vertical-align:middle;
+}
+
+.install-grid{display:grid;gap:1rem}
+@media (min-width:700px){.install-grid{grid-template-columns:repeat(3,1fr)}}
+.os{display:flex;flex-direction:column;gap:.6rem}
+.os .oshead{display:flex;align-items:center;justify-content:space-between;gap:.5rem}
+.os .oshead span{font-weight:650;color:var(--text)}
+.os ul{margin:.2rem 0 0;padding-left:1.1rem;color:var(--weak);font-size:.92rem}
+.os li{margin:.15rem 0}
+.os .btn{margin-top:auto;justify-content:center}
+
+pre,code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace}
+pre{
+  background:var(--bg-2);border:1px solid var(--line);border-radius:10px;
+  padding:.9rem 1rem;overflow-x:auto;font-size:.88rem;margin:0 0 .7rem;color:var(--text);
+}
+.small{font-size:.86rem}
+code.inline{background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:.05rem .35rem;font-size:.88em}
+
+details{border:1px solid var(--line);border-radius:10px;background:var(--panel);margin:.6rem 0;padding:.1rem}
+details>summary{cursor:pointer;padding:.7rem 1rem;font-weight:600;color:var(--text);border-radius:10px}
+details[open]>summary{border-bottom:1px solid var(--line);border-radius:10px 10px 0 0}
+details .body{padding:.9rem 1rem 1rem}
+details .body p:last-child{margin-bottom:0}
+
+.note{border-left:3px solid var(--accent);background:rgba(250,77,106,.13);background:var(--accent-soft);padding:.8rem 1rem;border-radius:0 10px 10px 0;color:var(--text)}
+.note p{color:var(--text);margin:0}
+
+ul.links{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:.6rem 1.4rem}
+ul.links a{font-weight:600}
+
+footer.site{padding:2rem 0 3rem;color:var(--weak);font-size:.88rem;border-top:1px solid var(--line)}
+footer.site p{margin:.3rem 0}
+.foot-links{display:flex;flex-wrap:wrap;gap:.5rem 1.2rem;margin-bottom:.7rem}
+.foot-links a{color:var(--weak)}
+.foot-links a:hover{color:var(--text)}
+
+@media (max-width:560px){
+  pre{white-space:pre-wrap;overflow-wrap:anywhere}
+  .hero{padding:3.2rem 0 2.6rem}
+}
+@media (prefers-reduced-motion:reduce){
+  *{transition:none!important;animation:none!important;scroll-behavior:auto!important}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site">
+  <div class="wrap" style="display:flex;align-items:center;justify-content:space-between;gap:1rem;width:100%">
+    <a class="brand" href="#top" aria-label="Mordent home">
+      <svg width="28" height="28" viewBox="0 0 1024 1024" aria-hidden="true" focusable="false">
+        <rect x="48" y="48" width="928" height="928" rx="212" fill="#161619" stroke="#ffffff1a" stroke-width="10"/>
+        <path d="M 282.7 665.7 L 392.3 475.8 L 554.4 756.5 L 700.9 502.6 L 752.1 693.8 L 846.1 693.8 L 731.9 267.5 L 554.4 575.0 L 392.3 294.3 L 177.9 665.7 Z" fill="#fa4d6a"/>
+      </svg>
+      Mordent
+    </a>
+    <nav class="top" aria-label="Primary">
+      <a href="#install">Install</a>
+      <a href="#helper">Helper</a>
+      <a href="#feedback">Feedback</a>
+      <a href="https://github.com/mordentplayer/mordent" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <section class="hero wrap" id="top">
+    <svg class="icon" viewBox="0 0 1024 1024" role="img" aria-label="Mordent mark: a pink ornament on a dark rounded square">
+      <defs>
+        <radialGradient id="bg" cx="0.32" cy="0.24" r="0.95">
+          <stop offset="0" stop-color="#26262a"/>
+          <stop offset="1" stop-color="#161619"/>
+        </radialGradient>
+      </defs>
+      <rect x="48" y="48" width="928" height="928" rx="212" fill="url(#bg)" stroke="#ffffff1a" stroke-width="10"/>
+      <path d="M 282.7 665.7 L 392.3 475.8 L 554.4 756.5 L 700.9 502.6 L 752.1 693.8 L 846.1 693.8 L 731.9 267.5 L 554.4 575.0 L 392.3 294.3 L 177.9 665.7 Z" fill="#fa4d6a"/>
+    </svg>
+    <h1>Mordent</h1>
+    <p class="tag">A native, fast Apple Music client.</p>
+    <p class="sub">Instant startup, minimal resource use, and the shortest path from wanting to hear music to hearing it — in a single Rust binary with an egui interface.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/mordentplayer/mordent/releases/latest" rel="noopener">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 12 5 5 5-5"/><path d="M5 21h14"/></svg>
+        Download
+      </a>
+      <a class="btn" href="#install">How to install</a>
+      <a class="btn" href="#feedback">Report a bug</a>
+    </div>
+  </section>
+
+  <section class="wrap" id="what">
+    <h2>What it is</h2>
+    <p class="lead">Mordent is a lightweight, native Apple Music client for Linux, macOS and Windows, built in Rust with egui.</p>
+    <div class="grid two" style="margin-top:1.4rem">
+      <div class="card">
+        <h3>Native &amp; fast</h3>
+        <p>One small Rust binary and an immediate-mode UI. Catalog search and 90-second previews work anonymously — no login required to browse.</p>
+      </div>
+      <div class="card">
+        <h3>Full-quality playback</h3>
+        <p>ALAC up to 24-bit / hi-res, decrypted in-flight by <span class="badge">wrapper-lite</span> — the FairPlay SAMPLE-AES backend. Requires an active Apple Music subscription logged into the helper.</p>
+      </div>
+      <div class="card">
+        <h3>Your music, organized</h3>
+        <p>Search with Songs and Albums views, your library albums, playlists, favorites, word-synced lyrics, and a real queue with reorder, shuffle and repeat.</p>
+      </div>
+      <div class="card">
+        <h3>Private by design</h3>
+        <p>Only <strong>encrypted</strong> (FairPlay) audio is ever written to the cache — decryption happens in memory at play time, so the cached files stay inert without your device's license material.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap" id="install">
+    <h2>Install</h2>
+    <p class="lead">Download, double-click, done. The first run opens a guided setup wizard — every later run is the same windowed app, no terminal at any point.</p>
+
+    <div class="install-grid" style="margin-top:1.4rem">
+      <div class="card os">
+        <div class="oshead"><span>Linux — AppImage</span></div>
+        <ul>
+          <li>Works on any distro; installs nothing by itself.</li>
+          <li>Allow executing the file in your file manager once.</li>
+          <li>Double-click to start.</li>
+        </ul>
+        <a class="btn" data-asset="linux" href="https://github.com/mordentplayer/mordent/releases/latest" rel="noopener">Download for Linux</a>
+      </div>
+      <div class="card os">
+        <div class="oshead"><span>macOS — Mordent.app</span></div>
+        <ul>
+          <li>Apple Silicon and Intel builds.</li>
+          <li>Unzip, drag into Applications.</li>
+          <li>First launch: right-click → Open → Open.</li>
+        </ul>
+        <a class="btn" data-asset="macos" href="https://github.com/mordentplayer/mordent/releases/latest" rel="noopener">Download for macOS</a>
+      </div>
+      <div class="card os">
+        <div class="oshead"><span>Windows — zip</span></div>
+        <ul>
+          <li>Unzip anywhere, run <code class="inline">mordent.exe</code>.</li>
+          <li>First run: SmartScreen → More info → Run anyway.</li>
+        </ul>
+        <a class="btn" data-asset="windows" href="https://github.com/mordentplayer/mordent/releases/latest" rel="noopener">Download for Windows</a>
+      </div>
+    </div>
+    <p class="small" style="margin-top:.9rem">All downloads live on the <a href="https://github.com/mordentplayer/mordent/releases/latest" rel="noopener">latest release page</a> — plain tarballs and checksums included.</p>
+
+    <h3 style="margin-top:2rem">Or one line in a terminal</h3>
+    <p>Installs into a user directory (<code class="inline">~/.local</code>) — no <code class="inline">sudo</code>, ever.</p>
+    <pre><code>curl -fsSL https://github.com/mordentplayer/mordent/releases/latest/download/install.sh | bash</code></pre>
+    <div class="note"><p>Prefer to look before you run? Download <a href="https://github.com/mordentplayer/mordent/releases/latest/download/install.sh" rel="noopener">install.sh</a>, read it, then run <code class="inline">bash install.sh</code> yourself. It takes <code class="inline">--prefix</code>, <code class="inline">--tag</code> and <code class="inline">--uninstall</code>.</p></div>
+  </section>
+
+  <section class="wrap" id="helper">
+    <h2>The helper</h2>
+    <p class="lead">Full-quality playback needs <a href="https://github.com/WorldObservationLog/wrapper/tree/lite" rel="noopener">wrapper-lite</a>, the FairPlay SAMPLE-AES decryption backend.</p>
+    <p>Apple serves lossless audio encrypted; wrapper-lite does the licensed decryption and hands Mordent the manifest, keys and lyrics over plain HTTP on your own machine or LAN. It is a small Linux/x86-64 binary — Mordent talks to it over HTTP, so it can live anywhere reachable.</p>
+    <div class="grid two" style="margin-top:1.2rem">
+      <div class="card">
+        <h3>Graphical install</h3>
+        <p>The setup wizard installs the helper bundled with the app as a system service under <code class="inline">/opt/mordent-wrapper</code> — the one step that asks for your password, through a graphical dialog. Pick <em>Install the helper on this computer</em> and it streams the installer output live.</p>
+      </div>
+      <div class="card">
+        <h3>Remote or home server</h3>
+        <p>On a Mac the helper runs in Docker (or on an always-on Linux box) and the wizard's <em>Connect to a music helper</em> path just points at its URL — on this computer, a friend's server, or your own VPS. Compose file and a step-by-step guide ship with each release.</p>
+      </div>
+    </div>
+    <details>
+      <summary>Download the helper container pieces directly</summary>
+      <div class="body">
+        <p>Stable URLs, always the latest release:</p>
+        <pre><code>https://github.com/mordentplayer/mordent/releases/latest/download/wrapper-lite-amd64.tar.gz
+https://github.com/mordentplayer/mordent/releases/latest/download/compose.yaml</code></pre>
+        <p class="small" style="margin:0">Already installed and want to update? A helper under <code class="inline">/opt/mordent-wrapper</code> (or a legacy <code class="inline">/opt/amc-wrapper</code>) keeps working unchanged — nothing needs re-authenticating.</p>
+      </div>
+    </details>
+  </section>
+
+  <section class="wrap" id="feedback">
+    <h2>Feedback</h2>
+    <p class="lead">Report a bug or request a feature — no GitHub account needed.</p>
+    <p>Submissions go to an anonymous form and are triaged into public issues on the repository. You can also open an issue directly if you prefer.</p>
+    <div class="cta" style="justify-content:flex-start">
+      <a class="btn primary" href="https://mordent.app/feedback" rel="noopener">Open the feedback form</a>
+      <a class="btn" href="https://github.com/mordentplayer/mordent/issues" rel="noopener">Browse issues</a>
+    </div>
+  </section>
+
+  <section class="wrap" id="links">
+    <h2>Links</h2>
+    <ul class="links">
+      <li><a href="https://github.com/mordentplayer/mordent" rel="noopener">Source code</a></li>
+      <li><a href="https://github.com/mordentplayer/mordent/releases/latest" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/mordentplayer/mordent/issues" rel="noopener">Issues</a></li>
+      <li><a href="https://mordent.app/feedback" rel="noopener">Feedback form</a></li>
+    </ul>
+  </section>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <div class="foot-links">
+      <a href="https://github.com/mordentplayer/mordent" rel="noopener">GitHub</a>
+      <a href="https://github.com/mordentplayer/mordent/blob/main/LICENSE" rel="noopener">Apache-2.0</a>
+      <a href="https://github.com/mordentplayer/mordent/releases/latest" rel="noopener">Releases</a>
+    </div>
+    <p>Mordent is free software, licensed under the Apache License 2.0. © mordentplayer.</p>
+    <p>Mordent is an independent project. Apple, Apple Music and MusicKit are trademarks of Apple Inc. Not affiliated with or endorsed by Apple.</p>
+  </div>
+</footer>
+
+<script>
+/* Progressive enhancement: fill real per-OS asset links from the latest release.
+   The page is fully functional without this — every button already points at the
+   releases page, and any failure leaves those defaults untouched. */
+(function () {
+  var API = "https://api.github.com/repos/mordentplayer/mordent/releases/latest";
+  function pick(assets, res) {
+    for (var j = 0; j < res.length; j++) {
+      for (var i = 0; i < assets.length; i++) {
+        if (res[j].test(assets[i].name)) return assets[i].browser_download_url;
+      }
+    }
+    return null;
+  }
+  /* Ordered preferences: the graphical artifact first, the plain tarball as a
+     still-useful second choice. Nothing here changes when the release lacks a
+     given artifact — the button just keeps its releases-page fallback. */
+  var groups = {
+    linux: [/\.AppImage$/i, /linux-x86_64\.tar\.gz$/i],
+    macos: [/macos-(aarch64|arm64|x86_64)\.zip$/i, /macos-(aarch64|arm64|x86_64)\.tar\.gz$/i],
+    windows: [/windows-x86_64\.zip$/i]
+  };
+  try {
+    if (!window.fetch || !window.JSON) return;
+    fetch(API, { headers: { Accept: "application/vnd.github+json" } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (rel) {
+        if (!rel || !rel.assets) return;
+        Object.keys(groups).forEach(function (key) {
+          var url = pick(rel.assets, groups[key]);
+          if (!url) return;
+          var el = document.querySelector('[data-asset="' + key + '"]');
+          if (!el) return;
+          el.href = url;
+          el.setAttribute("download", "");
+          el.title = "Direct download — version " + (rel.tag_name || "latest");
+        });
+      })
+      .catch(function () { /* keep the releases-page fallbacks */ });
+  } catch (e) { /* no JS / blocked: fallbacks stand */ }
+})();
+</script>
+</body>
+</html>

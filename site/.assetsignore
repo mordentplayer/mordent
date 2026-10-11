@@ -1,0 +1,8 @@
+# Files that must not be uploaded as part of the site deployment.
+README.md
+wrangler.jsonc
+.assetsignore
+.gitignore
+# wrangler's own scratch directory, created inside the assets root at deploy time
+.wrangler/
+preview-*.png
