@@ -54,7 +54,10 @@ if [ -d "$dest" ]; then
   find "$dest" -mindepth 1 -delete
 fi
 
-git -C "$tmp" archive FETCH_HEAD | tar -x -C "$dest"
+# The branch layout is always `triage-reports/<file>.md` (see bin/publish.sh),
+# so strip that one leading component: the mirror then reads as a flat
+# directory of reports rather than ~/mordent-triage-reports/triage-reports/.
+git -C "$tmp" archive FETCH_HEAD | tar -x -C "$dest" --strip-components=1
 
 count="$(find "$dest" -type f | wc -l | tr -d ' ')"
 log "mirrored ${count} file(s) from ${repo}#${branch} into ${dest}"
