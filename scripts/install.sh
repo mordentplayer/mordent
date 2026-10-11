@@ -2,7 +2,7 @@
 #
 # install.sh — install Mordent into a USER directory. No sudo, ever.
 #
-#   curl -fsSL https://github.com/sliced-paraiba/mordent/releases/latest/download/install.sh | bash
+#   curl -fsSL https://github.com/mordentplayer/mordent/releases/latest/download/install.sh | bash
 #
 # Options:
 #   --tag <tag>      install a specific release tag (default: the latest release)
@@ -21,7 +21,7 @@
 #
 set -euo pipefail
 
-REPO="sliced-paraiba/mordent"
+REPO="mordentplayer/mordent"
 TAG="${MORDENT_TAG:-}"
 PREFIX="${MORDENT_PREFIX:-${HOME:-}/.local}"
 UNINSTALL=0

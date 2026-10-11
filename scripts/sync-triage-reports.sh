@@ -14,7 +14,7 @@
 #   scripts/sync-triage-reports.sh [-v]
 #
 # Environment overrides:
-#   MORDENT_REPO        owner/name            (default sliced-paraiba/mordent)
+#   MORDENT_REPO        owner/name            (default mordentplayer/mordent)
 #   MORDENT_REMOTE      git remote URL        (default https://github.com/<repo>.git)
 #   MORDENT_TRIAGE_DIR  destination           (default ~/mordent-triage-reports)
 #   TRIAGE_REPORT_BRANCH branch name          (default triage-reports)
@@ -29,7 +29,7 @@ if [ "${MORDENT_SYNC_VERBOSE:-0}" = "1" ]; then
   verbose=1
 fi
 
-repo="${MORDENT_REPO:-sliced-paraiba/mordent}"
+repo="${MORDENT_REPO:-mordentplayer/mordent}"
 branch="${TRIAGE_REPORT_BRANCH:-triage-reports}"
 dest="${MORDENT_TRIAGE_DIR:-$HOME/mordent-triage-reports}"
 remote="${MORDENT_REMOTE:-https://github.com/${repo}.git}"

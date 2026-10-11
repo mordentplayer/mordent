@@ -4,7 +4,7 @@ An **anonymous** bug-report / feature-request form for people without a GitHub
 account. A valid submission is handed to the triage workflow
 (`.github/workflows/triage.yml`) via a `repository_dispatch` event; that workflow
 classifies it and files the public issue on
-[`sliced-paraiba/mordent`](https://github.com/sliced-paraiba/mordent) with the
+[`mordentplayer/mordent`](https://github.com/mordentplayer/mordent) with the
 `from-web` label. The Worker itself never creates issues, so nothing reaches the
 repository without passing the classification step.
 
@@ -120,21 +120,21 @@ the final gate that decides what becomes a public issue — spam never surfaces.
 
 | Var | Meaning |
 | --- | --- |
-| `GH_REPO` | `sliced-paraiba/mordent` — repository the dispatch is sent to. |
+| `GH_REPO` | `mordentplayer/mordent` — repository the dispatch is sent to. |
 | `DRY_RUN` | `1` = log the would-be dispatch and return `200 {ok:true}` **without** calling GitHub. Must be `0` in production. |
 
 Secret:
 
 | Secret | Meaning |
 | --- | --- |
-| `GH_TOKEN` | Fine-grained PAT for `sliced-paraiba/mordent` with **Issues: read and write** *and* **Contents: read and write**. Issues write is no longer used by the Worker itself (the workflow files the issue with its own `GITHUB_TOKEN`); Contents write is what authorises `repository_dispatch` — GitHub requires it and answers `403 ... x-accepted-github-permissions: contents=write` without it. |
+| `GH_TOKEN` | Fine-grained PAT for `mordentplayer/mordent` with **Issues: read and write** *and* **Contents: read and write**. Issues write is no longer used by the Worker itself (the workflow files the issue with its own `GITHUB_TOKEN`); Contents write is what authorises `repository_dispatch` — GitHub requires it and answers `403 ... x-accepted-github-permissions: contents=write` without it. |
 
 ### Delivery channel
 
 The Worker validates, rate-limits and then fires one `repository_dispatch`:
 
 ```json
-POST https://api.github.com/repos/sliced-paraiba/mordent/dispatches
+POST https://api.github.com/repos/mordentplayer/mordent/dispatches
 { "event_type": "web-submission",
   "client_payload": { "type": "bug", "title": "…", "body": "…", "contact": "…" } }
 ```
@@ -188,10 +188,10 @@ and never touches the production KV namespace.
 ### 3. The fine-grained PAT (`GH_TOKEN`)
 
 **Status: installed 2026-10-11** as the Worker secret `GH_TOKEN`, named
-`mordent-intake-worker`, scoped to the single repository `sliced-paraiba/mordent`
+`mordent-intake-worker`, scoped to the single repository `mordentplayer/mordent`
 with **Issues: read and write** and, since the channel switched to
 `repository_dispatch`, also **Contents: read and write**. Verified:
-`GET /user` → `sliced-paraiba`, `GET /repos/sliced-paraiba/mordent` → `200`, a
+`GET /user` → `sliced-paraiba`, `GET /repos/mordentplayer/mordent` → `200`, a
 deliberately invalid issue creation returning `422 Validation Failed` (not `403`,
 proving Issues write without creating anything), and the dispatch endpoint
 returning `204` (`403 … contents=write` before the Contents permission was
@@ -227,7 +227,7 @@ granted). The steps below are the record for rotation.
    curl -s -o /dev/null -w '%{http_code}\n' -X POST \
      -H "Authorization: Bearer $GH_TOKEN" \
      -d '{"event_type":"intake-capability-probe"}' \
-     https://api.github.com/repos/sliced-paraiba/mordent/dispatches
+     https://api.github.com/repos/mordentplayer/mordent/dispatches
    # → 204
    ```
 
@@ -255,8 +255,8 @@ against the deployed Worker:
 
 End to end against the live Worker and the public repo:
 
-- PAT checks: `GET /user`/`GET /repos/sliced-paraiba/mordent` → `200`; invalid issue creation → `422`; `POST /dispatches` → `403` before the Contents permission and `204` after it.
-- Dispatch smoke: a synthetic JSON `curl` submission → `200 {"ok":true}`; the Worker created **no** issue itself, the `repository_dispatch` run [38111262415](https://github.com/sliced-paraiba/mordent/actions/runs/38111262415) ran the `web` job to success, and issue [#6](https://github.com/sliced-paraiba/mordent/issues/6) was filed by `github-actions[bot]` with the `from-web` label, the classification/analysis body and the original report in a collapsed `Original report (verbatim)` block plus the `contact (unverified):` line. The test issue was then closed. (The spam pass ran as part of that job and cleared it as not spam.)
+- PAT checks: `GET /user`/`GET /repos/mordentplayer/mordent` → `200`; invalid issue creation → `422`; `POST /dispatches` → `403` before the Contents permission and `204` after it.
+- Dispatch smoke: a synthetic JSON `curl` submission → `200 {"ok":true}`; the Worker created **no** issue itself, the `repository_dispatch` run [38111262415](https://github.com/mordentplayer/mordent/actions/runs/38111262415) ran the `web` job to success, and issue [#6](https://github.com/mordentplayer/mordent/issues/6) was filed by `github-actions[bot]` with the `from-web` label, the classification/analysis body and the original report in a collapsed `Original report (verbatim)` block plus the `contact (unverified):` line. The test issue was then closed. (The spam pass ran as part of that job and cleared it as not spam.)
 - Earlier, the direct-issue era was verified the same way: issue #3 → `Issue triage` run `38110549687` → report `triage-reports/issue-3.md`; that path has since been removed.
 - Honeypot re-checked on the live endpoint: `200 {ok:true}` and no issue created.
 - Confirmed the endpoint ships no attestation/CAPTCHA integration: the Cloudflare account's challenge-widget list is empty and there is no such verification code or secret in this directory — a browser challenge was considered and deliberately rejected to keep the endpoint scriptable.

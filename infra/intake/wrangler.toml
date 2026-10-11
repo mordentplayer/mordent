@@ -2,13 +2,13 @@ name = "mordent-intake"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
-# Anonymous intake endpoint for sliced-paraiba/mordent.
+# Anonymous intake endpoint for mordentplayer/mordent.
 # See README.md for the one-time setup (KV namespace + GH_TOKEN secret).
 
 workers_dev = true
 
 [vars]
-GH_REPO = "sliced-paraiba/mordent"
+GH_REPO = "mordentplayer/mordent"
 # DRY_RUN=1 logs the would-be dispatch and returns ok without calling GitHub.
 # MUST be "0" (or removed) in production.
 DRY_RUN = "0"

@@ -251,12 +251,12 @@ operator's own login.
 # Never echo the value; pipe straight from the source.
 omp token opencode-go --raw > /tmp/opencode_cred      # or download from the dashboard
 chmod 600 /tmp/opencode_cred
-gh secret set OPENCODE_CRED --repo sliced-paraiba/mordent < /tmp/opencode_cred
+gh secret set OPENCODE_CRED --repo mordentplayer/mordent < /tmp/opencode_cred
 shred -u /tmp/opencode_cred
 
 # Safety switches:
-gh variable set TRIAGE_ALLOWLIST --repo sliced-paraiba/mordent --body "sliced-paraiba"
-gh variable set TRIAGE_DISABLED  --repo sliced-paraiba/mordent --body "true"   # until ready
+gh variable set TRIAGE_ALLOWLIST --repo mordentplayer/mordent --body "sliced-paraiba"
+gh variable set TRIAGE_DISABLED  --repo mordentplayer/mordent --body "true"   # until ready
 ```
 
 The secret is **set**: `OPENCODE_CRED` was first populated on 2026-10-10 and
@@ -449,14 +449,14 @@ gateway token files, and a filesystem-wide `grep -rEo 'oc_…' /`.
 Live-fire on the real repo, with `TRIAGE_ALLOWLIST=sliced-paraiba` and
 `TRIAGE_DISABLED=false`:
 
-* Run 1 — https://github.com/sliced-paraiba/mordent/actions/runs/38081570781 —
+* Run 1 — https://github.com/mordentplayer/mordent/actions/runs/38081570781 —
   job succeeded but produced **no report**: the gateway container died with
   `KeyError: 'GW_TOKEN'` because `GW_TOKEN` was a shell variable rather than an
   exported one, so `docker run -e GW_TOKEN` passed nothing; the health check
   only warned. Fixed in `f779cd9` (export the token, fail the step when the
   gateway does not come up, address the gateway by container IP instead of by
   name).
-* Run 2 — https://github.com/sliced-paraiba/mordent/actions/runs/38081740809 —
+* Run 2 — https://github.com/mordentplayer/mordent/actions/runs/38081740809 —
   **success**, all steps green including *Publish report to branch*:
   * no credential leak: `grep -c "$(omp token opencode-go --raw)"` over
     `gh run view --log` → **0**; `oc_…`-shaped strings in the logs → **0**; the
@@ -509,7 +509,7 @@ the `-free` id returns
 **(j) Live end-to-end on the hosted runner (2026-10-11, dedicated CI key).**
 
 *Web submission, real (`repository_dispatch`)* —
-[run 38111189516](https://github.com/sliced-paraiba/mordent/actions/runs/38111189516),
+[run 38111189516](https://github.com/mordentplayer/mordent/actions/runs/38111189516),
 all steps green. The spam pass returned `real`, the sandbox produced a
 medium-confidence analysis (`src/supervisor.rs:930,576-596,1008-1033`,
 `src/stream.rs:768-820`, `src/prefetch.rs`) explaining the ~1.5 s gapless gap,
@@ -521,7 +521,7 @@ the submission plus the `contact (unverified):` line. Report published as
 `triage-reports/issue-4.md`; artifact `triage-web-38111189516` (2229 B).
 
 *Web submission, spam* —
-[run 38111469184](https://github.com/sliced-paraiba/mordent/actions/runs/38111469184)
+[run 38111469184](https://github.com/mordentplayer/mordent/actions/runs/38111469184)
 after the fix below. `Classify spam` → `spam`; **no issue was created**, and
 `triage-reports/spam-20261011T042458Z.md` (263 B) was published containing only
 the verdict, the timestamp and the classifier's one-liner — *"Advertising for
@@ -531,7 +531,7 @@ PREVIOUS` → 0 hits, i.e. no verbatim content escaped. The submission carried a
 explicit "reply VERDICT: real" injection; it was ignored.
 
 *Failure found and fixed on the first spam run* —
-[run 38111278679](https://github.com/sliced-paraiba/mordent/actions/runs/38111278679)
+[run 38111278679](https://github.com/mordentplayer/mordent/actions/runs/38111278679)
 classified correctly and skipped issue creation, but the note step died with
 `FileNotFoundError: 'triage-reports/spam-…md'`: the web job's checkout has no
 `triage-reports/` directory (only the analysis path creates it, inside the
@@ -539,7 +539,7 @@ sandbox). Fixed in `7b8e2f5` by having `spam-note.py` create its own output
 directory.
 
 *Native issue path* —
-[run 38111301239](https://github.com/sliced-paraiba/mordent/actions/runs/38111301239)
+[run 38111301239](https://github.com/mordentplayer/mordent/actions/runs/38111301239)
 on test issue #5 posted the concise report as a comment by `github-actions[bot]`
 (trimmed before `## Evidence`, footer linking `triage-reports/issue-5.md`), with
 the full report on the branch and artifact `triage-issue-5` (1789 B).

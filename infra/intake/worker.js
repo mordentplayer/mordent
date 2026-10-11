@@ -340,7 +340,7 @@ const PAGE = `<!doctype html>
 <main>
   <h1>Report a bug or request a feature</h1>
   <p class="sub">No GitHub account needed — this files an issue on
-    <a href="https://github.com/sliced-paraiba/mordent" rel="noopener noreferrer">sliced-paraiba/mordent</a>
+    <a href="https://github.com/mordentplayer/mordent" rel="noopener noreferrer">mordentplayer/mordent</a>
     for you. Keep it short and concrete: what you did, what you expected, what happened.</p>
 
   <form id="intake" novalidate>
