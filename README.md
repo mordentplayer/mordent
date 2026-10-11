@@ -32,6 +32,64 @@ requires an active Apple Music subscription logged into the wrapper.
 
 *optional — personalized library/playlists features.
 
+## Install
+
+Graphical all the way: download, double-click, done. The first run opens a
+**guided setup wizard**, and every later run is the same windowed app — no
+terminal at any point. (The wizard is described under
+[First-run setup](#first-run-setup).)
+
+### Linux — AppImage (any distro)
+
+1. Download `mordent-<version>-x86_64.AppImage` from the
+   [latest release](https://github.com/sliced-paraiba/mordent/releases/latest).
+2. Once, in your file manager: **Properties → Permissions → “Allow executing
+   file as program”** (downloads are not marked executable).
+3. Double-click the file. The app starts.
+
+The AppImage installs nothing by itself — it runs from wherever you saved it,
+and deleting the file removes it. If you also want full-quality playback on
+this computer, pick *Install the helper on this computer* in the wizard: it
+installs the helper bundled inside the AppImage as a system service under
+`/opt/mordent-wrapper` (that is the one step that needs your password, asked
+for through a graphical `pkexec` dialog). The image carries a `.desktop` entry
+and a 256×256 icon, so desktop-integration tools (e.g. AppImageLauncher, or a
+file manager's “Integrate” action) can add Mordent to your applications menu.
+
+### macOS — Mordent.app
+
+1. Download `Mordent-<version>-macos-aarch64.zip` (Apple Silicon) or
+   `Mordent-<version>-macos-x86_64.zip` (Intel) and double-click it in Finder to
+   unzip.
+2. Drag **Mordent.app** into *Applications*.
+3. **First launch: right-click the app → Open → Open.** The build is not
+   code-signed or notarized, so Gatekeeper refuses a plain double-click the
+   first time; approving once is remembered. (Signing with an Apple Developer
+   ID and notarizing would remove this step — optional, not done yet.)
+
+The FairPlay helper is Linux-only, so there nothing is installed locally: the
+wizard's *Connect to a music helper* path points at a wrapper running
+elsewhere — in Docker on your Mac, or on an always-on Linux box. Step-by-step
+guide: [`docs/macos-container/README-friend.md`](docs/macos-container/README-friend.md).
+
+### Windows — zip
+
+1. Download `mordent-<version>-windows-x86_64.zip` and unzip it anywhere.
+2. Double-click `mordent.exe`. The first time, SmartScreen warns about an
+   unsigned app — click **More info → Run anyway** (one click, remembered
+   afterwards).
+
+The executable carries no icon resource (that would need a cross-compile
+resource step); the app window, tray and About box all use the Mordent icon.
+
+### Advanced — tarballs, scripts, source
+
+The release page also keeps the plain tarballs
+(`mordent-<version>-linux-x86_64.tar.gz` and `…-macos-<arch>.tar.gz`) for
+scripted or system-wide installs; the Linux tarball contains exactly the payload
+the AppImage is built from. To build from source see [Building](#building), and
+for a hand-rolled wrapper setup see [Setup](#setup).
+
 ## Building
 
 ```sh
