@@ -10,6 +10,7 @@ an injected payload cannot ride along into the published note.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import unicodedata
 
@@ -52,6 +53,9 @@ def main() -> None:
         "- **Content:** withheld — spam submissions are not mirrored verbatim.",
         "",
     ]
+    parent = os.path.dirname(args.out)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
 
