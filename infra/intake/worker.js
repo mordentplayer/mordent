@@ -4,6 +4,10 @@
  *   GET  /   → self-contained HTML form
  *   POST /   → validate a report and hand it to the triage workflow
  *
+ * Also served under the production route `mordent.app/feedback` (and
+ * `/feedback/`), see wrangler.toml. The HTML form posts back to whatever path
+ * it was served from, so both entry points work.
+ *
  * Delivery: `repository_dispatch` with event_type "web-submission" and
  * client_payload {type,title,body,contact}. The triage workflow
  * (.github/workflows/triage.yml) owns everything past that point: it runs the
@@ -33,10 +37,14 @@ const MAX_REQUEST_BYTES = 20000;
 const MIN_BODY_WORDS = 3;
 const TYPES = new Set(["bug", "feature"]);
 
+// Paths this Worker answers on. "/" is the workers.dev root (kept working);
+// the production entry point is the `mordent.app/feedback` route.
+const ROUTES = new Set(["", "/", "/feedback", "/feedback/"]);
+
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
-    if (pathname !== "/" && pathname !== "") {
+    if (!ROUTES.has(pathname)) {
       return json({ ok: false, error: "not found" }, 404);
     }
     if (request.method === "GET" || request.method === "HEAD") {
@@ -411,7 +419,11 @@ const PAGE = `<!doctype html>
       website: document.getElementById("website").value
     };
 
-    fetch("/", {
+    // Post back to this page's own path, so the form works both at the
+    // workers.dev root and under the mordent.app/feedback route.
+    var endpoint = location.pathname.replace(/\/+$/, "") + "/";
+
+    fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload)

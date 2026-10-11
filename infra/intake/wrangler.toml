@@ -7,6 +7,13 @@ compatibility_date = "2025-01-01"
 
 workers_dev = true
 
+# Production entry point: mordent.app/feedback (the apex itself is the `mordent`
+# static-assets Worker, which owns every other path). workers_dev stays true so
+# the mordent-intake.outline2319.workers.dev URL keeps working.
+routes = [
+  { pattern = "mordent.app/feedback*", zone_name = "mordent.app" },
+]
+
 [vars]
 GH_REPO = "mordentplayer/mordent"
 # DRY_RUN=1 logs the would-be dispatch and returns ok without calling GitHub.

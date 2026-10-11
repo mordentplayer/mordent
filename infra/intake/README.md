@@ -25,7 +25,8 @@ classification pass, which is the gate before anything becomes public.
 | Cloudflare account | a dedicated Cloudflare account (Workers + Workers KV) — account identifiers are intentionally not published here |
 | workers.dev subdomain | `outline2319` |
 | Worker name | `mordent-intake` |
-| **Public URL** | **https://mordent-intake.outline2319.workers.dev** |
+| **Public URL (canonical)** | **https://mordent.app/feedback** — a Worker route on the `mordent.app` zone (`pattern = "mordent.app/feedback*"`, see `wrangler.toml`); the apex root itself is the `mordent` static-assets Worker for `../../site/` |
+| Public URL (also live) | **https://mordent-intake.outline2319.workers.dev** — the workers.dev endpoint, kept working (`workers_dev = true`) |
 | KV namespace | `INTAKE_KV` → id `64e15885c1594c368e8367e67a9ae6a7` |
 | Secrets configured | `GH_TOKEN` — the org-scoped fine-grained PAT of the `mordent-bot` account (Issues: read and write + Contents: read and write), installed 2026-10-11; the value is never printed or committed and lives at `~/.config/intake-token` (mode 600) |
 | Delivery channel | `repository_dispatch`, event_type `web-submission`, `client_payload {type,title,body,contact}` — see [Delivery channel](#delivery-channel) |
@@ -41,21 +42,23 @@ current state.
 | File | Purpose |
 | --- | --- |
 | `worker.js` | The whole Worker: router, validation, spam/rate limits, dispatch client, and the inline HTML page. No npm dependencies. |
-| `wrangler.toml` | Worker name, `GH_REPO` / `DRY_RUN` vars, `INTAKE_KV` binding. |
+| `wrangler.toml` | Worker name, `GH_REPO` / `DRY_RUN` vars, `INTAKE_KV` binding, and the `mordent.app/feedback*` route. |
 | `.gitignore` | Keeps local `.wrangler/` state and `.dev.vars` out of git. |
 
 ---
 
 ## API
 
-### `GET /`
+### `GET /` (and `/feedback`, `/feedback/`)
 
 Returns a small self-contained dark-themed HTML page (no external assets, no
 tracking, `noindex`). Fields: report kind (`bug` / `feature`), title, description,
 an optional public contact line, and a visually hidden honeypot field. Vanilla JS
-`fetch` posts JSON and shows success / error inline.
+`fetch` posts JSON back to the path the page was served from, so the form works
+identically on the workers.dev root and on `mordent.app/feedback`. Any other path
+is a `404 {"ok":false,"error":"not found"}`.
 
-### `POST /`
+### `POST /` (and `/feedback`, `/feedback/`)
 
 Accepts `application/json` or `application/x-www-form-urlencoded`:
 
@@ -185,6 +188,26 @@ wrangler tail mordent-intake
 Local `wrangler dev` uses its own state directory (`.wrangler/state`, git-ignored)
 and never touches the production KV namespace.
 
+### The `mordent.app/feedback` route
+
+`mordent.app` (apex) is the `mordent` **static-assets Worker** (Cloudflare's
+Pages-in-Workers flow; config in `../../site/wrangler.jsonc`, attached as a
+`custom_domain` route). This Worker holds a single additional **zone route**:
+
+```toml
+routes = [
+  { pattern = "mordent.app/feedback*", zone_name = "mordent.app" },
+]
+```
+
+The zone route wins over the static-assets custom domain for the prefix it matches,
+so the two Workers coexist on one hostname: `/feedback*` → this form, everything
+else → the landing page. Verified live (see below). `workers_dev = true` keeps the
+workers.dev URL as a second entry point, and the form posts back to whatever path
+served it (`location.pathname`), so both entry points work unchanged. `wrangler
+deploy` creates the route; no separate step. Rate limits and the honeypot are
+unchanged (`CF-Connecting-IP` is the real visitor IP on both entry points).
+
 ### 3. The fine-grained PAT (`GH_TOKEN`) — now `mordent-bot`'s org token
 
 **Status: installed 2026-10-11** as the Worker secret `GH_TOKEN`. This is now the
@@ -254,8 +277,14 @@ Deleting/rotating: revoke the token in GitHub settings, then re-run
 
 ## Verification performed
 
-Local (`wrangler dev`, `DRY_RUN=1`, `--var DRY_RUN:0` for the 503 case) and live
-against the deployed Worker:
+### Move to `mordent.app/feedback` (2026-10-11)
+
+- `GET`/`HEAD https://mordent.app/feedback` → `200 text/html; charset=utf-8` with the self-contained form (`cache-control: no-store`); `GET /feedback/` → `200`; `POST /feedback` with a filled honeypot → `200 {"ok":true}` and nothing dispatched (no issue filed). `GET /feedback/xyz` → `404 {"ok":false,"error":"not found"}` (the Worker's own JSON 404).
+- The workers.dev entry point still works: `GET /` → `200` form, honeypot `POST /` → `200 {"ok":true}`.
+- Zone-route precedence over the `mordent` static-assets custom domain, verified on the apex: `https://mordent.app/` → `200` landing page (canonical `https://mordent.app/`, feedback links to `https://mordent.app/feedback`), `https://mordent.app/nonexistent` → `404` rendering `404.html`. Right after the deploy some edge locations still served the previous state (the assets Worker's 404) until route propagation settled; a re-check was consistently correct.
+- Pre-move verification of the routing logic stays valid: `wrangler dev` was not re-run for the prefix change — the live checks above cover the two accepted paths (`/`, `/feedback`) and the rejections.
+
+Live behaviour before the move:
 
 - `GET /` → `200`, self-contained HTML (~6.4 KiB, no external requests); `GET /health` → `404`; `PUT /` → `405`.
 - Valid JSON and form-encoded submissions → `200 {"ok":true}`; the DRY_RUN log shows the exact would-be event, e.g.
