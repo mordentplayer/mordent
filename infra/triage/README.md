@@ -200,7 +200,7 @@ output is published.
 | Skip bot-authored issues (`type == Bot` or login ending `[bot]`) | `issue` job `if` |
 | Skip issues authored by our own posting bot | `issue` job `if`: `github.event.issue.user.login != 'mordent-bot'` |
 | Kill switch | repo variable `TRIAGE_DISABLED=true` disables both jobs |
-| Optional author allowlist | repo variable `TRIAGE_ALLOWLIST` (comma-separated logins); empty = everyone |
+| Author allowlist — **currently disabled** | repo variable `TRIAGE_ALLOWLIST` (comma-separated logins). Unset/empty means *every* non-bot author is triaged. GitHub refuses an empty variable value (`422 Variable value cannot be empty`), so "widen" means **delete** the variable — which is the current state |
 | Hard wall clock | `timeout-minutes: 30` (issue) / `35` (web); `--max-time 1320` analyse, `300` spam pass |
 | Resource caps | `--memory=2g --cpus=2` (analysis), `1g/1cpu` (spam pass); `--memory=256m` (gateway) |
 | Submission size cap | `TRIAGE_MAX_ISSUE_CHARS` (default 20000) truncates the body |
@@ -210,13 +210,16 @@ output is published.
 **Flood / cost risk.** Every opened issue triggers a paid model run plus a
 docker build, and the web form is public. Mitigations actually implemented:
 `triage-web` serialises all web submissions globally (one at a time), the
-per-issue group prevents duplicate runs for the same issue, `TRIAGE_DISABLED`
-is the stop button, and `TRIAGE_ALLOWLIST` can restrict the native path to
-trusted authors. The per-issue group alone is *not* a global rate limit for
-`issues` events — many distinct issues can still run in parallel. A stronger
-global limit (e.g. an extra `triage-inflight` group, or an `author_association`
-check) is a worthwhile follow-up once the noise level is known. The timeouts
-and byte caps bound the per-run cost.
+per-issue group prevents duplicate runs for the same issue, and
+`TRIAGE_DISABLED` is the stop button.
+
+The author allowlist is **currently disabled on purpose**: `TRIAGE_ALLOWLIST`
+is unset, so the guard's `vars.TRIAGE_ALLOWLIST == ''` branch matches and
+*every* non-bot author gets triaged. That is the widest setting — worth
+remembering, because the per-issue group is *not* a global rate limit, so
+many distinct issues can still run in parallel. Re-arm it at any time with
+`gh variable set TRIAGE_ALLOWLIST --repo mordentplayer/mordent --body "user1,user2"`.
+The timeouts and byte caps bound the per-run cost.
 
 ## 4. Report format
 
