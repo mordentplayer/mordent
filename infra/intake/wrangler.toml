@@ -9,9 +9,7 @@ workers_dev = true
 
 [vars]
 GH_REPO = "sliced-paraiba/mordent"
-# Comma-separated labels applied to every created issue. Set to "" to disable.
-GH_LABELS = "from-web"
-# DRY_RUN=1 logs the would-be issue and returns ok without calling GitHub.
+# DRY_RUN=1 logs the would-be dispatch and returns ok without calling GitHub.
 # MUST be "0" (or removed) in production.
 DRY_RUN = "0"
 

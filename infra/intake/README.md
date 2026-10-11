@@ -1,9 +1,12 @@
 # Mordent intake endpoint (Cloudflare Worker)
 
 An **anonymous** bug-report / feature-request form for people without a GitHub
-account. A valid submission becomes a GitHub issue on
-[`sliced-paraiba/mordent`](https://github.com/sliced-paraiba/mordent), labelled
-`from-web`, where the issue-triage pipeline picks it up automatically.
+account. A valid submission is handed to the triage workflow
+(`.github/workflows/triage.yml`) via a `repository_dispatch` event; that workflow
+classifies it and files the public issue on
+[`sliced-paraiba/mordent`](https://github.com/sliced-paraiba/mordent) with the
+`from-web` label. The Worker itself never creates issues, so nothing reaches the
+repository without passing the classification step.
 
 Everything is one dependency-free Worker script plus the static page it serves.
 
@@ -24,8 +27,8 @@ classification pass, which is the gate before anything becomes public.
 | Worker name | `mordent-intake` |
 | **Public URL** | **https://mordent-intake.outline2319.workers.dev** |
 | KV namespace | `INTAKE_KV` → id `64e15885c1594c368e8367e67a9ae6a7` |
-| Secrets configured | `GH_TOKEN` — fine-grained PAT (Issues: read and write), installed 2026-10-11; the value is never printed or committed |
-| Delivery channel | direct GitHub issue creation (`POST /repos/{repo}/issues`), labelled `from-web` — see [Delivery channel](#delivery-channel) |
+| Secrets configured | `GH_TOKEN` — fine-grained PAT (Issues: read and write + Contents: read and write), installed 2026-10-11; the value is never printed or committed |
+| Delivery channel | `repository_dispatch`, event_type `web-submission`, `client_payload {type,title,body,contact}` — see [Delivery channel](#delivery-channel) |
 
 If the `GH_TOKEN` secret is ever removed (rotation window), `POST /` degrades to
 `503 {"ok":false,"error":"intake not configured yet"}` and `GET /` still serves the
@@ -37,8 +40,8 @@ current state.
 
 | File | Purpose |
 | --- | --- |
-| `worker.js` | The whole Worker: router, validation, spam/rate limits, GitHub client, and the inline HTML page. No npm dependencies. |
-| `wrangler.toml` | Worker name, `GH_REPO` / `GH_LABELS` / `DRY_RUN` vars, `INTAKE_KV` binding. |
+| `worker.js` | The whole Worker: router, validation, spam/rate limits, dispatch client, and the inline HTML page. No npm dependencies. |
+| `wrangler.toml` | Worker name, `GH_REPO` / `DRY_RUN` vars, `INTAKE_KV` binding. |
 | `.gitignore` | Keeps local `.wrangler/` state and `.dev.vars` out of git. |
 
 ---
@@ -61,14 +64,17 @@ Accepts `application/json` or `application/x-www-form-urlencoded`:
 | `type` | required, `"bug"` or `"feature"` |
 | `title` | required, 4–120 chars (control chars stripped, single line) |
 | `body` | required, 20–8000 chars, at least 3 words, not mostly links |
-| `contact` | optional, ≤ 200 chars; appended to the issue body as `contact (unverified): …` |
-| `website` | honeypot — MUST be empty. When filled the request is **silently accepted** (`200 {ok:true}`) and nothing is created. |
+| `contact` | optional, ≤ 200 chars; passed through to the workflow, which appends it to the issue as `contact (unverified): …` |
+| `website` | honeypot — MUST be empty. When filled the request is **silently accepted** (`200 {ok:true}`) and nothing is dispatched. |
 
-Success → `200 {"ok":true}`. The created issue has
+Success → `200 {"ok":true}` once the dispatch event has been queued. The issue is
+then filed by the workflow, so its final shape is:
 
-- title `[bug] <title>` or `[feature] <title>`,
-- body = your text + `\n\n---\nsubmitted anonymously via the web form` (+ the optional contact line),
-- labels `["from-web"]`.
+- title = the submitted title, prefixed with `[bug] ` / `[feature] ` by the
+  workflow unless the title already starts with a `[` marker,
+- body = the model's classification and analysis, with the original report in a
+  collapsed `Original report (verbatim)` block plus the optional contact line,
+- label `from-web`.
 
 Errors (JSON, always shaped `{"ok":false,"error":"…"}`):
 
@@ -78,7 +84,7 @@ Errors (JSON, always shaped `{"ok":false,"error":"…"}`):
 | `405` | method other than GET/POST |
 | `404` | any path other than `/` |
 | `429` | rate limit hit (`Retry-After` header set) |
-| `502` | GitHub rejected the issue request |
+| `502` | GitHub rejected the dispatch request (nothing was queued; the submission is *not* silently lost) |
 | `503` | `DRY_RUN` off and no `GH_TOKEN` secret |
 
 ---
@@ -114,50 +120,47 @@ the final gate that decides what becomes a public issue — spam never surfaces.
 
 | Var | Meaning |
 | --- | --- |
-| `GH_REPO` | `sliced-paraiba/mordent` — repository that receives the issues. |
-| `GH_LABELS` | Comma-separated labels to apply (default `from-web`); set to `""` to disable labels entirely. |
-| `DRY_RUN` | `1` = log the would-be issue and return `200 {ok:true}` **without** calling GitHub. Must be `0` in production. |
+| `GH_REPO` | `sliced-paraiba/mordent` — repository the dispatch is sent to. |
+| `DRY_RUN` | `1` = log the would-be dispatch and return `200 {ok:true}` **without** calling GitHub. Must be `0` in production. |
 
 Secret:
 
 | Secret | Meaning |
 | --- | --- |
-| `GH_TOKEN` | Fine-grained PAT with **Issues: read and write** on `sliced-paraiba/mordent`. `Contents: read and write` is additionally required *only* if the delivery channel is ever switched to `repository_dispatch` (see below) — it is not needed for the current channel. |
+| `GH_TOKEN` | Fine-grained PAT for `sliced-paraiba/mordent` with **Issues: read and write** *and* **Contents: read and write**. Issues write is no longer used by the Worker itself (the workflow files the issue with its own `GITHUB_TOKEN`); Contents write is what authorises `repository_dispatch` — GitHub requires it and answers `403 ... x-accepted-github-permissions: contents=write` without it. |
 
 ### Delivery channel
 
-Currently the Worker calls the GitHub REST API directly and creates the issue
-itself (`POST /repos/{repo}/issues`), with the `from-web` label, and the
-`issues: opened` trigger of `.github/workflows/triage.yml` then picks it up.
+The Worker validates, rate-limits and then fires one `repository_dispatch`:
 
-The planned replacement is a `repository_dispatch` event
-(`event_type: web-submission`, `client_payload: {type, title, body, contact}`), so
-the triage workflow owns issue creation and can classify a submission before
-anything public exists. That switch is **not enabled** because two prerequisites
-are missing:
+```json
+POST https://api.github.com/repos/sliced-paraiba/mordent/dispatches
+{ "event_type": "web-submission",
+  "client_payload": { "type": "bug", "title": "…", "body": "…", "contact": "…" } }
+```
 
-1. the PAT must also carry `Contents: read and write` — the dispatch endpoint
-   requires it (`x-accepted-github-permissions: contents=write`); the current
-   token's dispatch attempt returns `403 Resource not accessible by personal access token`;
-2. the workflow needs a matching `repository_dispatch` trigger — until then a
-   dispatch would be accepted and silently dropped, losing the report.
+The title is sent **raw** — the workflow adds the `[bug] ` / `[feature] ` marker
+(see the POST contract above). `.github/workflows/triage.yml` picks up the
+`web-submission` action in its `web` job, runs a cheap spam classification first
+(spam is dropped with a redacted note on the `triage-reports` branch and *no* issue
+is created) and only then investigates and files the issue with
+`GITHUB_TOKEN`. The Worker therefore never creates public content, and the
+repository's `issues: opened` triage job does not re-run on these issues (bot
+author guard).
 
-Both must land together before the channel is switched.
+Trade-off, deliberately accepted: a dispatch is fire-and-forget — GitHub answers
+`204` as soon as the event is queued, so the Worker reports `{ok:true}` before the
+workflow has run, and a *later* workflow failure is invisible to the submitter
+(it shows up in the Actions run). In exchange, nothing unclassified can ever
+become public. A non-`204` dispatch response is reported honestly as `502` rather
+than falling back to creating an unclassified public issue.
 
 ### Label handling
 
-`from-web` is created lazily: if GitHub rejects the issue because the label does
-not exist (`422`), the Worker creates the label once
-(`POST /repos/{repo}/labels`, colour `1d76db`, description "submitted anonymously
-via the web form") and retries; if that still fails it retries the issue
-**without labels**, so a missing-label problem can never lose a report. Failures
-are logged. (Equivalent manual step:
-`gh label create from-web --color 1d76db --description "Submitted via the anonymous web form"`.)
-
-The repository already carries a `from-web` label (colour `ededed`, no
-description), so the lazy-create branch has not needed to run in production so
-far; aligning that label with the colour/description above is cosmetic and has
-not been done automatically.
+The Worker no longer touches labels. The workflow creates `from-web` only if it is
+missing (`gh label create … || true`, colour `ededed`, description "Submitted via
+the anonymous web form") and never overwrites an existing label's colour or
+description, then files the issue with `--label from-web`.
 
 ---
 
@@ -186,10 +189,13 @@ and never touches the production KV namespace.
 
 **Status: installed 2026-10-11** as the Worker secret `GH_TOKEN`, named
 `mordent-intake-worker`, scoped to the single repository `sliced-paraiba/mordent`
-with **Issues: read and write**. Verified: `GET /user` → `sliced-paraiba`,
-`GET /repos/sliced-paraiba/mordent` → `200`, and a deliberately invalid issue
-creation returning `422 Validation Failed` (not `403`), which proves Issues write
-without creating anything. The steps below are the record for rotation.
+with **Issues: read and write** and, since the channel switched to
+`repository_dispatch`, also **Contents: read and write**. Verified:
+`GET /user` → `sliced-paraiba`, `GET /repos/sliced-paraiba/mordent` → `200`, a
+deliberately invalid issue creation returning `422 Validation Failed` (not `403`,
+proving Issues write without creating anything), and the dispatch endpoint
+returning `204` (`403 … contents=write` before the Contents permission was
+granted). The steps below are the record for rotation.
 
 > **Do not reuse the `gh` CLI OAuth token** (`gho_…`) as the long-lived secret.
 > It is an OAuth-app token with broad `repo` scope, belongs to the whole CLI
@@ -200,8 +206,9 @@ without creating anything. The steps below are the record for rotation.
 2. **Token name**: `mordent-intake-worker`.
 3. **Resource owner**: `sliced-paraiba`.
 4. **Repository access**: *Only select repositories* → `mordent`.
-5. **Permissions** → *Repository permissions* → **Issues: Read and write**
-   (`Metadata: Read-only` is added automatically; nothing else is needed).
+5. **Permissions** → *Repository permissions* → **Issues: Read and write** and
+   **Contents: Read and write** (`Metadata: Read-only` is added automatically;
+   nothing else is needed).
 6. **Expiration**: pick a sensible window (e.g. 90 days) and put a reminder in your
    calendar to rotate the secret.
 7. **Generate token** and copy the `github_pat_…` value.
@@ -213,13 +220,15 @@ without creating anything. The steps below are the record for rotation.
    ```
 
    Secrets are encrypted at rest and not readable again; only Workers can use them.
-9. Verify:
+9. Verify the dispatch capability (a `204` means the workflow will receive the
+   event; the probe event type matches no trigger, so nothing runs):
 
    ```sh
-   curl -s -H 'content-type: application/json' \
-     -d '{"type":"bug","title":"Intake smoke test","body":"filed from the intake smoke test to confirm the token works."}' \
-     https://mordent-intake.outline2319.workers.dev/
-   # → {"ok":true}   and a new [bug] issue appears on the repo
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+     -H "Authorization: Bearer $GH_TOKEN" \
+     -d '{"event_type":"intake-capability-probe"}' \
+     https://api.github.com/repos/sliced-paraiba/mordent/dispatches
+   # → 204
    ```
 
 Deleting/rotating: revoke the token in GitHub settings, then re-run
@@ -234,25 +243,23 @@ Local (`wrangler dev`, `DRY_RUN=1`, `--var DRY_RUN:0` for the 503 case) and live
 against the deployed Worker:
 
 - `GET /` → `200`, self-contained HTML (~6.4 KiB, no external requests); `GET /health` → `404`; `PUT /` → `405`.
-- Valid JSON and form-encoded submissions → `200 {"ok":true}`; DRY_RUN log shows the exact would-be issue, e.g.
-  `{"title":"[bug] Playback stops after the first track","body":"…\n\n---\nsubmitted anonymously via the web form\ncontact (unverified): tester@example.com","labels":["from-web"]}`.
+- Valid JSON and form-encoded submissions → `200 {"ok":true}`; the DRY_RUN log shows the exact would-be event, e.g.
+  `{"event_type":"web-submission","client_payload":{"type":"bug","title":"Queue pane stays empty after restart","body":"…","contact":"tester@example.com"}}` (title raw, `contact` `""` when the field is omitted).
 - Invalid type / short title / >8000-char body / mostly-links body / bad JSON → `400`; unsupported content-type → `415`; oversized request → `400`.
-- Honeypot filled → `200 {ok:true}` with log `intake: honeypot triggered, dropping submission` and no KV quota or create.
+- Honeypot filled → `200 {ok:true}` with log `intake: honeypot triggered, dropping submission` and no KV quota or dispatch.
 - 4th valid submission in the hour → `429` with `Retry-After: 3600`; global counter seeded at the 20/day cap → `429` "daily submission limit reached".
-- Control characters (`\u0007`, `\u0001`, `\u001b`) stripped from title/body before the issue payload is built.
+- Control characters (`\u0007`, `\u0001`, `\u001b`) stripped from title/body before the dispatch payload is built.
 - Two different source IPs received independent per-IP budgets (same-IP keying confirmed).
-- `DRY_RUN=0` with no `GH_TOKEN` → `503 {"ok":false,"error":"intake not configured yet"}`; validation still runs first (`400` for bad input).
-- Live deploy: page `200`, valid POST `503` (unconfigured), bad type `400`, and a temporary `DRY_RUN=1` deploy proved the **remote** KV binding writes `rl:*` keys (test counters deleted afterwards).
+- `DRY_RUN=0` with no `GH_TOKEN` → `503 {"ok":false,"error":"intake not configured yet"}`; validation still runs first (`400` for bad input). With a deliberately invalid token the dispatch call fails and the endpoint answers `502` and logs the upstream status — i.e. a rejected dispatch is never reported as success.
+- Live deploy: page `200`, bad type `400`, and a temporary `DRY_RUN=1` deploy proved the **remote** KV binding writes `rl:*` keys (test counters deleted afterwards).
 
-With the PAT installed, end to end against the live Worker and the public repo:
+End to end against the live Worker and the public repo:
 
-- `GET /user`/`GET /repos/sliced-paraiba/mordent` with the PAT → `200`; invalid issue creation → `422` (Issues write confirmed without side effects).
-- A synthetic JSON `curl` submission → `200 {"ok":true}` and issue [#3](https://github.com/sliced-paraiba/mordent/issues/3) created with title `[bug] [test] intake smoke: queue pane stays empty`, the exact body (`…` + `---` + intake line + `contact (unverified): …`) and the `from-web` label.
-- `.github/workflows/triage.yml` fired on that issue and **succeeded** (`Issue triage`, run `38110549687`), producing `triage-reports/issue-3.md` on the `triage-reports` branch — the pipeline classifies the report (class/confidence/labels/priority + code-level analysis) and treats the body strictly as data. The test issue was then closed.
-- Honeypot re-checked on the armed endpoint: `200 {ok:true}` and no issue created.
-- `POST /repos/sliced-paraiba/mordent/dispatches` → `403 Resource not accessible by personal access token` (`x-accepted-github-permissions: contents=write`) — the dispatch channel is therefore not enabled (see [Delivery channel](#delivery-channel)).
+- PAT checks: `GET /user`/`GET /repos/sliced-paraiba/mordent` → `200`; invalid issue creation → `422`; `POST /dispatches` → `403` before the Contents permission and `204` after it.
+- Dispatch smoke: a synthetic JSON `curl` submission → `200 {"ok":true}`; the Worker created **no** issue itself, the `repository_dispatch` run [38111262415](https://github.com/sliced-paraiba/mordent/actions/runs/38111262415) ran the `web` job to success, and issue [#6](https://github.com/sliced-paraiba/mordent/issues/6) was filed by `github-actions[bot]` with the `from-web` label, the classification/analysis body and the original report in a collapsed `Original report (verbatim)` block plus the `contact (unverified):` line. The test issue was then closed. (The spam pass ran as part of that job and cleared it as not spam.)
+- Earlier, the direct-issue era was verified the same way: issue #3 → `Issue triage` run `38110549687` → report `triage-reports/issue-3.md`; that path has since been removed.
+- Honeypot re-checked on the live endpoint: `200 {ok:true}` and no issue created.
 - Confirmed the endpoint ships no attestation/CAPTCHA integration: the Cloudflare account's challenge-widget list is empty and there is no such verification code or secret in this directory — a browser challenge was considered and deliberately rejected to keep the endpoint scriptable.
 
-Still not exercised: the label-create fallback branch (the repository already has a
-`from-web` label) and the `repository_dispatch` channel (blocked on the two
-prerequisites above).
+Not exercised: a spam-verdict dispatch (the `web` job's spam branch) — it is the
+workflow's own path, and deliberately producing spam submissions was left alone.

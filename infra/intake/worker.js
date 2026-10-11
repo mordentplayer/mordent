@@ -2,17 +2,24 @@
  * Mordent anonymous intake endpoint — a single dependency-free Cloudflare Worker.
  *
  *   GET  /   → self-contained HTML form
- *   POST /   → validate a report and open a GitHub issue on GH_REPO
+ *   POST /   → validate a report and hand it to the triage workflow
+ *
+ * Delivery: `repository_dispatch` with event_type "web-submission" and
+ * client_payload {type,title,body,contact}. The triage workflow
+ * (.github/workflows/triage.yml) owns everything past that point: it runs the
+ * spam pass and files the public issue itself, so nothing unvalidated by the
+ * model ever becomes public. The title is sent raw (no "[bug] " prefix) — the
+ * workflow adds the marker.
  *
  * Contract (POST): JSON or form-encoded { type, title, body, contact?, website? }
  *   - type    : "bug" | "feature"
  *   - title   : 4..120 chars
  *   - body    : 20..8000 chars, not mostly links
- *   - contact : optional, <= 200 chars (appended to the issue body as unverified)
+ *   - contact : optional, <= 200 chars (passed through for the workflow to append)
  *   - website : honeypot; if non-empty the submission is silently accepted and dropped
  *
  * Success → { ok: true }.
- * Config: GH_REPO + GH_LABELS (vars), GH_TOKEN (secret), DRY_RUN (var).
+ * Config: GH_REPO (var), GH_TOKEN (secret), DRY_RUN (var).
  * Rate limiting state lives in the INTAKE_KV namespace (see README.md).
  */
 
@@ -25,8 +32,6 @@ const MAX_CONTACT = 200;
 const MAX_REQUEST_BYTES = 20000;
 const MIN_BODY_WORDS = 3;
 const TYPES = new Set(["bug", "feature"]);
-
-const DEDUPE_NOTE = "submitted anonymously via the web form";
 
 export default {
   async fetch(request, env) {
@@ -119,27 +124,20 @@ async function handleSubmit(request, env) {
   const limited = await checkRateLimits(env, ip);
   if (limited) return limited;
 
-  const labels = (env.GH_LABELS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const issue = {
-    title: `[${type}] ${title}`,
-    body: buildIssueBody(body, contact),
-    labels,
-  };
+  const payload = { type, title, body, contact };
+  const dispatch = { event_type: "web-submission", client_payload: payload };
 
   if (dryRun) {
-    console.log(`intake: DRY_RUN, would create issue on ${repo || "(unset)"}: ${JSON.stringify(issue)}`);
+    console.log(`intake: DRY_RUN, would dispatch to ${repo || "(unset)"}: ${JSON.stringify(dispatch)}`);
     return json({ ok: true });
   }
 
   try {
-    const result = await createIssue(env.GH_TOKEN, repo, issue, labels);
-    console.log(`intake: created issue ${result.html_url}`);
+    await dispatchSubmission(env.GH_TOKEN, repo, payload);
+    console.log(`intake: dispatched web-submission (${type}, ${title.length}-char title)`);
     return json({ ok: true });
   } catch (err) {
-    console.error("intake: GitHub issue creation failed:", err && err.message ? err.message : err);
+    console.error("intake: GitHub dispatch failed:", err && err.message ? err.message : err);
     return json({ ok: false, error: "could not file the report right now; please try again later" }, 502);
   }
 }
@@ -202,51 +200,14 @@ async function checkRateLimits(env, ip) {
 /* --------------------------------------------------------------- github */
 
 /**
- * Create the issue. If the label set is rejected (e.g. the label does not
- * exist yet on the repo), create the label once and retry, then finally retry
- * without labels. See README.md ("Label handling").
+ * Hand the submission to the triage workflow via `repository_dispatch`
+ * (event_type `web-submission`). The workflow owns everything after this
+ * point: it runs the spam pass and files the public issue, so an unclassified
+ * report never becomes public. A non-204 response means the submission was
+ * *not* queued — the caller must say so instead of claiming success.
  */
-async function createIssue(token, repo, issue, labels) {
-  const url = `https://api.github.com/repos/${repo}/issues`;
-  let res = await gh(token, url, { title: issue.title, body: issue.body, labels });
-
-  if (!res.ok && labels.length > 0) {
-    const detail = await readError(res);
-    console.warn(`intake: issue create rejected (${res.status}): ${detail}`);
-
-    const labelOk = await ensureLabels(token, repo, labels);
-    if (labelOk) {
-      res = await gh(token, url, { title: issue.title, body: issue.body, labels });
-    }
-    if (!res.ok) {
-      const retryDetail = await readError(res);
-      console.warn(`intake: retrying without labels (${res.status}): ${retryDetail}`);
-      res = await gh(token, url, { title: issue.title, body: issue.body });
-    }
-  }
-
-  if (!res.ok) {
-    throw new Error(`GitHub API responded ${res.status}: ${await readError(res)}`);
-  }
-  return res.json();
-}
-
-async function ensureLabels(token, repo, labels) {
-  const colors = { "from-web": "1d76db" };
-  const results = await Promise.all(
-    labels.map((name) =>
-      gh(token, `https://api.github.com/repos/${repo}/labels`, {
-        name,
-        color: colors[name] || "ededed",
-        description: DEDUPE_NOTE,
-      })
-    )
-  );
-  return results.every((r) => r.ok || r.status === 422);
-}
-
-function gh(token, url, payload) {
-  return fetch(url, {
+async function dispatchSubmission(token, repo, payload) {
+  const res = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`,
@@ -255,11 +216,14 @@ function gh(token, url, payload) {
       "content-type": "application/json",
       "user-agent": "mordent-intake-worker",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ event_type: "web-submission", client_payload: payload }),
   });
+  if (res.status !== 204) {
+    throw new Error(`GitHub dispatch responded ${res.status}: ${await readText(res)}`);
+  }
 }
 
-async function readError(res) {
+async function readText(res) {
   try {
     const text = await res.text();
     return text.slice(0, 300);
@@ -269,12 +233,6 @@ async function readError(res) {
 }
 
 /* ----------------------------------------------------------------- utils */
-
-function buildIssueBody(body, contact) {
-  let out = `${body}\n\n---\n${DEDUPE_NOTE}`;
-  if (contact) out += `\ncontact (unverified): ${contact}`;
-  return out;
-}
 
 /** Strip control characters; optionally flatten all whitespace. */
 function cleanText(value, { keepNewlines }) {
