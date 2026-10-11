@@ -3,8 +3,7 @@
 [![CI](https://github.com/sliced-paraiba/mordent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sliced-paraiba/mordent/actions/workflows/ci.yml)
 
 A lightweight native Apple Music client for Linux (Rust + egui). Goals:
-instant startup, minimal resource use, and the shortest possible path from
-"I want to hear music" to hearing it — mirroring [spotifast]'s philosophy.
+instant startup, minimal resource use, and going from wanting to listen to music -> song playing as fast as possible.
 
 Full-quality playback (ALAC up to 24-bit / hi-res, word-synced lyrics) is
 powered by [wrapper-lite], the FairPlay SAMPLE-AES decryption backend.
@@ -84,6 +83,40 @@ resource step, which is out of scope for now. The repository ships
 [`assets/icon/mordent.ico`](assets/icon/mordent.ico) if you want the icon on a
 desktop shortcut.
 
+### Linux — one-line install (user directory, no root)
+
+Installs under `~/.local` and adds a `Mordent` entry to your application menu —
+no package manager, no `sudo`:
+
+```sh
+curl -fsSL https://github.com/sliced-paraiba/mordent/releases/latest/download/install.sh | bash
+```
+
+Prefer to read it before you run it? (Recommended for any `curl | bash`.)
+
+```sh
+curl -fsSLO https://github.com/sliced-paraiba/mordent/releases/latest/download/install.sh
+less install.sh
+bash install.sh
+```
+
+Options — the piped form takes them after `bash -s --`, e.g.
+`… | bash -s -- --prefix /opt/mordent`:
+
+| Flag | Meaning |
+|---|---|
+| `--prefix <dir>` | install prefix (default `$HOME/.local`; env `MORDENT_PREFIX`) |
+| `--tag <tag>` | install a specific release (default: the latest; env `MORDENT_TAG`) |
+| `--uninstall` | remove the install — keeps `~/.config/mordent` |
+| `--yes` | non-interactive (implied when stdin is not a TTY) |
+
+It lays out `share/mordent/` (`mordent`, `wrapper-lite`, `rootfs/`, `scripts/`,
+`licenses/`, `README.md`) plus the `bin/mordent` symlink, a `.desktop` entry and
+icons; verifies the download against the release's `SHA256SUMS` when the release
+ships one (otherwise it prints the computed hash and a warning), and never calls
+`sudo`. Upgrading is just re-running it. `--uninstall` removes the files but
+leaves your settings and login in `~/.config/mordent`.
+
 ### Advanced — tarballs, scripts, source
 
 The release page also keeps the plain tarballs
@@ -120,6 +153,7 @@ cargo build --release
    media_user_token = ""                  # optional: library features
    report_plays = true                    # report plays to Apple (Recently Played)
    cache_size_gb = 10                     # audio-cache budget; 0 disables
+   check_updates = true                   # daily GitHub release check (see Updates)
    ```
 
 ### Running the wrapper on macOS (or a home server)
@@ -468,6 +502,64 @@ disables prefetch along with the cache.
 | full ALAC stream: first second of audio | 6.9 s |
 | decode throughput (debug build) | 12.4× realtime |
 | full track streamed + decrypted + decoded | 369 s of ALAC, 0 errors |
+
+## Updates
+
+Mordent checks for a newer release at most **once a day** and can install one
+for you. Nothing is ever downloaded without you pressing a button, nothing
+installs while music is playing, and every download is checksum-verified.
+
+**Privacy.** The check is a single unauthenticated HTTPS request to
+`api.github.com` (no account, no token, no telemetry, and nothing about you or
+your library is sent). It is skipped when you are offline, when GitHub rate
+limits the request, and when the release tag does not parse as a version — a
+failed check is silent. Set `check_updates = false` in
+`~/.config/mordent/config.toml` (or untick *check for new Mordent versions* in
+the wizard's Preferences step) to switch it off entirely; *Check now* still
+works.
+
+**Where it shows up.** Press `?` in the player: the **updates** panel shows the
+version you are running, the newest release, when the last check was, a *Check
+now* button, and — when one exists — a *Download & install* button. A newer
+release also adds one small `↓ <version>` hint to the player bar; open the panel
+to act on it or press *Hide the update hint* to dismiss it for that release. No
+modal, no nagging.
+
+**How an update is verified.** The release page publishes a `SHA256SUMS` file
+listing the SHA-256 of every asset. Mordent downloads your platform's asset,
+hashes it and refuses anything that does not match, then unpacks it with `tar`.
+That is **integrity, not authenticity**: the checksums are served over the same
+TLS connection as the artifact and the releases are **not signed**, so this
+protects against a truncated or corrupted download, not against someone who can
+publish a release on this repository's behalf.
+
+**What each install gets** (the panel says which one you have):
+
+| How you installed | Check | Verified download | Installs itself |
+|---|---|---|---|
+| Linux tarball, or `scripts/install.sh` (`mordent` + `scripts/` + payload in one directory) | yes | yes | **yes** — staged, then every file is swapped in at the *next start*; replaced files are kept in `~/.cache/mordent/update/backup-<version>/`. The helper's login state (`rootfs/data`) is never touched. |
+| Linux **AppImage** (`$APPIMAGE`) | yes | yes | **yes** — staged, then the `.AppImage` file itself is replaced at the next start (the previous image is kept as `<name>.AppImage.bak`) |
+| macOS **`Mordent.app`** | yes | yes | **yes** — staged, then the bundle is swapped at the next start (previous bundle kept as `Mordent.app.bak-<version>`). Implemented and build-checked; not exercised on macOS hardware by the author — delete the bundle to fall back to a manual download if anything looks wrong. |
+| macOS tarball (plain `mordent` binary + README) | yes | yes | **no** — the tarball carries no payload or scripts to swap, so Mordent unpacks the verified update into `~/.cache/mordent/update/` and opens the folder for you |
+| Windows zip | yes | yes | **no** — Windows cannot replace a running `mordent.exe`, so Mordent unpacks the verified update and opens the folder; close Mordent, then copy the files over your install folder |
+
+The tarball/AppImage paths also install the *update itself* the same way the
+wizard installs a first copy: a running Linux binary keeps its own inode, and
+the swap happens before the window opens.
+
+**The helper has versions too.** A wrapper-lite payload changes when the bundled
+upstream project changes, and wrapper-lite reports no version of its own
+(`/status` carries only `regions`), so Mordent compares a **SHA-256 of the
+payload manifest** (`wrapper-lite` + `rootfs/system/**`) that
+`scripts/install-wrapper.sh` records as `/opt/mordent-wrapper/payload-version`.
+When the installed payload differs from the one bundled with the running app,
+the updates panel shows **Helper update available** with an *Update helper…*
+button that re-runs the same installer through `pkexec` (the same graphical
+password prompt as setup). The installer is idempotent: it stops the service,
+replaces the payload, restarts it and waits for `/status`; your Apple login
+state under `/opt/mordent-wrapper/rootfs/data` is preserved. If `wrapper_url`
+points at another machine, the panel instead says so — **update the helper
+there**; Mordent cannot reach into a remote helper and will not pretend to.
 
 ## Status
 

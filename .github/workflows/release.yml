@@ -19,6 +19,11 @@ env:
   # Release/asset version. Tag runs use the tag (CalVer); manual runs have no
   # tag, so every name that would carry it falls back to "test".
   VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'test' }}
+  # Exact CalVer tag compiled into the binary (src/update.rs reads it with
+  # option_env! so the app can compare itself against the newest release and
+  # show the precise version). A manual run sets "test", which is not a version
+  # and is ignored — the app then falls back to the Cargo version.
+  MORDENT_BUILD_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'test' }}
   WRAPPER_REPO: https://github.com/WorldObservationLog/wrapper
   # Canonical NDK r23b URL: dl.google.com is blocked on some networks, the
   # gvt1 mirror is the documented alternative.
@@ -442,6 +447,31 @@ jobs:
           path: ${{ env.APPIMAGE }}
           if-no-files-found: error
 
+      # Checksums for every published asset, in one file, with the exact asset
+      # names: the in-app updater (src/update.rs) downloads an asset only when
+      # it finds its SHA-256 here. Integrity, not authenticity — the artifacts
+      # are not signed, which the README states.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp "${PKG}.tar.gz" "${APPIMAGE}" release-assets/
+          cp in/container/wrapper-lite-amd64.tar.gz release-assets/
+          cp docs/macos-container/compose.yaml release-assets/
+          cp in/release/*.tar.gz in/release/*.zip release-assets/
+          # The curl | bash installer is a release asset too (so
+          # .../releases/latest/download/install.sh resolves for every tag).
+          cp scripts/install.sh release-assets/
+          # Bare file names (exactly the published asset names), no "./" prefix.
+          ( cd release-assets && sha256sum * >../SHA256SUMS )
+          # Every asset must appear exactly once (a renamed/duplicated asset
+          # would silently drop out of the updater's lookup).
+          for f in release-assets/*; do
+            grep -q "  ${f#release-assets/}$" SHA256SUMS ||
+              { echo "::error::SHA256SUMS is missing ${f#release-assets/}"; exit 1; }
+          done
+          cat SHA256SUMS
+
       # Tag runs only: a manual (workflow_dispatch) run builds artifacts for
       # testing and stops here — no release is created, no assets are published.
       - name: Create GitHub Release
@@ -451,6 +481,8 @@ jobs:
           files: |
             ${{ env.PKG }}.tar.gz
             ${{ env.APPIMAGE }}
+            SHA256SUMS
+            release-assets/install.sh
             in/container/wrapper-lite-amd64.tar.gz
             docs/macos-container/compose.yaml
             in/release/*.tar.gz
