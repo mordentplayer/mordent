@@ -261,11 +261,60 @@ gh variable set TRIAGE_DISABLED  --repo mordentplayer/mordent --body "true"   # 
 ```
 
 The secret is **set**: `OPENCODE_CRED` was first populated on 2026-10-10 and
-replaced on 2026-10-11 with a **dedicated CI key** (a separate, revocable
-credential rather than the operator's own login). Both variables exist;
-`TRIAGE_ALLOWLIST=sliced-paraiba`, `TRIAGE_DISABLED=false`. The repo's
-`default_workflow_permissions` was raised from `read` to `write` so the
-`triage-reports` push (and the release job) work.
+replaced on 2026-10-11 with a **dedicated, budget-limited key** (separate and
+revocable rather than the operator's own login) — see *OpenCode key &
+rotation* below. Both variables exist; `TRIAGE_ALLOWLIST=sliced-paraiba`,
+`TRIAGE_DISABLED=false`.
+
+The `mordentplayer` org **disables write-by-default workflow permissions**, so
+the repository default is `read` and cannot be raised (the API answers
+`409 Write permissions for workflows are disabled by the organization`). That
+only affects the *default*: the workflow's own `permissions:` block still
+grants write, which is how the pre-switch run pushed to `triage-reports` with
+`GITHUB_TOKEN`. A workflow that relies on the default instead of declaring
+`permissions:` will be read-only in this org.
+
+### OpenCode key & rotation
+
+The model credential is the repository secret **`OPENCODE_CRED`**. It is a
+dedicated key for this pipeline — separate from the operator's own login,
+budget-limited on the OpenCode side, and inference-only.
+
+**What it may do.** Inside this repo the key is used for exactly one thing: as
+`Authorization: Bearer …` by `bin/gateway.py`, which proxies nothing but
+`/v1/*` to `https://opencode.ai/zen/go` (the OpenCode inference endpoint) and
+overwrites whatever the client sent. So from the pipeline's side it can only
+ever make inference calls. It is never handed to the model sandbox (the sandbox
+gets only the ephemeral `GW_TOKEN`) and it is never baked into an image:
+`Dockerfile.sandbox` declares no `ARG`/`ENV` for it, and it enters the gateway
+container at run time via `docker run -e OPENCODE_CRED`, copied out of the
+step's environment. Five steps mention it — the two `Start credential gateway`
+steps (as the credential) and the three scrub steps (`--redact-env
+OPENCODE_CRED`, as a redaction literal only).
+
+**Where the budget lives.** Not in this repository. Nothing here sets a budget,
+quota or spend cap (the only "budget" in the tree is the prompt's *time*
+budget). The cap belongs to the account that owns the key, on the OpenCode
+side.
+
+**Rotation.** Create the replacement, update the secret, revoke the old key —
+nothing to redeploy, no image rebuild, no code change:
+
+```bash
+# 1. create the replacement in the OpenCode dashboard, budget-capped the same way
+# 2. update the secret (never echo the value, never pass it in argv)
+gh secret set OPENCODE_CRED --repo mordentplayer/mordent < /path/to/new-key
+# 3. confirm one triage run succeeds, then revoke the old key in the dashboard
+```
+
+This works because the workflow resolves `secrets.OPENCODE_CRED` at run time
+into the step environment and from there into the gateway container; the next
+run picks the new value up on its own. A run already in flight keeps the value
+it started with. The scrub steps read the same secret, so redaction follows the
+rotation with no further work.
+
+**If the secret is missing**, both gateway steps abort with
+`::error::OPENCODE_CRED secret is not set; refusing to run.`
 
 Workflow permissions requested by the triage workflow itself:
 `contents: write` (publish reports) and `issues: write` (comment on issues, file
@@ -298,9 +347,6 @@ collaborator with **Write** access. It needs:
 
 A read-only token fails every write with
 `403 Resource not accessible by personal access token`.
-
-Recommended: use a **separate, low-budget OpenCode key** for CI so a leak (or a
-runaway loop) can be revoked without touching the operator's key.
 
 ## 6. Local proof
 

@@ -85,6 +85,7 @@ jobs:
         id: gw
         if: steps.gate.outputs.skip == 'false'
         env:
+          # Rotation/budget story: infra/triage/README.md §5 'OpenCode key & rotation'.
           OPENCODE_CRED: ${{ secrets.OPENCODE_CRED }}
         run: |
           set -euo pipefail
@@ -293,6 +294,7 @@ jobs:
         id: gw
         if: steps.gate.outputs.skip == 'false'
         env:
+          # Rotation/budget story: infra/triage/README.md §5 'OpenCode key & rotation'.
           OPENCODE_CRED: ${{ secrets.OPENCODE_CRED }}
         run: |
           set -euo pipefail
