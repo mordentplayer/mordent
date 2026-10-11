@@ -489,6 +489,9 @@ pub struct App {
     theme: Theme,
     /// (mtime, size) of theme.toml at last load; `None` when the file is absent.
     theme_stamp: Option<(std::time::SystemTime, u64)>,
+    /// Last Appearance-section outcome ("saved to …", "edited — not written
+    /// yet", a save error) shown under the Save/Reset buttons.
+    theme_note: Option<String>,
     /// Throttles the once-per-second hot-reload poll; `None` = not polled yet.
     theme_poll: Option<std::time::Instant>,
     /// Font set currently installed on the egui context; starts as egui's
@@ -734,6 +737,7 @@ impl App {
             volume,
             theme,
             theme_stamp: Theme::stamp(&crate::theme::theme_path()),
+            theme_note: None,
             theme_poll: None,
             // eframe starts every app on egui's built-in fonts; the first
             // poll_theme installs the configured set.
@@ -1660,54 +1664,150 @@ impl App {
     }
 
     /// The Settings window (gear button / ctrl+,): Setup (re-run the wizard),
-    /// Playback (streaming quality) and About (version + the update checker,
-    /// the very block the ? cheatsheet shows).
+    /// Playback (streaming quality), Appearance (the theme editor) and About
+    /// (version + the update checker, the very block the ? cheatsheet shows).
     fn settings_ui(&mut self, ctx: &egui::Context) {
         let theme = self.theme;
         let mut open = self.show_settings;
         let mut run_setup = false;
         let mut quality = self.cfg.quality;
+        let path = crate::theme::theme_path();
+        // Appearance editor state: a copy of the live theme, applied the
+        // moment a control changes and written to disk only by Save / Reset.
+        let mut draft = self.theme;
+        let mut edited = false;
+        let mut save = false;
+        let mut reset = false;
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(false)
             .default_width(430.0)
+            // Explicit height: an auto-sized Window plus a ScrollArea child
+            // settles on a small height, which would hide most of Appearance
+            // behind a scrollbar even when the screen has room.
+            .default_height(620.0)
             .show(ctx, |ui| {
-                ui.strong(egui::RichText::new("Setup").size(15.0));
-                ui.label(
-                    "Mordent runs the setup wizard automatically on first launch \
-                     (no ~/.config/mordent/config.toml) — that first-run path is \
-                     unchanged. This re-runs it from the player.",
-                );
-                ui.add_space(4.0);
-                if ui.button("Run setup wizard").clicked() {
-                    run_setup = true;
-                }
-                ui.weak(
-                    "Install / login / preferences; the player returns when the wizard \
-                     finishes.",
-                );
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.strong(egui::RichText::new("Playback").size(15.0));
-                ui.label("Streaming quality");
-                for q in Quality::ALL {
-                    ui.radio_value(&mut quality, q, q.label())
-                        .on_hover_text(q.detail());
-                }
-                ui.weak(quality.detail());
-                ui.weak(
-                    "Applies to the next track streamed; tracks already in the audio \
-                     cache keep their stored quality.",
-                );
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.strong(egui::RichText::new("About").size(15.0));
+                // ONE scroll container for the whole window: four sections plus
+                // the update block can exceed a short screen. The cap follows
+                // the viewport so it uses the height that is actually there.
+                let max_h = (ctx.screen_rect().height() - 150.0).clamp(240.0, 620.0);
                 egui::ScrollArea::vertical()
-                    .max_height(260.0)
+                    .max_height(max_h)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        ui.strong(egui::RichText::new("Setup").size(15.0));
+                        ui.label(
+                            "Mordent runs the setup wizard automatically on first launch \
+                             (no ~/.config/mordent/config.toml) — that first-run path is \
+                             unchanged. This re-runs it from the player.",
+                        );
+                        ui.add_space(4.0);
+                        if ui.button("Run setup wizard").clicked() {
+                            run_setup = true;
+                        }
+                        ui.weak(
+                            "Install / login / preferences; the player returns when the \
+                             wizard finishes.",
+                        );
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.strong(egui::RichText::new("Playback").size(15.0));
+                        ui.label("Streaming quality");
+                        for q in Quality::ALL {
+                            ui.radio_value(&mut quality, q, q.label())
+                                .on_hover_text(q.detail());
+                        }
+                        ui.weak(quality.detail());
+                        ui.weak(
+                            "Applies to the next track streamed; tracks already in the \
+                             audio cache keep their stored quality.",
+                        );
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.strong(egui::RichText::new("Appearance").size(15.0));
+                        ui.label(
+                            "Theme — every change applies to the whole UI immediately; \
+                             Save writes theme.toml.",
+                        );
+                        egui::Grid::new("theme_colors")
+                            .num_columns(4)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                let rows = [
+                                    [
+                                        ("accent", &mut draft.accent),
+                                        ("lossless badge", &mut draft.lossless),
+                                    ],
+                                    [
+                                        ("window", &mut draft.bg),
+                                        ("panel", &mut draft.panel),
+                                    ],
+                                    [
+                                        ("text", &mut draft.text),
+                                        ("weak text", &mut draft.weak),
+                                    ],
+                                ];
+                                for row in rows {
+                                    for (name, slot) in row {
+                                        ui.label(name);
+                                        // Alpha::Opaque: theme colours are opaque
+                                        // (the `opacity` slider is the single
+                                        // background-alpha knob), so the picker
+                                        // offers no alpha row and `hex()` can never
+                                        // silently drop what the user chose.
+                                        edited |= egui::widgets::color_picker::color_edit_button_srgba(
+                                            ui,
+                                            slot,
+                                            egui::widgets::color_picker::Alpha::Opaque,
+                                        )
+                                        .changed();
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        edited |= ui
+                            .add(egui::Slider::new(&mut draft.opacity, 0.0..=1.0).text("opacity"))
+                            .on_hover_text(
+                                "Background alpha; needs a compositor to see through the window.",
+                            )
+                            .changed();
+                        ui.horizontal(|ui| {
+                            ui.label("font");
+                            egui::ComboBox::from_id_salt("theme_font")
+                                .selected_text(draft.font.label())
+                                .show_ui(ui, |ui| {
+                                    for f in FontChoice::ALL {
+                                        if ui
+                                            .selectable_value(&mut draft.font, f, f.label())
+                                            .clicked()
+                                        {
+                                            edited = true;
+                                        }
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Save to theme.toml").clicked() {
+                                save = true;
+                            }
+                            if ui.button("Reset to defaults").clicked() {
+                                reset = true;
+                            }
+                        });
+                        ui.weak(
+                            egui::RichText::new(path.display().to_string())
+                                .monospace()
+                                .size(11.0),
+                        );
+                        if let Some(n) = &self.theme_note {
+                            ui.weak(n.clone());
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.strong(egui::RichText::new("About").size(15.0));
                         self.updates_ui(ui, &theme);
                     });
             });
@@ -1717,6 +1817,39 @@ impl App {
         }
         if quality != self.cfg.quality {
             self.set_quality(quality);
+        }
+        if edited {
+            self.theme = draft;
+            self.apply_theme(ctx);
+            self.theme_note = Some("edited — not written to theme.toml yet".into());
+        }
+        if reset {
+            // Reset means "throw my customisation away": apply the built-in
+            // palette AND write it, so screen and file agree.
+            self.theme = Theme::default();
+            self.apply_theme(ctx);
+            self.write_theme();
+        }
+        if save {
+            self.write_theme();
+        }
+    }
+
+    /// Persist the live theme to `theme.toml` and remember the file's new
+    /// identity, so the ~1 s hot-reload poll does not re-read what we wrote.
+    fn write_theme(&mut self) {
+        let path = crate::theme::theme_path();
+        match self.theme.save() {
+            Ok(()) => {
+                self.theme_stamp = Theme::stamp(&path);
+                eprintln!("[theme] saved {}", path.display());
+                self.theme_note = Some(format!("saved to {}", path.display()));
+            }
+            Err(e) => {
+                eprintln!("[theme] save failed: {e:#}");
+                self.theme_note = Some(format!("could not save: {e:#}"));
+                self.fail(format!("Could not save the theme: {e:#}"));
+            }
         }
     }
 
@@ -2967,11 +3100,18 @@ impl App {
             self.error = Some(ErrorToast::new(w.clone()));
         }
         self.theme = theme;
+        self.apply_theme(ctx);
+    }
+
+    /// Push `self.theme` into egui's visuals, and the bundled fonts when the
+    /// `font` choice changed. ONE apply path, shared by the ~1 s file
+    /// hot-reload poll and the Appearance section's live edits.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
         self.theme.apply(ctx);
         // Fonts are hot-reloadable the same way: egui picks up new
-        // definitions at the start of the next pass, so editing the `font`
-        // key switches the typeface without a restart. Only resubmit when the
-        // choice actually changed (set_fonts compares the TTF data).
+        // definitions at the start of the next pass, so switching the typeface
+        // needs no restart. Only resubmit when the choice actually changed
+        // (set_fonts compares the TTF data).
         if self.font != self.theme.font {
             crate::fonts::apply(ctx, self.theme.font);
             self.font = self.theme.font;

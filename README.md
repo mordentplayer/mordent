@@ -287,13 +287,16 @@ are explicit, and the pointer turns into a hand over clickable rows.
 ### Settings (`ctrl+,`)
 
 The **⚙** button in the top bar (or `ctrl+,`) opens a **Settings** window with
-three sections:
+four sections (scrolls when the content is taller than the screen):
 
 * **Setup** — *Run setup wizard* re-opens the guided first-run flow (install /
   login / preferences) with the current config as its starting values; the
   player returns when the wizard finishes. The wizard still opens
   automatically on first launch when no config exists.
 * **Playback** — the streaming-quality selector (below).
+* **Appearance** — the theme editor: colour pickers for every `theme.toml`
+  key, live apply, *Save to theme.toml* and *Reset to defaults* (see
+  [Theming](#theming)).
 * **About** — this build's version and the same update checker the `?`
   cheatsheet shows (*Check now*, the daily-check toggle, self-update and
   helper-payload status).
@@ -403,6 +406,16 @@ default for that key is kept.
 
 Colors accept `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`; `font` hot-reloads
 with the colors, so the typeface switches without a restart.
+
+The same theme is editable in the app: **⚙ Settings → Appearance** (`ctrl+,`)
+has egui colour pickers for the six colours plus the `opacity` slider and the
+`font` menu. Every change is applied to the running UI the moment it is made —
+no restart — and the section shows the `theme.toml` path it writes to.
+**Save to theme.toml** writes the file (atomically, merged over the existing
+one: keys the editor does not know are preserved) and **Reset to defaults**
+restores the built-in palette and writes that. The file stays hand-editable:
+it is re-read about once a second, which also means an outside edit is picked
+up while the editor is open.
 
 ```toml
 accent = "#4dd0fa"
@@ -619,7 +632,8 @@ search sub-bar + album detail modal, library albums view with add-date/name
 sort, library playlists tab with playlist detail modal, persisted
 track favorites with a favorites tab, queue with reorder/shuffle, seekable
 player bar with shuffle/repeat, keyboard shortcuts, a ⚙ settings window
-(setup-wizard re-entry, streaming-quality selector, about/updates).
+(setup-wizard re-entry, streaming-quality selector, graphical theme editor,
+about/updates).
 Next: animated word-synced lyrics
 view, wrapper auto-spawn from the app.
 

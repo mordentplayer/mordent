@@ -7,6 +7,7 @@
 //! recolors the running UI without a restart.
 
 use crate::fonts::FontChoice;
+use anyhow::{Context, Result};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
@@ -63,6 +64,99 @@ impl Default for Theme {
 
 pub fn theme_path() -> PathBuf {
     crate::config::home().join(".config/mordent/theme.toml")
+}
+
+/// Keys the Appearance editor owns. Every *other* key already in the file is
+/// preserved verbatim on save (a hand-added comment is not: a TOML round-trip
+/// drops those, exactly like the config writer).
+const KNOWN_THEME_KEYS: [&str; 8] = [
+    "accent",
+    "lossless",
+    "bg",
+    "panel",
+    "text",
+    "weak",
+    "opacity",
+    "font",
+];
+
+/// `#rrggbb` — theme colours are opaque; `opacity` is the single alpha knob.
+fn hex(c: egui::Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "theme.toml".into());
+    path.with_file_name(format!(".{name}.tmp"))
+}
+
+/// Render a full `theme.toml` body from `theme`, merging over `existing`
+/// (parsed as TOML; a missing or unparseable file counts as empty). Pure, so
+/// the file the Appearance section would write is unit-tested without a HOME.
+pub fn merge_theme_toml(existing: Option<&str>, theme: &Theme) -> Result<String> {
+    let mut table: toml::Table = match existing {
+        Some(text) => toml::from_str(text).unwrap_or_default(),
+        None => toml::Table::new(),
+    };
+    table.insert("accent".into(), hex(theme.accent).into());
+    table.insert("lossless".into(), hex(theme.lossless).into());
+    table.insert("bg".into(), hex(theme.bg).into());
+    table.insert("panel".into(), hex(theme.panel).into());
+    table.insert("text".into(), hex(theme.text).into());
+    table.insert("weak".into(), hex(theme.weak).into());
+    table.insert("opacity".into(), f64::from(theme.opacity).into());
+    table.insert("font".into(), theme.font.as_str().into());
+
+    let mut out = String::from(
+        "# Mordent theme — written by the Settings window (Appearance).\n\
+         # Every key is optional; keys we do not know are preserved across writes.\n",
+    );
+    for key in KNOWN_THEME_KEYS {
+        if let Some(v) = table.remove(key) {
+            out.push_str(&format!("{key} = {v}\n"));
+        }
+    }
+    // Whatever is left was not written by the editor: keep it, sorted.
+    for (key, v) in table {
+        out.push_str(&format!("{key} = {v}\n"));
+    }
+    Ok(out)
+}
+
+/// Atomically write `theme` to `path`, merging over any file already there.
+///
+/// Same discipline as the config writer: the temp file lives in the target
+/// directory and is renamed over the target (atomic on one filesystem), and is
+/// created 0600 so a theme file is never more readable than the config.
+pub fn save_to(path: &Path, theme: &Theme) -> Result<()> {
+    let existing = std::fs::read_to_string(path).ok();
+    let text = merge_theme_toml(existing.as_deref(), theme)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let tmp = tmp_path(path);
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        use std::io::Write;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        let _ = f.sync_all();
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 /// Parse `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa` (leading `#` optional) into
@@ -213,6 +307,12 @@ impl Theme {
     pub fn clear_color(&self) -> [f32; 4] {
         self.bg.gamma_multiply(self.opacity).to_normalized_gamma_f32()
     }
+
+    /// Persist this theme to the default `theme.toml` (atomic, merged over any
+    /// existing file). Used by the Settings window's Appearance section.
+    pub fn save(&self) -> Result<()> {
+        save_to(&theme_path(), self)
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +378,86 @@ mod tests {
         assert_eq!(t.opacity, 1.0); // clamped
         assert_eq!(t.weak, Theme::default().weak); // bad hex -> default
         assert_eq!(warns.len(), 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    fn tmp_theme(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("mordent-theme-{tag}-{}.toml", std::process::id()))
+    }
+
+    /// What the Appearance section writes must load back as exactly the theme
+    /// it saved — the round-trip the live editor and a fresh launch rely on.
+    #[test]
+    fn save_load_round_trip() {
+        let p = tmp_theme("roundtrip");
+        let _ = std::fs::remove_file(&p);
+        let theme = Theme {
+            accent: egui::Color32::from_rgb(0x11, 0x22, 0x33),
+            lossless: egui::Color32::from_rgb(0x44, 0x55, 0x66),
+            bg: egui::Color32::from_gray(7),
+            panel: egui::Color32::from_gray(9),
+            text: egui::Color32::from_gray(200),
+            weak: egui::Color32::from_gray(80),
+            opacity: 0.5,
+            font: FontChoice::DejaVu,
+        };
+        save_to(&p, &theme).unwrap();
+        let (back, warns) = Theme::load_from(&p);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(back.accent, theme.accent);
+        assert_eq!(back.lossless, theme.lossless);
+        assert_eq!(back.bg, theme.bg);
+        assert_eq!(back.panel, theme.panel);
+        assert_eq!(back.text, theme.text);
+        assert_eq!(back.weak, theme.weak);
+        assert_eq!(back.opacity, 0.5);
+        assert_eq!(back.font, FontChoice::DejaVu);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn save_preserves_unknown_keys_and_writes_no_temp() {
+        let p = tmp_theme("merge");
+        std::fs::write(&p, "future_knob = 42\naccent = \"#000000\"\n").unwrap();
+        let theme = Theme {
+            accent: egui::Color32::from_rgb(0xfa, 0x4d, 0x6a),
+            ..Theme::default()
+        };
+        save_to(&p, &theme).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("future_knob = 42"), "{raw}");
+        assert!(raw.contains("accent = \"#fa4d6a\""), "{raw}");
+        assert!(!tmp_path(&p).exists(), "no temp file left behind");
+        // a corrupt existing file is tolerated (treated as empty)
+        std::fs::write(&p, "this is not toml ===").unwrap();
+        save_to(&p, &theme).unwrap();
+        assert!(Theme::load_from(&p).1.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "theme file should not be world-readable");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The defaults the Appearance "Reset to defaults" button restores must be
+    /// the built-in palette, not whatever the file held.
+    #[test]
+    fn merge_writes_the_builtin_defaults() {
+        let d = Theme::default();
+        let text = merge_theme_toml(Some("accent = \"#000000\"\n"), &d).unwrap();
+        assert!(text.contains("accent = \"#fa4d6a\""), "{text}");
+        assert!(text.contains("opacity = 1.0"), "{text}");
+        assert!(text.contains("font = \"inter\""), "{text}");
+        // and the written body loads back as those defaults
+        let p = tmp_theme("defaults");
+        std::fs::write(&p, &text).unwrap();
+        let (back, warns) = Theme::load_from(&p);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(back.accent, d.accent);
+        assert_eq!(back.panel, d.panel);
+        assert_eq!(back.opacity, 1.0);
         let _ = std::fs::remove_file(&p);
     }
 }

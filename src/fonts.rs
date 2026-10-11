@@ -45,6 +45,29 @@ impl FontChoice {
             _ => None,
         }
     }
+
+    /// The `font` key's spelling in `theme.toml` (round-trips with [`parse`]).
+    ///
+    /// [`parse`]: FontChoice::parse
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inter => "inter",
+            Self::DejaVu => "dejavu",
+            Self::Default => "default",
+        }
+    }
+
+    /// Human label for the Appearance section's font menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inter => "Inter (bundled)",
+            Self::DejaVu => "DejaVu Sans (bundled)",
+            Self::Default => "egui built-in",
+        }
+    }
+
+    /// Every choice, in menu order.
+    pub const ALL: [FontChoice; 3] = [Self::Inter, Self::DejaVu, Self::Default];
 }
 
 /// Font definitions for `choice`: the choice's primary face first, egui's
