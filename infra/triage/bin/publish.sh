@@ -23,8 +23,12 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 git -C "$work" init -q
-git -C "$work" config user.name "mordent-triage[bot]"
-git -C "$work" config user.email "triage@users.noreply.github.com"
+# Canonical GitHub Actions bot identity. The previous value
+# (mordent-triage[bot] <triage@users.noreply.github.com>) resolved to an
+# unrelated real user account named "triage" on github.com, which misattributed
+# the report commits to a human.
+git -C "$work" config user.name "github-actions[bot]"
+git -C "$work" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 # TRIAGE_PUBLISH_REMOTE exists so the publish mechanics can be dry-run against
 # a local bare repo; in CI it is unset and the token URL is used.
 remote="${TRIAGE_PUBLISH_REMOTE:-https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git}"
