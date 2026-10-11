@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Compose the body of an issue created from a web submission.
+
+The body is: the model's analysis, followed by the reporter's original text in
+a collapsed ``<details>`` block.
+
+Escaping matters here -- the submission is attacker-controlled and the result
+is published:
+
+* the verbatim text goes inside a fenced code block whose fence is *longer*
+  than the longest backtick run in the submission, so it cannot close the
+  fence;
+* inside a fenced code block GitHub renders HTML as literal text, so a
+  ``</details>`` in the submission cannot close the outer ``<details>`` either.
+
+``contact`` is deliberately NOT shown to the model (it is submitter PII); it is
+only appended here, inside the collapsed block.
+"""
+
+from __future__ import annotations
+
+import re
+
+import argparse
+
+
+def read(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+
+
+def longest_backtick_run(text: str) -> int:
+    longest = 0
+    current = 0
+    for char in text:
+        if char == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--submission", required=True)
+    parser.add_argument("--analysis", default="")
+    parser.add_argument("--contact", default="")
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args()
+
+    submission = read(args.submission)
+    analysis = read(args.analysis).strip() if args.analysis else ""
+    contact = read(args.contact).strip() if args.contact else ""
+    # The intake worker may hand us the contact text with or without its
+    # "contact (unverified):" prefix -- normalise so we never double it.
+    contact = re.sub(r"(?i)^contact\s*\(unverified\)\s*:\s*", "", contact).strip()
+
+    if not analysis:
+        analysis = (
+            "> ⚠️ Automated analysis did not complete for this submission "
+            "(the sandbox produced no report). The original report is preserved "
+            "below; a maintainer should triage it by hand."
+        )
+
+    fence = "`" * max(3, longest_backtick_run(submission) + 1)
+    # A trailing newline inside the fence keeps the closing fence on its own line.
+    verbatim = submission if submission.endswith("\n") else submission + "\n"
+
+    parts = [
+        analysis,
+        "",
+        "<details>",
+        "<summary>Original report (verbatim)</summary>",
+        "",
+        fence,
+        verbatim + fence,
+        "",
+    ]
+    if contact:
+        parts.append(f"contact (unverified): {contact}")
+        parts.append("")
+    parts.append("</details>")
+    parts.append("")
+
+    with open(args.out, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(parts))
+
+
+if __name__ == "__main__":
+    main()

@@ -2,28 +2,41 @@
 #
 # Sandbox entrypoint for the Mordent issue-triage workflow.
 #
-# This runs INSIDE the disposable model sandbox container. It configures the
+# Runs INSIDE the disposable model sandbox container. It configures the
 # OpenCode CLI ("omp") to talk to the credential-injecting gateway instead of
-# the real upstream, renders the prompt, runs the agent, and leaves the report
+# the real upstream, renders the prompt, runs the agent, and leaves the output
 # on disk.
 #
 # The container holds NO real credential: GW_TOKEN is an ephemeral,
 # job-scoped, network-local bearer that only unlocks the gateway.
 #
+# Two modes:
+#   TRIAGE_MODE=analyze (default) -- full investigation, writes a report file.
+#   TRIAGE_MODE=spam              -- cheap classifier pass, no tools, prints a
+#                                    VERDICT/RATIONALE answer and tees it to
+#                                    $OUT_DIR/spam-verdict.txt.
+#
 # Required env:
-#   ISSUE_NUMBER   GitHub issue number
-#   ISSUE_TITLE    issue title (inline)
-#   ISSUE_TITLE_FILE  file containing the issue title (used if set)
-#   ISSUE_BODY_FILE path to the raw issue body
-#   GW_URL         gateway base URL, e.g. http://gateway:4000
+#   GW_URL         gateway base URL, e.g. http://172.18.0.3:4000
 #   GW_TOKEN       ephemeral gateway bearer
-#   REPO_DIR       checkout to analyse (default /work)
-#   OUT_DIR        where to write the report (default $REPO_DIR)
+#   ISSUE_BODY_FILE path to the raw submission text (default /tmp/issue.md)
+# Optional env:
+#   ISSUE_NUMBER     GitHub issue number (empty for pre-issue web submissions)
+#   ISSUE_REF        label used in the report header (default "#<number>")
+#   ISSUE_TITLE / ISSUE_TITLE_FILE
+#   TRIAGE_ORIGIN    sentence describing where the submission came from
+#   REPORT_RELPATH   report path relative to OUT_DIR
+#                    (default triage-reports/issue-<number>.md)
+#   REPO_DIR         checkout to analyse (default /work)
+#   OUT_DIR          where to write the report (default $REPO_DIR)
 set -euo pipefail
 
-: "${ISSUE_NUMBER:?}"
 : "${GW_URL:?}"
 : "${GW_TOKEN:?}"
+TRIAGE_MODE="${TRIAGE_MODE:-analyze}"
+ISSUE_NUMBER="${ISSUE_NUMBER:-}"
+ISSUE_REF="${ISSUE_REF:-}"
+TRIAGE_ORIGIN="${TRIAGE_ORIGIN:-}"
 ISSUE_TITLE="${ISSUE_TITLE:-}"
 if [ -n "${ISSUE_TITLE_FILE:-}" ] && [ -f "$ISSUE_TITLE_FILE" ]; then
   ISSUE_TITLE="$(cat "$ISSUE_TITLE_FILE")"
@@ -37,9 +50,6 @@ TRIAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_ROLE="${TRIAGE_MODEL_ROLE:-triage}"          # custom provider id
 MODEL_ID="${TRIAGE_MODEL_ID:-muse-spark-1.3-contributor}"
 sel="${MODEL_ROLE}/${MODEL_ID}"
-
-report_path="${OUT_DIR}/triage-reports/issue-${ISSUE_NUMBER}.md"
-fence="UNTRUSTED-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
 # --- point omp at the gateway ------------------------------------------------
 # A custom provider with the gateway's base URL is how the client's upstream is
@@ -70,12 +80,54 @@ providers:
 EOF
 chmod 600 "$HOME/.omp/agent/models.yml"
 
-# --- render the prompt -------------------------------------------------------
+export OMP_SKIP_SETUP=1
+export GIT_TERMINAL_PROMPT=0
+
+fence="UNTRUSTED-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+if [ "$TRIAGE_MODE" = "spam" ]; then
+  # --- cheap spam classification pass ---------------------------------------
+  # No tools and minimal thinking: the decision only depends on the text.
+  verdict_path="${OUT_DIR}/spam-verdict.txt"
+  python3 "$TRIAGE_DIR/bin/render-prompt.py" \
+    --template "$TRIAGE_DIR/prompt/spam-prompt.md" \
+    --issue-file "$ISSUE_BODY_FILE" \
+    --issue-title "$ISSUE_TITLE" \
+    --repo-dir "$REPO_DIR" \
+    --fence "$fence" \
+    --out /tmp/triage-prompt.md
+
+  set +e
+  omp -p \
+    --cwd "$REPO_DIR" \
+    --model "$sel" \
+    --auto-approve \
+    --no-session \
+    --no-tools \
+    --no-lsp \
+    --no-pty \
+    --no-skills \
+    --no-extensions \
+    --thinking minimal \
+    --max-time "${TRIAGE_MAX_TIME:-300}" \
+    "$(cat /tmp/triage-prompt.md)" 2>&1 | tee "$verdict_path"
+  agent_rc=${PIPESTATUS[0]}
+  set -e
+  echo "=== triage: spam pass exited with ${agent_rc} ==="
+  exit 0
+fi
+
+# --- analysis pass -----------------------------------------------------------
+REPORT_RELPATH="${REPORT_RELPATH:-triage-reports/issue-${ISSUE_NUMBER}.md}"
+report_path="${OUT_DIR}/${REPORT_RELPATH}"
+
 python3 "$TRIAGE_DIR/bin/render-prompt.py" \
   --template "$TRIAGE_DIR/prompt/triage-prompt.md" \
   --issue-file "$ISSUE_BODY_FILE" \
   --issue-number "$ISSUE_NUMBER" \
+  --issue-ref "$ISSUE_REF" \
   --issue-title "$ISSUE_TITLE" \
+  --origin "$TRIAGE_ORIGIN" \
   --repo-dir "$REPO_DIR" \
   --report-path "$report_path" \
   --fence "$fence" \
@@ -83,9 +135,6 @@ python3 "$TRIAGE_DIR/bin/render-prompt.py" \
 
 mkdir -p "$(dirname "$report_path")"
 
-# --- run the agent -----------------------------------------------------------
-export OMP_SKIP_SETUP=1
-export GIT_TERMINAL_PROMPT=0
 set +e
 omp -p \
   --cwd "$REPO_DIR" \
