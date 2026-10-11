@@ -132,7 +132,7 @@ impl Tray for TrayItem {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        vec![note_icon()]
+        vec![mark_icon()]
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -312,34 +312,16 @@ pub fn spawn(
     }
 }
 
-/// A 32×32 ARGB32 (network byte order: a, r, g, b per pixel) eighth-note on
-/// a transparent tile, painted at startup — no asset, no PNG decoder.
-fn note_icon() -> Icon {
-    const S: i32 = 32;
-    // accent + a darker shade for the head/stem split
-    const ACCENT: (u8, u8, u8) = (0x7a, 0xa6, 0xff);
-    let mut data = Vec::with_capacity((S * S * 4) as usize);
-    for y in 0..S {
-        for x in 0..S {
-            // note head: filled circle at (12, 25), r 5.5
-            let dx = x - 12;
-            let dy = y - 25;
-            let head = dx * dx + dy * dy <= 30;
-            // stem: 3 px wide, from the head's right side up to the flag
-            let stem = (19..=21).contains(&x) && (8..=25).contains(&y);
-            // flag: wedge slanting down-right from the stem top
-            let flag = x > 21 && x < 29 && y >= 6 && y <= 7 + (x - 21);
-            if head || stem || flag {
-                data.extend_from_slice(&[255, ACCENT.0, ACCENT.1, ACCENT.2]);
-            } else {
-                data.extend_from_slice(&[0, 0, 0, 0]);
-            }
-        }
-    }
+/// The tray pixmap: the Mordent mark (`assets/brand/brand.md`), the same figure
+/// as the app icon but without its dark panel, so it sits on whatever
+/// background the host draws — the accent reads on both light and dark bars.
+/// `brand` draws it at 24 px, where the four strokes need a thicker ribbon;
+/// ARGB network byte order, as ksni expects.
+fn mark_icon() -> Icon {
     Icon {
-        width: S,
-        height: S,
-        data,
+        width: crate::brand::TRAY_SIZE as i32,
+        height: crate::brand::TRAY_SIZE as i32,
+        data: crate::brand::tray_argb(),
     }
 }
 

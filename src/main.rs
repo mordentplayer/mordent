@@ -1,5 +1,6 @@
 mod acache;
 mod api;
+mod brand;
 mod config;
 mod fonts;
 mod lyrics;

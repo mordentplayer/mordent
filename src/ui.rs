@@ -4738,10 +4738,19 @@ fn launch_with(cfg: Config, start_wizard: bool) -> anyhow::Result<()> {
     // like the selftest uses) there is nothing to blend against, so the window
     // just renders solid at full alpha. That is a silent degradation — no
     // error, no panic, and playback/UI behave identically either way.
+    //
+    // Window icon: the app mark, rasterised by `brand` — the taskbar/dock shows
+    // the logo instead of winit's default. Wayland has no protocol for this,
+    // so the compositor there uses the .desktop entry's icon instead.
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([760.0, 420.0])
+            .with_icon(egui::IconData {
+                rgba: crate::brand::app_icon_rgba(crate::brand::WINDOW_ICON_SIZE),
+                width: crate::brand::WINDOW_ICON_SIZE,
+                height: crate::brand::WINDOW_ICON_SIZE,
+            })
             .with_transparent(true),
         ..Default::default()
     };
