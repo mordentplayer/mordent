@@ -113,8 +113,53 @@ impl Default for Config {
     }
 }
 
+/// The user's home directory, from the environment candidates in order:
+/// `HOME` → `USERPROFILE` → `HOMEDRIVE` + `HOMEPATH` → `/`.
+///
+/// `HOME` is the Unix convention and is usually **unset on Windows**, where
+/// `USERPROFILE` is the equivalent (`HOMEDRIVE` = `C:`, `HOMEPATH` =
+/// `\Users\name` is the older pair). Without this, every path below
+/// (`~/.config/mordent`, `~/.cache/mordent`, …) resolves drive-relative on
+/// Windows — the current drive's root — and running Mordent from two drives
+/// yields two configs. An empty (or whitespace-only) value counts as unset:
+/// Windows tooling does export `HOME=` from time to time. The `/` fallback is
+/// the long-standing behaviour when nothing is available.
+///
+/// The decision itself is [`resolve_home`] (pure, unit-tested); this wrapper
+/// only reads the environment.
 pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
+    resolve_home(
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+        std::env::var("HOMEDRIVE").ok().as_deref(),
+        std::env::var("HOMEPATH").ok().as_deref(),
+    )
+}
+
+/// Pick a home directory from the four environment candidates (see [`home`]).
+///
+/// `Some("")` and `Some("   ")` are treated as unset; a usable value is
+/// returned verbatim (never trimmed — a path may legitimately contain spaces).
+/// `HOMEDRIVE` and `HOMEPATH` only count together.
+fn resolve_home(
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    homedrive: Option<&str>,
+    homepath: Option<&str>,
+) -> PathBuf {
+    fn usable(v: Option<&str>) -> Option<&str> {
+        v.filter(|v| !v.trim().is_empty())
+    }
+    if let Some(h) = usable(home) {
+        return PathBuf::from(h);
+    }
+    if let Some(p) = usable(userprofile) {
+        return PathBuf::from(p);
+    }
+    if let (Some(drive), Some(path)) = (usable(homedrive), usable(homepath)) {
+        return PathBuf::from(format!("{drive}{path}"));
+    }
+    PathBuf::from("/")
 }
 
 /// The `mordent` config directory (`~/.config/mordent`).
@@ -664,5 +709,75 @@ mod migration_tests {
             swap_cache_dir(&got, "/home/a/.cache/amc", "/home/a/.cache/mordent"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    /// The candidate order, including the Windows cases: `HOME` unset or empty
+    /// → `USERPROFILE`; otherwise the older `HOMEDRIVE` + `HOMEPATH` pair; and
+    /// the `/` fallback when nothing usable is set.
+    #[test]
+    fn home_resolves_the_environment_candidates_in_order() {
+        // Unix: HOME wins over everything else.
+        assert_eq!(
+            resolve_home(Some("/home/u"), Some("C:\\Users\\u"), Some("C:"), Some("\\Users\\u")),
+            PathBuf::from("/home/u")
+        );
+        // Windows: HOME is usually absent…
+        assert_eq!(
+            resolve_home(None, Some("C:\\Users\\u"), Some("C:"), Some("\\Users\\u")),
+            PathBuf::from("C:\\Users\\u")
+        );
+        // …and is sometimes present but EMPTY (a real Windows quirk).
+        assert_eq!(
+            resolve_home(Some(""), Some("C:\\Users\\u"), None, None),
+            PathBuf::from("C:\\Users\\u")
+        );
+        // Whitespace-only counts as empty too.
+        assert_eq!(
+            resolve_home(Some("   "), Some("C:\\Users\\u"), None, None),
+            PathBuf::from("C:\\Users\\u")
+        );
+        // The older pair, used only when both halves are set.
+        assert_eq!(
+            resolve_home(None, Some(""), Some("D:"), Some("\\Users\\u")),
+            PathBuf::from("D:\\Users\\u")
+        );
+        assert_eq!(resolve_home(None, None, Some("D:"), None), PathBuf::from("/"));
+        assert_eq!(resolve_home(None, None, None, Some("\\Users\\u")), PathBuf::from("/"));
+        // Nothing usable anywhere → the long-standing fallback.
+        assert_eq!(resolve_home(None, None, None, None), PathBuf::from("/"));
+        // A path is never trimmed.
+        assert_eq!(
+            resolve_home(Some(" /home/with space "), None, None, None),
+            PathBuf::from(" /home/with space ")
+        );
+    }
+
+    /// The thin wrapper really reads this process's environment: on Unix (and
+    /// on a Windows runner with HOME set) that is `HOME`; with `HOME` unset or
+    /// empty, Windows must fall back to `USERPROFILE`.
+    #[test]
+    fn home_reads_the_process_environment() {
+        let set = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        if let Some(h) = set("HOME") {
+            assert_eq!(home(), PathBuf::from(h));
+        } else if let Some(p) = set("USERPROFILE") {
+            assert_eq!(home(), PathBuf::from(p));
+        } else {
+            assert_eq!(home(), PathBuf::from("/"), "no candidate set anywhere");
+        }
+    }
+
+    /// Everything else derives from `home()` — the Windows drive-relative bug
+    /// could not have been fixed in one place otherwise.
+    #[test]
+    fn dirs_derive_from_home() {
+        assert_eq!(config_dir(), home().join(".config/mordent"));
+        assert_eq!(default_cache_dir(), home().join(".cache/mordent"));
+        assert_eq!(config_file(), config_dir().join("config.toml"));
     }
 }
