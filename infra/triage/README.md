@@ -86,7 +86,7 @@ GitHub Actions runner (ubuntu-latest, trusted)
 │                              ▼                                       │
 │                       https://opencode.ai/zen/go/...                 │
 │  step "Scrub", "Upload artifact", "Publish to triage-reports"        │
-│      (outside the sandbox; use GITHUB_TOKEN)                         │
+│      (outside the sandbox; post as mordent-bot)                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -119,7 +119,7 @@ worker sends
    backticks and angle brackets stripped, capped at 400 chars) and scrubbed —
    so the mirror still records that something arrived, without ever mirroring
    the content.
-3. **Real → investigate**, then file the issue with `GITHUB_TOKEN`:
+3. **Real → investigate**, then file the issue as `mordent-bot` (PAT):
    * title = the reporter's title, prefixed `[bug] `/`[feature] ` from
      `client_payload.type` (or `[web] `) unless it already carries a `[…]`
      marker;
@@ -198,6 +198,7 @@ output is published.
 | **Global** serialisation for the public form | job `concurrency: triage-web` |
 | Skip bodies < 40 bytes | `gate` step (both flows) |
 | Skip bot-authored issues (`type == Bot` or login ending `[bot]`) | `issue` job `if` |
+| Skip issues authored by our own posting bot | `issue` job `if`: `github.event.issue.user.login != 'mordent-bot'` |
 | Kill switch | repo variable `TRIAGE_DISABLED=true` disables both jobs |
 | Optional author allowlist | repo variable `TRIAGE_ALLOWLIST` (comma-separated logins); empty = everyone |
 | Hard wall clock | `timeout-minutes: 30` (issue) / `35` (web); `--max-time 1320` analyse, `300` spam pass |
@@ -272,6 +273,31 @@ web submissions). Neither is ever exposed to the model sandbox.
 
 Separately, the **intake worker** needs its own PAT with `Contents: read and
 write` to be allowed to send `repository_dispatch` events.
+
+### Posting identity
+
+Everything the pipeline posts publicly — issue comments, issues filed from web
+submissions, labels, and the `triage-reports` branch commits — is done as the
+dedicated bot account **`mordent-bot`** (id 340837187), never as the maintainer
+and never as `github-actions[bot]`:
+
+* the five posting steps use `GH_TOKEN: ${{ secrets.MORDENT_BOT_TOKEN }}`;
+  `GITHUB_TOKEN` is still what checkout and artifact upload use;
+* `bin/publish.sh` sets the commit identity to
+  `mordent-bot <340837187+mordent-bot@users.noreply.github.com>`;
+* the VPS keeps the same token at `~/.config/mordent-bot-token` (mode 0600).
+
+The token is a fine-grained PAT on the `mordent-bot` account, which is a
+collaborator with **Write** access. It needs:
+
+| Capability | Permission | Used for |
+| --- | --- | --- |
+| `Contents: read and write` | also required for `repository_dispatch` | `triage-reports` commits; the intake worker's dispatch |
+| `Issues: read and write` | comments, issue creation, label creation | the comment / file-issue steps |
+| `Metadata: read` | always included | — |
+
+A read-only token fails every write with
+`403 Resource not accessible by personal access token`.
 
 Recommended: use a **separate, low-budget OpenCode key** for CI so a leak (or a
 runaway loop) can be revoked without touching the operator's key.
@@ -584,12 +610,14 @@ Nobody should ever mistake automation's words for the maintainer's.
   is exactly what makes automation look like a person. Every issue and comment
   from the turn-3 smoke tests was deleted on 2026-10-11.
 * **Never post public comments or closes through a human account from a test or
-  an agent.** All pipeline writes go through `secrets.GITHUB_TOKEN` (see §4 and
+  an agent.** All pipeline writes go through `secrets.MORDENT_BOT_TOKEN` (see §4, §5 and
   the workflow audit); ad-hoc testing must use the API under a bot identity, or
   be cleaned up by deletion.
-* The `triage-reports` branch commits are created with the git identity
-  `github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>`
-  so the branch attributes to the bot rather than to any human account.
+* **All public output is posted as the dedicated `mordent-bot` account** —
+  comments, filed issues, labels and `triage-reports` branch commits (git
+  identity `mordent-bot <340837187+mordent-bot@users.noreply.github.com>`).
+  The earlier `github-actions[bot]` / `mordent-triage[bot]` identities were
+  replaced because the latter resolved to an unrelated human account.
 
 ## 10. Residual risks / follow-ups
 

@@ -46,6 +46,7 @@ jobs:
       vars.TRIAGE_DISABLED != 'true' &&
       github.event.issue.user.type != 'Bot' &&
       !endsWith(github.event.issue.user.login, '[bot]') &&
+      github.event.issue.user.login != 'mordent-bot' &&
       (vars.TRIAGE_ALLOWLIST == '' || contains(vars.TRIAGE_ALLOWLIST, github.event.issue.user.login))
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -207,7 +208,7 @@ jobs:
       - name: Publish report to branch
         if: steps.gate.outputs.skip == 'false' && steps.scrub.outputs.present == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.MORDENT_BOT_TOKEN }}
           TRIAGE_COMMIT_MSG: "issue #${{ github.event.issue.number }}"
         run: |
           set -euo pipefail
@@ -219,7 +220,7 @@ jobs:
         id: comment
         if: steps.gate.outputs.skip == 'false' && steps.scrub.outputs.present == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.MORDENT_BOT_TOKEN }}
         run: |
           set -euo pipefail
           spam="$(python3 infra/triage/bin/report-comment.py \
@@ -400,7 +401,7 @@ jobs:
       - name: Publish spam note to branch
         if: steps.gate.outputs.skip == 'false' && steps.spam.outputs.verdict == 'spam'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.MORDENT_BOT_TOKEN }}
           TRIAGE_COMMIT_MSG: "web submission classified as spam"
         run: |
           set -euo pipefail
@@ -466,7 +467,7 @@ jobs:
         id: create
         if: steps.gate.outputs.skip == 'false' && steps.spam.outputs.verdict != 'spam'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.MORDENT_BOT_TOKEN }}
         run: |
           set -euo pipefail
           title="$(cat "$RUNNER_TEMP/submission-title.txt")"
@@ -511,7 +512,7 @@ jobs:
       - name: Publish report to branch
         if: steps.gate.outputs.skip == 'false' && steps.spam.outputs.verdict != 'spam' && steps.create.outputs.report_path != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.MORDENT_BOT_TOKEN }}
           TRIAGE_COMMIT_MSG: "web submission -> issue #${{ steps.create.outputs.number }}"
         run: |
           set -euo pipefail
