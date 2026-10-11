@@ -14,7 +14,8 @@
 # Environment overrides: MORDENT_TAG, MORDENT_PREFIX.
 #
 # Layout (XDG-ish, under --prefix):
-#   share/mordent/{mordent, wrapper-lite, rootfs/, scripts/, licenses/, README.md}
+#   share/mordent/{mordent, wrapper-lite, rootfs/, scripts/, licenses/, README.md,
+#                  assets/icon/}
 #   bin/mordent -> ../share/mordent/mordent
 #   share/applications/mordent.desktop
 #   share/icons/hicolor/<size>/apps/mordent.png

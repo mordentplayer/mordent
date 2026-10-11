@@ -4,6 +4,7 @@
 # The input is the *same directory the linux tarball is made from* (see the
 # "Assemble bundle" step in .github/workflows/release.yml): a tree containing
 #   mordent  wrapper-lite  rootfs/  scripts/  WRAPPER_COMMIT  licenses/  README.md
+#   assets/icon/
 # so the AppImage payload is identical to the tarball's by construction.
 #
 # Layout inside the AppDir (this is what makes the wizard's *install the helper

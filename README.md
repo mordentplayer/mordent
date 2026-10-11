@@ -116,11 +116,12 @@ Options — the piped form takes them after `bash -s --`, e.g.
 | `--yes` | non-interactive (implied when stdin is not a TTY) |
 
 It lays out `share/mordent/` (`mordent`, `wrapper-lite`, `rootfs/`, `scripts/`,
-`licenses/`, `README.md`) plus the `bin/mordent` symlink, a `.desktop` entry and
-icons; verifies the download against the release's `SHA256SUMS` when the release
-ships one (otherwise it prints the computed hash and a warning), and never calls
-`sudo`. Upgrading is just re-running it. `--uninstall` removes the files but
-leaves your settings and login in `~/.config/mordent`.
+`licenses/`, `assets/icon/`, `README.md`) plus the `bin/mordent` symlink, a
+`.desktop` entry and icons; verifies the download against the release's
+`SHA256SUMS` when the release ships one (otherwise it prints the computed hash
+and a warning), and never calls `sudo`. Upgrading is just re-running it.
+`--uninstall` removes the files but leaves your settings and login in
+`~/.config/mordent`.
 
 ### Advanced — tarballs, scripts, source
 

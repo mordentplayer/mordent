@@ -374,12 +374,31 @@ jobs:
           # setup scripts + systemd unit the wizard drives
           cp -a scripts "$root/scripts"
 
+          # Icons for the one-line installer: scripts/install.sh looks for
+          # <payload>/assets/icon/{mordent-*.png, mordent.iconset/icon_*.png} and
+          # installs them into share/icons/hicolor/<size>/apps/, falling back to
+          # a placeholder icon when the directory is absent. `assets/brand/` is
+          # deliberately not shipped — install.sh never reads it.
+          install -d "$root/assets"
+          cp -a assets/icon "$root/assets/icon"
+
           # docs + licenses
           cp README.md "$root/README.md"
           cp assets/fonts/LICENSE-DejaVu.txt "$root/licenses/LICENSE-DejaVu.txt"
           cp assets/fonts/LICENSE-Inter.txt "$root/licenses/LICENSE-Inter.txt"
           cp in/wrapper/LICENSE-wrapper.txt "$root/licenses/LICENSE-wrapper.txt"
           cp in/wrapper/README-wrapper.md "$root/licenses/README-wrapper.md"
+
+          # Guard: a payload without the icon set silently degrades to a
+          # placeholder menu icon in every one-liner install. Fail loudly here
+          # instead of shipping that (both halves of install_icons_from).
+          icon_pngs=("$root"/assets/icon/mordent-*.png)
+          icon_set=("$root"/assets/icon/mordent.iconset/icon_*.png)
+          [[ -f "${icon_pngs[0]}" ]] ||
+            { echo "::error::bundle is missing assets/icon/mordent-*.png — install.sh would install a placeholder icon"; exit 1; }
+          [[ -f "${icon_set[0]}" ]] ||
+            { echo "::error::bundle is missing assets/icon/mordent.iconset/icon_*.png — install.sh would install a placeholder icon"; exit 1; }
+          echo "icons: ${#icon_pngs[@]} PNG(s) + ${#icon_set[@]} iconset file(s)"
 
           tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
 
@@ -397,6 +416,8 @@ jobs:
             scripts/mordent-wrapper.service \
             WRAPPER_COMMIT \
             README.md \
+            assets/icon/mordent-256.png \
+            assets/icon/mordent.iconset/icon_256x256.png \
             licenses/LICENSE-DejaVu.txt \
             licenses/LICENSE-Inter.txt \
             licenses/LICENSE-wrapper.txt; do
