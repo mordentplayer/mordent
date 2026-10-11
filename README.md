@@ -419,3 +419,7 @@ track favorites with a favorites tab, queue with reorder/shuffle, seekable
 player bar with shuffle/repeat, keyboard shortcuts.
 Next: animated word-synced lyrics
 view, wrapper auto-spawn from the app.
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE).

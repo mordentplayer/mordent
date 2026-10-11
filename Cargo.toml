@@ -3,6 +3,7 @@ name = "mordent"
 version = "2026.10.10"
 edition = "2024"
 description = "Mordent — a native, fast Apple Music client"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1"
