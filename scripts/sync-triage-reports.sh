@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sync-triage-reports.sh — mirror the `triage-reports` branch to this machine.
+# sync-triage-reports.sh — mirror the `triage-reports` branch to a local directory.
 #
 # The triage pipeline publishes one Markdown report per issue to the
 # `triage-reports` branch. This script exports that branch (via `git archive`,

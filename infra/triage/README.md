@@ -33,12 +33,12 @@ infra/triage/
 └── README.md
 ```
 
-The VPS-side mirror lives at [`scripts/sync-triage-reports.sh`](../../scripts/sync-triage-reports.sh)
-(see §7).
+A local mirror of the branch is provided by
+[`scripts/sync-triage-reports.sh`](../../scripts/sync-triage-reports.sh) (see §7).
 
 ## 1. How the agent is invoked (discovery findings)
 
-Measured on the ops VPS (omp v18.8.6 host, v18.8.9 in the image):
+Measured on a headless Linux box (omp v18.8.6 host, v18.8.9 in the image):
 
 | Question | Answer |
 | --- | --- |
@@ -138,10 +138,11 @@ worker sends
 4. Issues created this way are authored by `github-actions[bot]`, so the native
    `issues: opened` job's bot filter means they are never re-triaged.
 
-### Why this satisfies hard requirement 1 (no VPS access)
+### Why this satisfies hard requirement 1 (no host access)
 
-The agent runs on a **GitHub-hosted runner**, not on the VPS — the runner is a
-fresh VM that has never had access to VPS files, env, or credentials. On top of
+The agent runs on a **GitHub-hosted runner**, not on a personal machine — the
+runner is a fresh VM that has never had access to that machine's files, env, or
+credentials. On top of
 that, the agent is further confined to a container that:
 
 * mounts only the workspace checkout and the read-only `infra/triage` scripts,
@@ -246,10 +247,10 @@ than trusting the reporter's `[bug]`/`[feature]` marker.
 
 ## 5. Provisioning
 
-The credential is the OpenCode API key (`oc_…`). Source it from the VPS's omp
-store **or** from the OpenCode dashboard, and set it as a repository secret.
-Change to a dedicated key that can be rotated/revoked independently of the
-operator's own login.
+The credential is the OpenCode API key (`oc_…`). Source it from your local omp
+credential store (`omp token opencode-go`) **or** from the OpenCode dashboard,
+and set it as a repository secret. Use a dedicated key that can be
+rotated/revoked independently of a personal login.
 
 ```bash
 # Never echo the value; pipe straight from the source.
@@ -262,14 +263,13 @@ shred -u /tmp/opencode_cred
 #   TRIAGE_DISABLED is the kill switch; it is currently `false`.
 #   TRIAGE_ALLOWLIST is OPTIONAL and is currently UNSET (= every non-bot author
 #   is triaged, see §3). This line is the re-arm step, not the current state:
-gh variable set TRIAGE_ALLOWLIST --repo mordentplayer/mordent --body "sliced-paraiba"
+gh variable set TRIAGE_ALLOWLIST --repo mordentplayer/mordent --body "user1,user2"
 gh variable set TRIAGE_DISABLED  --repo mordentplayer/mordent --body "true"   # until ready
 ```
 
 The secret is **set**: `OPENCODE_CRED` was first populated on 2026-10-10 and
 replaced on 2026-10-11 with a **dedicated, budget-limited key** (separate and
-revocable rather than the operator's own login) — see *OpenCode key &
-rotation* below.
+revocable rather than a personal login) — see *OpenCode key & rotation* below.
 
 Of the two safety variables, only **`TRIAGE_DISABLED=false`** remains set.
 `TRIAGE_ALLOWLIST` was **deleted** to widen triage to every non-bot author
@@ -287,7 +287,7 @@ grants write, which is how the pre-switch run pushed to `triage-reports` with
 ### OpenCode key & rotation
 
 The model credential is the repository secret **`OPENCODE_CRED`**. It is a
-dedicated key for this pipeline — separate from the operator's own login,
+dedicated key for this pipeline — separate from a personal login,
 budget-limited on the OpenCode side, and inference-only.
 
 **What it may do.** Inside this repo the key is used for exactly one thing: as
@@ -344,7 +344,7 @@ and never as `github-actions[bot]`:
   `GITHUB_TOKEN` is still what checkout and artifact upload use;
 * `bin/publish.sh` sets the commit identity to
   `mordent-bot <340837187+mordent-bot@users.noreply.github.com>`;
-* the VPS keeps the same token at `~/.config/mordent-bot-token` (mode 0600).
+* store your own copy of the same token in a `0600` file outside the repo.
 
 The token is a fine-grained PAT on the `mordent-bot` account, which is a
 collaborator with **Write** access. It needs:
@@ -389,9 +389,9 @@ docker run --rm -e GW_URL=http://host.docker.internal:4000 -e GW_TOKEN="$GW_TOKE
   bash /triage/bin/sandbox-entrypoint.sh
 ```
 
-## 7. Local mirror on the VPS
+## 7. Local mirror
 
-The writeups also land in a directory on the ops box, so they are readable
+The writeups can also be mirrored to a local directory, so they are readable
 without opening GitHub:
 
 ```bash
@@ -405,10 +405,10 @@ contents. No worktree, no branch checkout, and the working copy of the repo is
 never touched. Overridable via `MORDENT_REPO`, `MORDENT_REMOTE`,
 `MORDENT_TRIAGE_DIR` and `TRIAGE_REPORT_BRANCH`.
 
-Cron (installed on the VPS; every 10 minutes):
+Cron example (every 10 minutes):
 
 ```cron
-*/10 * * * * /home/ubuntu/proj/apple-music-client2/scripts/sync-triage-reports.sh >/dev/null 2>&1
+*/10 * * * * /path/to/mordent/scripts/sync-triage-reports.sh >/dev/null 2>&1
 ```
 
 Because the script is silent on success, cron sends no mail unless something
@@ -420,7 +420,7 @@ active and the first run mirrored six files into `~/mordent-triage-reports/`.
 * **`omp auth-gateway` / `omp auth-broker` (the vendor mechanism).** `omp`
   ships a credential vault (`auth-broker`) and an HTTP forward proxy backed by
   it (`auth-gateway serve`). This is *functionally identical* to our gateway
-  and was verified working on the VPS: `omp auth-gateway serve --bind
+  and was verified working locally: `omp auth-gateway serve --bind
   127.0.0.1:14000` proxies `/v1/responses` to `opencode-go/…` with the
   credential injected, guarded by its own bearer
   (`~/.omp/auth-gateway.token`). We did not adopt it because getting the
@@ -431,18 +431,18 @@ active and the first run mirrored six files into `~/mordent-triage-reports/`.
 * **Put the credential in the sandbox and rely on prompt hardening.** Rejected:
   the model ingests everything it sees and ships it to the provider; an
   injected issue could simply print the key.
-* **VPS-sandbox fallback (fresh container per issue on this VPS, repo copy
-  mounted, credential inside).** *Not needed* — the Actions design above
-  satisfies both hard requirements by construction, which is why the user
-  prefers it. The fallback is only worth revisiting if GitHub-hosted runners
-  are unavailable; then the token may live inside the container because logs
-  and reports stay private, but the VPS would then be a single point of
+* **Self-hosted sandbox fallback (fresh container per issue on your own
+  machine, repo copy mounted, credential inside).** *Not needed* — the Actions
+  design above satisfies both hard requirements by construction, which is why
+  it is preferred. The fallback is only worth revisiting if GitHub-hosted
+  runners are unavailable; then the token may live inside the container because
+  logs and reports stay private, but your host would then be a single point of
   compromise and the report pipeline would have to be kept out of public logs.
 
 ## 9. Evidence
 
-All of the below was produced on the ops VPS with the credential taken from
-`omp token opencode-go --raw` and injected into the host-side gateway only.
+All of the below was produced on a headless Linux box with the credential taken
+from `omp token opencode-go --raw` and injected into the host-side gateway only.
 The repo analysed was an archive of `main` (public content, no `.git`).
 
 **(a) The gateway proxies the Responses API, streaming and not.**
@@ -529,7 +529,7 @@ gateway token files, and a filesystem-wide `grep -rEo 'oc_…' /`.
 **(g) Hosted-run verification (GitHub-hosted runner, 2026-10-10).**
 
 Live-fire on the real repo, with the allowlist then set to
-`TRIAGE_ALLOWLIST=sliced-paraiba` (it has since been deleted — see §3/§5) and
+`TRIAGE_ALLOWLIST=<your-login>` (it has since been deleted — see §3/§5) and
 `TRIAGE_DISABLED=false`:
 
 * Run 1 — https://github.com/mordentplayer/mordent/actions/runs/38081570781 —

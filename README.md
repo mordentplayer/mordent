@@ -555,7 +555,7 @@ walk, and eviction protects the current track plus everything up-next, so a
 long queued album never gets its near-term entries pruned. `cache_size_gb = 0`
 disables prefetch along with the cache.
 
-## Measured (VPS, download-throttled Apple CDN)
+## Measured (headless Linux box, download-throttled Apple CDN)
 
 | Metric | Value |
 |---|---|

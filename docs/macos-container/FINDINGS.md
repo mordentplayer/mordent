@@ -1,6 +1,7 @@
 # FINDINGS — running wrapper-lite in a container (friend's MacBook)
 
-Status: **container prototype VERIFIED end-to-end on x86-64 Linux** (this VPS).
+Status: **container prototype VERIFIED end-to-end on x86-64 Linux** (a headless
+box).
 macOS behaviour is **reasoned, not measured** — there is no Mac in this lab.
 
 ---
@@ -8,7 +9,7 @@ macOS behaviour is **reasoned, not measured** — there is no Mac in this lab.
 ## TL;DR / GO-NO-GO
 
 **GO — ship it, as a beta, for Apple Silicon Macs via Docker Desktop or OrbStack
-(amd64 emulation), with the owner's VPS kept as the zero-risk fallback.**
+(amd64 emulation), with a native Linux deployment kept as the zero-risk fallback.**
 
 * The FairPlay wrapper runs fully inside a plain (non-`--privileged`) container
   and serves the real API on loopback. Verified: `/status`, `/m3u8`, `/key`
@@ -110,7 +111,7 @@ Readings:
     container's `unshare()` privileged → works with the **distro default
     sysctl**. This is what `compose.yaml` ships.
   * **(B, dev-box hack)** `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
-    + no extra caps. Previously applied on this VPS; **now reverted to the
+    + no extra caps. Previously applied on the test box; **now reverted to the
     distro default (1)** because (A) makes it unnecessary.
 
 Note: `docker inspect --format '{{json .HostConfig.SecurityOpt}}'` does **not**
@@ -146,7 +147,7 @@ the extra opts here are what this Ubuntu 24.04 host actually needed.
 
 ---
 
-## 3. Verified results (all on this VPS, x86-64 Linux)
+## 3. Verified results (all on a headless x86-64 Linux box)
 
 ### 3a. Service
 
@@ -200,7 +201,7 @@ native-wrapper output.
 ```
 ▶ One More Time — Daft Punk [697195462]
 [play] source: CDN stream (ready in 476.4ms)
-ALSA lib ...: cannot find card '0'          # headless VPS has no sound card
+ALSA lib ...: cannot find card '0'          # headless box has no sound card
 ```
 i.e. the FairPlay key exchange + HLS manifest resolve in 476 ms through the
 container; playback only stops at the host's missing audio device (expected on

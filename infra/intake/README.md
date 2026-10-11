@@ -28,7 +28,7 @@ classification pass, which is the gate before anything becomes public.
 | **Public URL (canonical)** | **https://mordent.app/feedback** — a Worker route on the `mordent.app` zone (`pattern = "mordent.app/feedback*"`, see `wrangler.toml`); the apex root itself is the `mordent` static-assets Worker for `../../site/` |
 | Public URL (also live) | **https://mordent-intake.outline2319.workers.dev** — the workers.dev endpoint, kept working (`workers_dev = true`) |
 | KV namespace | `INTAKE_KV` → id `64e15885c1594c368e8367e67a9ae6a7` |
-| Secrets configured | `GH_TOKEN` — the org-scoped fine-grained PAT of the `mordent-bot` account (Issues: read and write + Contents: read and write), installed 2026-10-11; the value is never printed or committed and lives at `~/.config/intake-token` (mode 600) |
+| Secrets configured | `GH_TOKEN` — the org-scoped fine-grained PAT of the `mordent-bot` account (Issues: read and write + Contents: read and write), installed 2026-10-11; the value is never printed or committed (while installing it is held in a mode-`0600` file outside the repo — see *Token storage*) |
 | Delivery channel | `repository_dispatch`, event_type `web-submission`, `client_payload {type,title,body,contact}` — see [Delivery channel](#delivery-channel) |
 
 If the `GH_TOKEN` secret is ever removed (rotation window), `POST /` degrades to
@@ -221,16 +221,16 @@ dangling-blob write → `201`, and an intentionally invalid issue creation → `
 (**not** `403`, proving Issues write without creating anything). The dispatched
 workflow run's actor is therefore `mordent-bot`.
 
-Token storage (the reason this file exists locally at all):
+Token storage (why a local file is involved at all):
 
-| Path | Purpose |
+| File (mode `0600`, outside the repo) | Purpose |
 | --- | --- |
-| `~/.config/intake-token` | the value piped into `wrangler secret put GH_TOKEN`; keep absent when a swap is not in progress |
-| `~/.config/mordent-bot-token` | the canonical saved copy of the bot PAT |
+| `~/intake-token` | the value piped into `wrangler secret put GH_TOKEN`; keep absent when a swap is not in progress |
+| `~/mordent-bot-token` | the canonical saved copy of the bot PAT |
 
 Both are `chmod 600` and are never committed; the secret cannot be read back from
-Workers after upload. The earlier `mordent-intake-worker` PAT (resource owner
-`sliced-paraiba`) was used only until the org move and is no longer installed.
+Workers after upload. The earlier `mordent-intake-worker` PAT (resource owner: a
+personal account) was used only until the org move and is no longer installed.
 
 > **Do not reuse the `gh` CLI OAuth token** (`gho_…`) as the long-lived secret.
 > It is an OAuth-app token with broad `repo` scope, belongs to the whole CLI
@@ -254,7 +254,7 @@ Workers after upload. The earlier `mordent-intake-worker` PAT (resource owner
 
    ```sh
    cd infra/intake
-   wrangler secret put GH_TOKEN < ~/.config/intake-token
+   wrangler secret put GH_TOKEN < ~/intake-token
    ```
 
    Secrets are encrypted at rest and not readable again; only Workers can use them.
@@ -300,7 +300,7 @@ Live behaviour before the move:
 End to end against the live Worker and the public repo:
 
 - PAT checks: `GET /user`/`GET /repos/mordentplayer/mordent` → `200`; invalid issue creation → `422`; `POST /dispatches` → `403` before the Contents permission and `204` after it.
-- Org/bot token swap (the current configuration): the secret is now the **`mordent-bot` org-scoped PAT**. Verified on `mordentplayer/mordent`: `GET /user` → `mordent-bot`, repo read → `200` (`admin: true`), dispatch probe → `204`, dangling-blob write → `201`, invalid issue create → `422`. The earlier personal-account PAT (resource owner `sliced-paraiba`) could not dispatch against the org repo at all (`403` with `x-accepted-github-permissions: contents=write`) — a personal resource owner does not carry write permissions on an org-owned repository, which is the whole reason for the org token.
+- Org/bot token swap (the current configuration): the secret is now the **`mordent-bot` org-scoped PAT**. Verified on `mordentplayer/mordent`: `GET /user` → `mordent-bot`, repo read → `200` (`admin: true`), dispatch probe → `204`, dangling-blob write → `201`, invalid issue create → `422`. The earlier personal-account PAT (resource owner: a personal account) could not dispatch against the org repo at all (`403` with `x-accepted-github-permissions: contents=write`) — a personal resource owner does not carry write permissions on an org-owned repository, which is the whole reason for the org token.
 - Org-path dispatch smoke: a synthetic JSON `curl` submission → `200 {"ok":true}`; the Worker created **no** issue itself; the `repository_dispatch` run `38113659767` shows `actor = triggering_actor = mordent-bot`; its `web` job succeeded and filed issue #7 with the `from-web` label, the `[bug] ` prefix added by the workflow, and the analysis plus collapsed verbatim report. Because the workflow still uses its own `GITHUB_TOKEN` (wstriage's `MORDENT_BOT_TOKEN` switch is not on main yet), #7 was authored by `github-actions[bot]`, not by `mordent-bot`.
 - Cleanup: #7 was **deleted** (not closed) with the repository admin login via the GraphQL `deleteIssue` mutation — issue count back to `0` — while `triage-reports/issue-7.md` (`2660` bytes, sha `20be414f`) remains on the `triage-reports` branch.
 
