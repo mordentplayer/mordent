@@ -212,6 +212,9 @@ pub enum Command {
     /// Toggle the queue's shuffle state (a pure list op under the shared
     /// lock) and mirror the flag for snapshot/reporting.
     SetShuffle(bool),
+    /// Adopt a new streaming `quality` for every source opened from now on
+    /// (settings window). Already-cached tracks keep playing untouched.
+    SetQuality(crate::config::Quality),
     /// MPRIS Stop / queue-panel "clear": close the segment, clear the queue,
     /// drop the current track, cancel any in-flight source.
     StopAll,
@@ -240,6 +243,8 @@ trait Effects {
     fn spawn_worker(&mut self, generation: u64, track: Track, offset: Duration, keep: Vec<String>);
     /// Request one UI frame (state changed: new track, pause, advance…).
     fn wake_ui(&mut self);
+    /// Adopt a new streaming quality for the play worker's config.
+    fn set_quality(&mut self, quality: crate::config::Quality);
     /// Un-hide + focus the window (MPRIS Raise; also the trayless restore).
     fn show_window(&mut self);
     /// Non-fatal error for the UI toast.
@@ -789,6 +794,7 @@ impl Sup {
                     fx.wake_ui();
                 }
             }
+            Command::SetQuality(q) => fx.set_quality(q),
             Command::StopAll => {
                 let pos = self.report_pos_ms();
                 self.report_end(PlayEvent::END_SUSPENDED, pos);
@@ -1039,6 +1045,12 @@ impl Effects for RealFx {
         }
     }
 
+    fn set_quality(&mut self, quality: crate::config::Quality) {
+        // The play worker clones this config when it starts, so the next
+        // source opened (any track not already cache-complete) uses it.
+        self.cfg.quality = quality;
+    }
+
     fn show_window(&mut self) {
         // Visible first: Focus alone does not un-hide a tray-hidden window.
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1238,6 +1250,7 @@ mod tests {
         fn wake_ui(&mut self) {
             self.wakes += 1;
         }
+        fn set_quality(&mut self, _quality: crate::config::Quality) {}
         fn show_window(&mut self) {
             self.shows += 1;
         }

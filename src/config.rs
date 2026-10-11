@@ -23,6 +23,79 @@ pub struct Config {
     /// Check GitHub Releases for a newer Mordent version. At most one
     /// unauthenticated request per day; see `update.rs`.
     pub check_updates: bool,
+    /// Streaming quality: which HLS variant the player picks out of a track's
+    /// master manifest (see `stream::pick_variant`). Absent from older configs
+    /// → [`Quality::Lossless`], the behaviour every build before this key had.
+    pub quality: Quality,
+}
+
+/// Playback quality — which audio variant of a master manifest to stream.
+///
+/// The wrapper offers the same set for every track observed so far: ALAC
+/// lossless (44.1 kHz, 16- or 24-bit), AAC 256, AAC 128 and HE-AAC 64
+/// (see the README's "Playback quality" section). All three levels degrade
+/// gracefully when a variant is missing.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    /// ALAC when the track offers it, else the highest-bitrate AAC. Default —
+    /// this is what Mordent has always streamed.
+    #[default]
+    Lossless,
+    /// Highest-bitrate AAC variant (typically AAC 256): roughly a quarter of
+    /// the lossless bandwidth.
+    High,
+    /// Lowest-bitrate variant (typically HE-AAC 64): the smallest download,
+    /// for slow links or metered data.
+    DataSaver,
+}
+
+impl Quality {
+    /// The `quality` key's spelling in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lossless => "lossless",
+            Self::High => "high",
+            Self::DataSaver => "data_saver",
+        }
+    }
+
+    /// Parse a `quality` value; `None` when it is not one of the known names.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lossless" => Some(Self::Lossless),
+            "high" => Some(Self::High),
+            "data_saver" => Some(Self::DataSaver),
+            _ => None,
+        }
+    }
+
+    /// Human label for the settings window.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lossless => "Lossless (ALAC)",
+            Self::High => "High (AAC)",
+            Self::DataSaver => "Data saver (HE-AAC)",
+        }
+    }
+
+    /// One-line explanation shown under the radio group.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Lossless => "ALAC 44.1 kHz; falls back to AAC when a track has no lossless variant",
+            Self::High => "best AAC variant — much smaller than lossless",
+            Self::DataSaver => "lowest-bitrate variant — smallest downloads",
+        }
+    }
+
+    /// Every level, in settings-window order.
+    pub const ALL: [Quality; 3] = [Self::Lossless, Self::High, Self::DataSaver];
+}
+
+impl std::fmt::Display for Quality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl Default for Config {
@@ -35,6 +108,7 @@ impl Default for Config {
             report_plays: true,
             cache_size_gb: 10,
             check_updates: true,
+            quality: Quality::Lossless,
         }
     }
 }
@@ -241,18 +315,20 @@ fn default_toml(cfg: &Config) -> String {
          cache_dir = \"{}\"\n\
          report_plays = true\n\
          cache_size_gb = {}\n\
-         check_updates = true\n",
+         check_updates = true\n\
+         quality = \"{}\"\n",
         cfg.storefront,
         cfg.wrapper_url,
         cfg.cache_dir.display(),
-        cfg.cache_size_gb
+        cfg.cache_size_gb,
+        cfg.quality.as_str()
     )
 }
 
 /// Keys the wizard collects and (re)writes; every other key already present in
 /// the file is preserved verbatim, so a write never clobbers keys we did not
 /// collect (e.g. a hand-added comment-bearing option or a future key).
-const KNOWN_KEYS: [&str; 7] = [
+const KNOWN_KEYS: [&str; 8] = [
     "storefront",
     "wrapper_url",
     "media_user_token",
@@ -260,6 +336,7 @@ const KNOWN_KEYS: [&str; 7] = [
     "report_plays",
     "cache_size_gb",
     "check_updates",
+    "quality",
 ];
 
 /// Render a full `config.toml` body from `cfg`, merging over `existing` (parsed
@@ -287,6 +364,7 @@ pub fn merge_config_toml(existing: Option<&str>, cfg: &Config) -> Result<String>
     table.insert("report_plays".into(), cfg.report_plays.into());
     table.insert("cache_size_gb".into(), (cfg.cache_size_gb as i64).into());
     table.insert("check_updates".into(), cfg.check_updates.into());
+    table.insert("quality".into(), cfg.quality.as_str().into());
 
     let mut out = String::from(
         "# Mordent configuration — written by the setup wizard (`mordent setup`).\n\
@@ -421,6 +499,7 @@ mod wizard_write_tests {
             report_plays: false,
             cache_size_gb: 7,
             check_updates: false,
+            quality: Quality::High,
         }
     }
 
@@ -434,11 +513,28 @@ mod wizard_write_tests {
         assert!(text.contains("report_plays = false"));
         assert!(text.contains("cache_size_gb = 7"));
         assert!(text.contains("check_updates = false"));
+        assert!(text.contains("quality = \"high\""));
         // round-trips through the real parser
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.storefront, "de");
         assert_eq!(back.cache_size_gb, 7);
         assert!(!back.report_plays);
+        assert_eq!(back.quality, Quality::High);
+    }
+
+    #[test]
+    fn missing_quality_key_defaults_to_lossless() {
+        // A config written before `quality` existed must load unchanged and
+        // keep streaming lossless (the pre-key behaviour).
+        let old = "storefront = \"us\"\nwrapper_url = \"http://127.0.0.1:12340\"\n";
+        let cfg: Config = toml::from_str(old).unwrap();
+        assert_eq!(cfg.quality, Quality::Lossless);
+        assert_eq!(Quality::Lossless.as_str(), "lossless");
+        // Every level round-trips through the key spelling.
+        for q in Quality::ALL {
+            let text = format!("quality = \"{}\"\n", q.as_str());
+            assert_eq!(toml::from_str::<Config>(&text).unwrap().quality, q);
+        }
     }
 
     #[test]

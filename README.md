@@ -4,6 +4,9 @@
 
 [![CI](https://github.com/mordentplayer/mordent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mordentplayer/mordent/actions/workflows/ci.yml)
 
+**[mordent.app](https://mordent.app/)** — landing page, downloads and the
+anonymous [feedback form](https://mordent.app/feedback) (source: [`site/`](site/)).
+
 A lightweight native Apple Music client for Linux (Rust + egui). Goals:
 instant startup, minimal resource use, and going from wanting to listen to music -> song playing as fast as possible.
 
@@ -156,6 +159,7 @@ cargo build --release
    report_plays = true                    # report plays to Apple (Recently Played)
    cache_size_gb = 10                     # audio-cache budget; 0 disables
    check_updates = true                   # daily GitHub release check (see Updates)
+   quality = "lossless"                   # lossless | high | data_saver (see Playback quality)
    ```
 
 ### Running the wrapper on macOS (or a home server)
@@ -177,6 +181,11 @@ any time with:
 ```sh
 mordent setup
 ```
+
+…or from inside the player: **⚙ Settings → Setup → Run setup wizard**
+(`ctrl+,` opens Settings). That re-opens the same wizard with the current
+config as its starting values and returns to the player when it finishes —
+the first-run auto-open is unchanged.
 
 The wizard walks through:
 
@@ -275,6 +284,40 @@ wraps the pointer to the top), and a compact volume slider. The window title
 mirrors the playing track. Errors surface as a dismissible toast, empty states
 are explicit, and the pointer turns into a hand over clickable rows.
 
+### Settings (`ctrl+,`)
+
+The **⚙** button in the top bar (or `ctrl+,`) opens a **Settings** window with
+three sections:
+
+* **Setup** — *Run setup wizard* re-opens the guided first-run flow (install /
+  login / preferences) with the current config as its starting values; the
+  player returns when the wizard finishes. The wizard still opens
+  automatically on first launch when no config exists.
+* **Playback** — the streaming-quality selector (below).
+* **About** — this build's version and the same update checker the `?`
+  cheatsheet shows (*Check now*, the daily-check toggle, self-update and
+  helper-payload status).
+
+### Playback quality
+
+The wrapper offers the same variant set for every track: **ALAC lossless**
+(44.1 kHz, 16- or 24-bit), **AAC 256**, **AAC 128** and **HE-AAC 64**. The
+`quality` key (or **Settings → Playback**) picks which one is streamed:
+
+| `quality` | Pick | Notes |
+|---|---|---|
+| `lossless` (default) | ALAC when the track has it, else the best AAC | what Mordent has always streamed |
+| `high` | best AAC variant (AAC 256 where offered) | a fraction of the lossless bandwidth |
+| `data_saver` | smallest variant (HE-AAC 64) | for slow links / metered data |
+
+The pick is made when a track is streamed, and the choice is written to
+config.toml immediately (the prefetcher and the play worker adopt it without a
+restart). **Tracks already in the audio cache keep their stored quality** — the
+cache is keyed by track, not by variant, so changing quality neither
+re-downloads nor evicts anything; a cached track plays its original variant
+until its cache entry is evicted (or you delete its `audio/<id>/` directory).
+Configs written before this key existed load unchanged and stay lossless.
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -288,6 +331,7 @@ are explicit, and the pointer turns into a hand over clickable rows.
 | `/` or `ctrl+F` | focus search |
 | `ctrl+1` / `2` / `3` | switch to Search / Library / Favorites |
 | `ctrl+4` | switch to Playlists |
+| `ctrl+,` | settings window |
 | `esc` | close modal / panel |
 | `?` | shortcut cheatsheet overlay |
 | click progress bar | seek |
@@ -305,6 +349,9 @@ pre-seed the UI for headless screenshots (`albums` opens the Search tab's
 Albums sub-view); `MORDENT_DEMO_PLAYLIST=<n>` additionally
 opens the n-th library playlist (0-based) once the list loads, and
 `MORDENT_DEMO_LYRICS=1` opens the lyrics panel.
+`MORDENT_DEMO_SETTINGS=1` opens the settings window (headless screenshot hook);
+`=setup` re-enters the wizard and `=lossless|high|data_saver` applies a
+streaming quality through the same handler the window's radio uses.
 `MORDENT_DEMO_CLOSE=1` simulates a WM close request
 (`ViewportCommand::Close` → the same path as `✕`/niri's `Win+Q`) so the close
 policy is testable headlessly: alone it fires after a short delay (idle
@@ -520,7 +567,8 @@ failed check is silent. Set `check_updates = false` in
 the wizard's Preferences step) to switch it off entirely; *Check now* still
 works.
 
-**Where it shows up.** Press `?` in the player: the **updates** panel shows the
+**Where it shows up.** Press `?` in the player (the same panel is in **⚙
+Settings → About**): the **updates** panel shows the
 version you are running, the newest release, when the last check was, a *Check
 now* button, and — when one exists — a *Download & install* button. A newer
 release also adds one small `↓ <version>` hint to the player bar; open the panel
@@ -570,7 +618,8 @@ lyrics endpoint, decrypt-to-file, dense search-first UI with a Songs/Albums
 search sub-bar + album detail modal, library albums view with add-date/name
 sort, library playlists tab with playlist detail modal, persisted
 track favorites with a favorites tab, queue with reorder/shuffle, seekable
-player bar with shuffle/repeat, keyboard shortcuts.
+player bar with shuffle/repeat, keyboard shortcuts, a ⚙ settings window
+(setup-wizard re-entry, streaming-quality selector, about/updates).
 Next: animated word-synced lyrics
 view, wrapper auto-spawn from the app.
 

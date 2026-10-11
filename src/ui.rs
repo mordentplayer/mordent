@@ -22,7 +22,7 @@
 //! player.
 
 use crate::api::{AlbumHit, Api, LibraryPlaylist, PlayEvent, SearchResults, Track, META_TTL_LIBRARY};
-use crate::config::Config;
+use crate::config::{Config, Quality};
 use crate::fonts::FontChoice;
 use crate::lyrics::{self, LyricTimeline};
 use crate::mpris;
@@ -476,6 +476,9 @@ pub struct App {
     album_busy: Option<String>,
     album_modal: Option<AlbumModal>,
     cheatsheet: bool,
+    /// Settings window (gear button in the top bar / ctrl+,): setup re-entry,
+    /// playback quality and about+updates. A pure view toggle, never persisted.
+    show_settings: bool,
     /// Sleep timer deadline (pauses playback when it fires).
     sleep_at: Option<(std::time::Instant, std::time::Duration)>,
     /// MORDENT_SELFTEST=1: drive play_now/queue/auto-advance deterministically
@@ -718,6 +721,7 @@ impl App {
             album_busy: None,
             album_modal: None,
             cheatsheet: false,
+            show_settings: false,
             sleep_at: None,
             selftest: selftest.then(|| SelftestState {
                 stage: 0,
@@ -840,6 +844,21 @@ impl App {
         }
         if std::env::var("MORDENT_DEMO_QUEUE").is_ok() {
             app.show_queue = true;
+        }
+        // MORDENT_DEMO_SETTINGS=1 opens the settings window (headless screenshot
+        // hook); `=setup` re-enters the wizard, `=lossless|high|data_saver`
+        // replays the quality radio's own handler — through `set_quality`, the
+        // path the window's click takes.
+        if let Ok(v) = std::env::var("MORDENT_DEMO_SETTINGS") {
+            app.show_settings = true;
+            match v.trim() {
+                "setup" => app.start_setup_wizard(),
+                other => {
+                    if let Some(q) = Quality::parse(other) {
+                        app.set_quality(q);
+                    }
+                }
+            }
         }
         // MORDENT_DEMO_LYRICS=1: open the lyrics panel (headless screenshot hook;
         // pairs with MORDENT_DEMO_PLAY so the karaoke highlight has a position).
@@ -1627,6 +1646,96 @@ impl App {
         }
     }
 
+    /// Start (or re-start) the first-run wizard in-app: the same
+    /// `SetupState::new` + seed + one automatic update check the launch path
+    /// uses (see `App::new` and `ui::launch_setup`). Callers: the settings
+    /// window's button and the `MORDENT_DEMO_SETTINGS=setup` screenshot hook.
+    fn start_setup_wizard(&mut self) {
+        let mut wizard = crate::setup::SetupState::new(&self.cfg);
+        wizard.seed_update_cache(self.last_update_check, self.last_seen_tag.clone());
+        wizard.auto_check_updates();
+        self.setup = Some(wizard);
+        self.show_settings = false;
+        eprintln!("[settings] re-running the setup wizard");
+    }
+
+    /// The Settings window (gear button / ctrl+,): Setup (re-run the wizard),
+    /// Playback (streaming quality) and About (version + the update checker,
+    /// the very block the ? cheatsheet shows).
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        let theme = self.theme;
+        let mut open = self.show_settings;
+        let mut run_setup = false;
+        let mut quality = self.cfg.quality;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.strong(egui::RichText::new("Setup").size(15.0));
+                ui.label(
+                    "Mordent runs the setup wizard automatically on first launch \
+                     (no ~/.config/mordent/config.toml) — that first-run path is \
+                     unchanged. This re-runs it from the player.",
+                );
+                ui.add_space(4.0);
+                if ui.button("Run setup wizard").clicked() {
+                    run_setup = true;
+                }
+                ui.weak(
+                    "Install / login / preferences; the player returns when the wizard \
+                     finishes.",
+                );
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.strong(egui::RichText::new("Playback").size(15.0));
+                ui.label("Streaming quality");
+                for q in Quality::ALL {
+                    ui.radio_value(&mut quality, q, q.label())
+                        .on_hover_text(q.detail());
+                }
+                ui.weak(quality.detail());
+                ui.weak(
+                    "Applies to the next track streamed; tracks already in the audio \
+                     cache keep their stored quality.",
+                );
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.strong(egui::RichText::new("About").size(15.0));
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        self.updates_ui(ui, &theme);
+                    });
+            });
+        self.show_settings = open;
+        if run_setup {
+            self.start_setup_wizard();
+        }
+        if quality != self.cfg.quality {
+            self.set_quality(quality);
+        }
+    }
+
+    /// Adopt a new streaming quality: persist it, hand it to the prefetcher
+    /// (its worker holds a live config) and to the supervisor's play worker
+    /// (which clones the config per source), and log the change.
+    fn set_quality(&mut self, quality: Quality) {
+        self.cfg.quality = quality;
+        self.prefetch.set_quality(quality);
+        self.send(Command::SetQuality(quality));
+        match crate::config::write_config(&self.cfg) {
+            Ok(()) => eprintln!("[settings] quality = {quality} (saved)"),
+            Err(e) => {
+                eprintln!("[settings] quality = {quality} (could not save: {e:#})");
+                self.fail(format!("Could not save the quality setting: {e:#}"));
+            }
+        }
+    }
+
     /// Render the first-run wizard and act on its outcome. Called INSTEAD of
     /// the normal UI while `self.setup` is `Some` (see `update`).
     fn setup_screen(&mut self, ctx: &egui::Context) {
@@ -2121,9 +2230,15 @@ impl App {
                     self.close_album_modal();
                 } else if self.playlist_modal.is_some() {
                     self.close_playlist_modal();
+                } else if self.show_settings {
+                    self.show_settings = false;
                 } else if self.show_queue {
                     self.show_queue = false;
                 }
+            }
+            // Global, like Esc: works even while a text field has focus.
+            if i.modifiers.command && i.key_pressed(egui::Key::Comma) {
+                self.show_settings = !self.show_settings;
             }
             if typing {
                 return;
@@ -3076,6 +3191,13 @@ impl eframe::App for App {
                 if ui.small_button("?").clicked() {
                     self.cheatsheet = !self.cheatsheet;
                 }
+                if ui
+                    .small_button("⚙")
+                    .on_hover_text("Settings (ctrl+,)")
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
+                }
                 let sl = sleep_label(&self.sleep_at);
                 if hand(ui.small_button(egui::RichText::new(sl).size(11.0))).clicked() {
                     self.sleep_at = match &self.sleep_at {
@@ -3144,6 +3266,9 @@ impl eframe::App for App {
         }
         if self.cheatsheet {
             self.cheatsheet_ui(ctx);
+        }
+        if self.show_settings {
+            self.settings_ui(ctx);
         }
         self.toast_ui(ctx);
 
@@ -4352,6 +4477,7 @@ impl App {
                             ("/ or ctrl+F", "focus search"),
                             ("ctrl+1 / 2 / 3", "search / library / favorites"),
                             ("ctrl+4", "playlists"),
+                            ("ctrl+,", "settings"),
                             ("♥ / ♡", "toggle favorite on a row"),
                             ("esc", "close modal / panel"),
                             ("?", "this cheatsheet"),

@@ -33,7 +33,7 @@
 //! expiry also wakes the parked worker to retry (wrapper came back).
 
 use crate::acache::AudioCache;
-use crate::config::Config;
+use crate::config::{Config, Quality};
 use crate::queuemodel::Queue;
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
@@ -62,6 +62,10 @@ struct Scan {
 struct Sh {
     st: Mutex<Scan>,
     cv: Condvar,
+    /// The live config. Kept here (not copied into the worker thread) so a
+    /// quality change from the settings window applies to the next populate
+    /// without restarting the worker or the app.
+    cfg: Mutex<Config>,
 }
 
 /// Handle the UI and supervisor threads hold; cheap to clone (Arc inside),
@@ -81,15 +85,24 @@ impl Prefetcher {
         let sh = Arc::new(Sh {
             st: Mutex::new(Scan { up_next: Vec::new(), current: None, epoch: 0 }),
             cv: Condvar::new(),
+            cfg: Mutex::new(cfg.clone()),
         });
         if enabled {
-            let cfg = cfg.clone();
             let sh = Arc::clone(&sh);
             let _ = std::thread::Builder::new()
                 .name("mordent-prefetch".into())
-                .spawn(move || worker(cfg, sh));
+                .spawn(move || worker(sh));
         }
         Self { sh, enabled }
+    }
+
+    /// Adopt `quality` for every populate the worker starts from now on. The
+    /// UI calls this when the settings window changes the quality; a no-op
+    /// when the audio cache (and therefore the worker) is off.
+    pub fn set_quality(&self, quality: Quality) {
+        if self.enabled {
+            self.sh.cfg.lock().quality = quality;
+        }
     }
 
     /// Queue/pointer/playback changed: replace the up-next snapshot. The
@@ -115,8 +128,8 @@ struct InFlight {
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn worker(cfg: Config, sh: Arc<Sh>) {
-    let audio = AudioCache::new(&cfg);
+fn worker(sh: Arc<Sh>) {
+    let audio = AudioCache::new(&sh.cfg.lock());
     let mut consumed = 0u64; // epoch of the snapshot being walked
     let mut last_stamp = 0u64;
     let mut cooldown: HashMap<String, Instant> = HashMap::new();
@@ -179,7 +192,7 @@ fn worker(cfg: Config, sh: Arc<Sh>) {
             }
             audio.prune(&keep);
             let stamp = next_stamp(&mut last_stamp, crate::config::unix_now());
-            match crate::stream::populate_track(&cfg, id, stamp) {
+            match crate::stream::populate_track(&sh.cfg.lock(), id, stamp) {
                 Err(_) => {
                     // disabled cache / wrapper down / bad manifest — retry
                     // after the cooldown, silently (cache trouble must never

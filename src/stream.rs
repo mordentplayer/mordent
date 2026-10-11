@@ -3,7 +3,7 @@
 //! passthrough for unencrypted previews) into a disk-backed seekable source.
 
 use crate::acache;
-use crate::config::Config;
+use crate::config::{Config, Quality};
 use crate::fairplay;
 use crate::wrapper::Wrapper;
 use anyhow::{anyhow, bail, Context, Result};
@@ -33,12 +33,18 @@ fn resolve_relative(base: &str, url: &str) -> String {
     format!("{}/{}", &base[..end], url)
 }
 
-/// Highest-quality variant URL from a master manifest: prefer ALAC (highest
-/// sample rate), then AAC 256, then anything else.
-pub fn pick_variant(master: &str, base_url: &str) -> Result<String> {
+/// Pick a variant URL from a master manifest for `quality`.
+///
+/// Scoring keeps the historical ordering: ALAC variants outrank every AAC one,
+/// and AAC variants are ranked by BANDWIDTH. `quality` then selects from that
+/// ranking — [`Quality::Lossless`] the best ALAC (falling back to the best AAC
+/// when the track has none), [`Quality::High`] the best AAC, and
+/// [`Quality::DataSaver`] the smallest variant. Variants whose CODECS match
+/// nothing known are only used when nothing else exists.
+pub fn pick_variant(master: &str, base_url: &str, quality: Quality) -> Result<String> {
     let mut groups: HashMap<String, (u32, u8)> = HashMap::new(); // group-id → (sample rate, bitrate-ish)
-    let mut best: Option<(u64, String)> = None; // (score, url)
-    let mut pending_score = 0u64;
+    let mut variants: Vec<(u64, bool, String)> = Vec::new(); // (score, is_alac, url)
+    let mut pending: Option<(u64, bool)> = None;
 
     for line in master.lines() {
         let line = line.trim();
@@ -58,21 +64,41 @@ pub fn pick_variant(master: &str, base_url: &str) -> Result<String> {
                 .unwrap_or(0);
             let audio = attr(rest, "AUDIO").unwrap_or_default();
             let (rate, _) = groups.get(&audio).copied().unwrap_or((0, 0));
-            pending_score = if codecs.contains("alac") {
-                1_000_000_000 + rate as u64
-            } else if codecs.contains("mp4a.40.2") {
-                bandwidth.min(1_000_000)
+            pending = Some(if codecs.contains("alac") {
+                (1_000_000_000 + rate as u64, true)
+            } else if codecs.contains("mp4a.") {
+                (bandwidth.min(1_000_000), false)
             } else {
-                0
-            };
+                (0, false)
+            });
         } else if !line.is_empty()
             && !line.starts_with('#')
-            && best.as_ref().is_none_or(|(s, _)| pending_score > *s)
+            && let Some((score, alac)) = pending.take()
         {
-            best = Some((pending_score, resolve_relative(base_url, line)));
+            variants.push((score, alac, resolve_relative(base_url, line)));
         }
     }
-    best.take().map(|(_, u)| u).ok_or_else(|| anyhow!("no variants in master manifest"))
+    // Known-codec variants first; an all-unknown manifest still resolves.
+    let mut pool: Vec<&(u64, bool, String)> =
+        variants.iter().filter(|(s, _, _)| *s > 0).collect();
+    if pool.is_empty() {
+        pool = variants.iter().collect();
+    }
+    let pick = match quality {
+        Quality::Lossless => pool
+            .iter()
+            .filter(|(_, alac, _)| *alac)
+            .max_by_key(|(s, _, _)| *s)
+            .or_else(|| pool.iter().max_by_key(|(s, _, _)| *s)),
+        Quality::High => pool
+            .iter()
+            .filter(|(_, alac, _)| !*alac)
+            .max_by_key(|(s, _, _)| *s)
+            .or_else(|| pool.iter().max_by_key(|(s, _, _)| *s)),
+        Quality::DataSaver => pool.iter().min_by_key(|(s, _, _)| *s),
+    };
+    pick.map(|(_, _, u)| u.clone())
+        .ok_or_else(|| anyhow!("no variants in master manifest"))
 }
 
 fn attr(line: &str, name: &str) -> Option<String> {
@@ -97,12 +123,21 @@ pub fn plan_of(m: &Manifests) -> Result<MediaPlan> {
 }
 
 /// Fetch the manifest for a track and reduce it to a [`MediaPlan`].
+///
+/// Uses [`Quality::Lossless`] (the pre-`quality`-key behaviour); the player
+/// path carries the configured quality through [`open_track`].
 pub fn plan_for_track(wrapper: &Wrapper, agent: &ureq::Agent, adam_id: &str) -> Result<MediaPlan> {
-    plan_of(&fetch_manifests(wrapper, agent, adam_id)?)
+    plan_of(&fetch_manifests(wrapper, agent, adam_id, Quality::Lossless)?)
 }
 
-/// Fetch master + variant manifests from the CDN (via the wrapper URL).
-pub fn fetch_manifests(wrapper: &Wrapper, agent: &ureq::Agent, adam_id: &str) -> Result<Manifests> {
+/// Fetch master + variant manifests from the CDN (via the wrapper URL),
+/// picking the variant for `quality`.
+pub fn fetch_manifests(
+    wrapper: &Wrapper,
+    agent: &ureq::Agent,
+    adam_id: &str,
+    quality: Quality,
+) -> Result<Manifests> {
     let manifest_url = wrapper.m3u8_url(adam_id)?;
     let text = fetch_text(agent, &manifest_url)?;
     if !text.contains("#EXT-X-STREAM-INF") {
@@ -113,10 +148,11 @@ pub fn fetch_manifests(wrapper: &Wrapper, agent: &ureq::Agent, adam_id: &str) ->
             media: text,
         });
     }
-    let media_url = pick_variant(&text, &manifest_url)?;
+    let media_url = pick_variant(&text, &manifest_url, quality)?;
     if media_url == manifest_url {
         bail!("variant resolution failed");
     }
+    eprintln!("[stream] quality={quality} variant: {media_url}");
     let media = fetch_text(agent, &media_url)?;
     Ok(Manifests {
         master: Some(text),
@@ -811,7 +847,7 @@ fn open_track_inner(
 
     let w = Wrapper::new(&cfg.wrapper_url);
     if w.regions().map(|r| !r.is_empty()).unwrap_or(false) {
-        let src = start_miss(&w, agent, adam_id, populate, Some(playback_file))?;
+        let src = start_miss(&w, agent, adam_id, cfg.quality, populate, Some(playback_file))?;
         return Ok((src, SourceMode::Stream));
     }
     let url = crate::api::Api::new(cfg.clone())?.preview_url(adam_id)?;
@@ -819,18 +855,20 @@ fn open_track_inner(
     Ok((src, SourceMode::Preview))
 }
 
-/// A cache miss: plan the track via the wrapper and start the CDN fetch,
-/// teeing raw ENCRYPTED bytes into `populate` when set. `playback` decides
-/// where the decrypted output goes — the transient seekable playback
-/// buffer (a path), or an anonymous discard file (`None`: populate-only).
+/// A cache miss: plan the track via the wrapper (`quality` selects the
+/// variant) and start the CDN fetch, teeing raw ENCRYPTED bytes into
+/// `populate` when set. `playback` decides where the decrypted output goes —
+/// the transient seekable playback buffer (a path), or an anonymous discard
+/// file (`None`: populate-only).
 fn start_miss(
     w: &Wrapper,
     agent: ureq::Agent,
     adam_id: &str,
+    quality: Quality,
     populate: Option<acache::Populate>,
     playback: Option<PathBuf>,
 ) -> Result<ProgressiveSource> {
-    let m = fetch_manifests(w, &agent, adam_id)?;
+    let m = fetch_manifests(w, &agent, adam_id, quality)?;
     if let Some(p) = &populate {
         acache::store_manifests(&p.dir, m.master.as_deref(), &m.media);
     }
@@ -865,7 +903,7 @@ pub fn populate_track(cfg: &Config, adam_id: &str, last_played: u64) -> Result<P
     if !w.regions().map(|r| !r.is_empty()).unwrap_or(false) {
         bail!("wrapper has no regions — nothing cacheable to fetch");
     }
-    start_miss(&w, ureq::AgentBuilder::new().build(), adam_id, Some(populate), None)
+    start_miss(&w, ureq::AgentBuilder::new().build(), adam_id, cfg.quality, Some(populate), None)
 }
 
 /// Read one top-level box: `(head, payload, exact header bytes as read)`
@@ -972,5 +1010,82 @@ impl symphonia::core::io::MediaSource for ProgressiveSource {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    /// The variant set the wrapper serves for every track observed so far
+    /// (ALAC + AAC 256/128 + HE-AAC 64), as relative URIs.
+    const MASTER: &str = "\
+#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a256\",AUTOSELECT=YES,NAME=\"songEnhanced\"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aalac\",AUTOSELECT=YES,NAME=\"songEnhanced\",SAMPLE-RATE=44100,BIT-DEPTH=24
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a128\",AUTOSELECT=YES,NAME=\"songEnhanced\"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a64\",AUTOSELECT=YES,NAME=\"songEnhanced\"
+#EXT-X-STREAM-INF:BANDWIDTH=270699,CODECS=\"mp4a.40.2\",AUDIO=\"a256\"
+v256.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1808512,CODECS=\"alac\",AUDIO=\"aalac\"
+valac.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=134985,CODECS=\"mp4a.40.2\",AUDIO=\"a128\"
+v128.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=77899,CODECS=\"mp4a.40.5\",AUDIO=\"a64\"
+v64.m3u8
+";
+    const BASE: &str = "https://cdn.example/x/master.m3u8";
+
+    fn pick(master: &str, q: Quality) -> String {
+        pick_variant(master, BASE, q).unwrap()
+    }
+
+    #[test]
+    fn each_quality_picks_its_own_variant() {
+        assert_eq!(pick(MASTER, Quality::Lossless), "https://cdn.example/x/valac.m3u8");
+        assert_eq!(pick(MASTER, Quality::High), "https://cdn.example/x/v256.m3u8");
+        assert_eq!(pick(MASTER, Quality::DataSaver), "https://cdn.example/x/v64.m3u8");
+    }
+
+    #[test]
+    fn lossless_falls_back_to_aac_without_alac() {
+        let no_alac = MASTER
+            .lines()
+            .filter(|l| !l.contains("alac") && !l.contains("valac"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(pick(&no_alac, Quality::Lossless), "https://cdn.example/x/v256.m3u8");
+        assert_eq!(pick(&no_alac, Quality::High), "https://cdn.example/x/v256.m3u8");
+        assert_eq!(pick(&no_alac, Quality::DataSaver), "https://cdn.example/x/v64.m3u8");
+    }
+
+    #[test]
+    fn absolute_variant_urls_are_kept() {
+        let abs = "#EXTM3U\n\
+                   #EXT-X-STREAM-INF:BANDWIDTH=100,CODECS=\"alac\"\n\
+                   https://other.example/audio.m3u8\n";
+        assert_eq!(pick(abs, Quality::Lossless), "https://other.example/audio.m3u8");
+    }
+
+    #[test]
+    fn empty_manifest_is_an_error() {
+        assert!(pick_variant("#EXTM3U\n", BASE, Quality::Lossless).is_err());
+    }
+
+    /// The lossless pick must not drift from the historical behaviour: best
+    /// ALAC by sample rate, never an AAC variant when ALAC exists.
+    #[test]
+    fn lossless_ignores_aac_even_when_aac_has_more_bandwidth() {
+        let master = "\
+#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"hi\",NAME=\"h\"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"l\",NAME=\"l\",SAMPLE-RATE=192000
+#EXT-X-STREAM-INF:BANDWIDTH=990000,CODECS=\"mp4a.40.2\",AUDIO=\"hi\"
+aac.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,CODECS=\"alac\",AUDIO=\"l\"
+alac192.m3u8
+";
+        assert_eq!(pick(master, Quality::Lossless), "https://cdn.example/x/alac192.m3u8");
+        assert_eq!(pick(master, Quality::High), "https://cdn.example/x/aac.m3u8");
     }
 }
