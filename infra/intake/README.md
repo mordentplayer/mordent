@@ -27,7 +27,7 @@ classification pass, which is the gate before anything becomes public.
 | Worker name | `mordent-intake` |
 | **Public URL** | **https://mordent-intake.outline2319.workers.dev** |
 | KV namespace | `INTAKE_KV` → id `64e15885c1594c368e8367e67a9ae6a7` |
-| Secrets configured | `GH_TOKEN` — fine-grained PAT (Issues: read and write + Contents: read and write), installed 2026-10-11; the value is never printed or committed |
+| Secrets configured | `GH_TOKEN` — the org-scoped fine-grained PAT of the `mordent-bot` account (Issues: read and write + Contents: read and write), installed 2026-10-11; the value is never printed or committed and lives at `~/.config/intake-token` (mode 600) |
 | Delivery channel | `repository_dispatch`, event_type `web-submission`, `client_payload {type,title,body,contact}` — see [Delivery channel](#delivery-channel) |
 
 If the `GH_TOKEN` secret is ever removed (rotation window), `POST /` degrades to
@@ -185,38 +185,53 @@ wrangler tail mordent-intake
 Local `wrangler dev` uses its own state directory (`.wrangler/state`, git-ignored)
 and never touches the production KV namespace.
 
-### 3. The fine-grained PAT (`GH_TOKEN`)
+### 3. The fine-grained PAT (`GH_TOKEN`) — now `mordent-bot`'s org token
 
-**Status: installed 2026-10-11** as the Worker secret `GH_TOKEN`, named
-`mordent-intake-worker`, scoped to the single repository `mordentplayer/mordent`
-with **Issues: read and write** and, since the channel switched to
-`repository_dispatch`, also **Contents: read and write**. Verified:
-`GET /user` → `sliced-paraiba`, `GET /repos/mordentplayer/mordent` → `200`, a
-deliberately invalid issue creation returning `422 Validation Failed` (not `403`,
-proving Issues write without creating anything), and the dispatch endpoint
-returning `204` (`403 … contents=write` before the Contents permission was
-granted). The steps below are the record for rotation.
+**Status: installed 2026-10-11** as the Worker secret `GH_TOKEN`. This is now the
+**org-scoped fine-grained PAT of the `mordent-bot` account**: resource owner
+`mordentplayer` (the organisation — a personal-account token cannot carry
+permissions on an org-owned repository), repository access limited to
+`mordentplayer/mordent`, with **Issues: Read and write** and **Contents: Read and
+write**. Verified: `GET /user` → `mordent-bot`, `GET /repos/mordentplayer/mordent`
+→ `200` (`admin: true` as the bot is an org owner), dispatch probe → `204`, a
+dangling-blob write → `201`, and an intentionally invalid issue creation → `422`
+(**not** `403`, proving Issues write without creating anything). The dispatched
+workflow run's actor is therefore `mordent-bot`.
+
+Token storage (the reason this file exists locally at all):
+
+| Path | Purpose |
+| --- | --- |
+| `~/.config/intake-token` | the value piped into `wrangler secret put GH_TOKEN`; keep absent when a swap is not in progress |
+| `~/.config/mordent-bot-token` | the canonical saved copy of the bot PAT |
+
+Both are `chmod 600` and are never committed; the secret cannot be read back from
+Workers after upload. The earlier `mordent-intake-worker` PAT (resource owner
+`sliced-paraiba`) was used only until the org move and is no longer installed.
 
 > **Do not reuse the `gh` CLI OAuth token** (`gho_…`) as the long-lived secret.
 > It is an OAuth-app token with broad `repo` scope, belongs to the whole CLI
 > session, and cannot be scoped to a single repository or revoked independently
-> of your CLI login.
+> of your CLI login. Likewise, an org owner's admin rights do not help: a
+> fine-grained PAT is gated by its own permission set and its resource owner.
 
 1. Open <https://github.com/settings/personal-access-tokens/new> (fine-grained tokens).
-2. **Token name**: `mordent-intake-worker`.
-3. **Resource owner**: `sliced-paraiba`.
+2. **Token name**: e.g. `mordent-bot-intake-worker`.
+3. **Resource owner**: **`mordentplayer`** (the organisation, not a user).
 4. **Repository access**: *Only select repositories* → `mordent`.
 5. **Permissions** → *Repository permissions* → **Issues: Read and write** and
    **Contents: Read and write** (`Metadata: Read-only` is added automatically;
-   nothing else is needed).
+   nothing else is needed). The organisation must permit fine-grained PATs
+   (Org settings → Personal access tokens).
 6. **Expiration**: pick a sensible window (e.g. 90 days) and put a reminder in your
    calendar to rotate the secret.
 7. **Generate token** and copy the `github_pat_…` value.
-8. Store it as a Worker secret (paste when prompted):
+8. Store it as a Worker secret (never paste it into a shell history line; pipe it
+   from the 0600 file):
 
    ```sh
    cd infra/intake
-   wrangler secret put GH_TOKEN
+   wrangler secret put GH_TOKEN < ~/.config/intake-token
    ```
 
    Secrets are encrypted at rest and not readable again; only Workers can use them.
@@ -256,10 +271,16 @@ against the deployed Worker:
 End to end against the live Worker and the public repo:
 
 - PAT checks: `GET /user`/`GET /repos/mordentplayer/mordent` → `200`; invalid issue creation → `422`; `POST /dispatches` → `403` before the Contents permission and `204` after it.
-- Dispatch smoke: a synthetic JSON `curl` submission → `200 {"ok":true}`; the Worker created **no** issue itself, the `repository_dispatch` run [38111262415](https://github.com/mordentplayer/mordent/actions/runs/38111262415) ran the `web` job to success, and issue [#6](https://github.com/mordentplayer/mordent/issues/6) was filed by `github-actions[bot]` with the `from-web` label, the classification/analysis body and the original report in a collapsed `Original report (verbatim)` block plus the `contact (unverified):` line. The test issue was then closed. (The spam pass ran as part of that job and cleared it as not spam.)
+- Org/bot token swap (the current configuration): the secret is now the **`mordent-bot` org-scoped PAT**. Verified on `mordentplayer/mordent`: `GET /user` → `mordent-bot`, repo read → `200` (`admin: true`), dispatch probe → `204`, dangling-blob write → `201`, invalid issue create → `422`. The earlier personal-account PAT (resource owner `sliced-paraiba`) could not dispatch against the org repo at all (`403` with `x-accepted-github-permissions: contents=write`) — a personal resource owner does not carry write permissions on an org-owned repository, which is the whole reason for the org token.
+- Org-path dispatch smoke: a synthetic JSON `curl` submission → `200 {"ok":true}`; the Worker created **no** issue itself; the `repository_dispatch` run `38113659767` shows `actor = triggering_actor = mordent-bot`; its `web` job succeeded and filed issue #7 with the `from-web` label, the `[bug] ` prefix added by the workflow, and the analysis plus collapsed verbatim report. Because the workflow still uses its own `GITHUB_TOKEN` (wstriage's `MORDENT_BOT_TOKEN` switch is not on main yet), #7 was authored by `github-actions[bot]`, not by `mordent-bot`.
+- Cleanup: #7 was **deleted** (not closed) with the repository admin login via the GraphQL `deleteIssue` mutation — issue count back to `0` — while `triage-reports/issue-7.md` (`2660` bytes, sha `20be414f`) remains on the `triage-reports` branch.
+
+<!-- previous run, kept for history -->
+- Dispatch smoke (pre-org-move): a synthetic JSON `curl` submission → `200 {"ok":true}`; the Worker created **no** issue itself, the `repository_dispatch` run [38111262415](https://github.com/mordentplayer/mordent/actions/runs/38111262415) ran the `web` job to success, and issue [#6](https://github.com/mordentplayer/mordent/issues/6) was filed by `github-actions[bot]` with the `from-web` label, the classification/analysis body and the original report in a collapsed `Original report (verbatim)` block plus the `contact (unverified):` line. (The spam pass ran as part of that job and cleared it as not spam.)
 - Earlier, the direct-issue era was verified the same way: issue #3 → `Issue triage` run `38110549687` → report `triage-reports/issue-3.md`; that path has since been removed.
 - Honeypot re-checked on the live endpoint: `200 {ok:true}` and no issue created.
 - Confirmed the endpoint ships no attestation/CAPTCHA integration: the Cloudflare account's challenge-widget list is empty and there is no such verification code or secret in this directory — a browser challenge was considered and deliberately rejected to keep the endpoint scriptable.
 
-Not exercised: a spam-verdict dispatch (the `web` job's spam branch) — it is the
-workflow's own path, and deliberately producing spam submissions was left alone.
+Not exercised here: a spam-verdict dispatch — the `web` job's spam branch is the
+triage pipeline's own path (it has since produced `triage-reports/spam-*.md`), and
+deliberately sending spam through the public endpoint was left alone.
