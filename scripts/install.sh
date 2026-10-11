@@ -184,6 +184,13 @@ done
 [[ -d "$SRC/scripts" && -f "$SRC/scripts/install-wrapper.sh" ]] ||
   die "archive is missing scripts/install-wrapper.sh (the setup wizard needs it)"
 
+# Defensive: published tarballs have shipped rootfs/system/bin/{lite,linker64}
+# without the executable bit (tar preserves whatever the CI checkout had), and
+# the chroot execs /system/bin/lite. Best-effort and silent.
+if [[ -d "$SRC/rootfs/system/bin" ]]; then
+  chmod +x "$SRC"/rootfs/system/bin/* 2>/dev/null || true
+fi
+
 mkdir -p "$PREFIX/share"
 STAGE="$PREFIX/share/.mordent-stage.$$"
 OLD="$PREFIX/share/.mordent-old.$$"

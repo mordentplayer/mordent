@@ -125,6 +125,49 @@ install -m 0755 "$SRC/wrapper-lite" "$PREFIX/wrapper-lite"
 install -d -m 0755 "$PREFIX/rootfs"
 cp -a "$SRC/rootfs/." "$PREFIX/rootfs/"
 
+# Defensive: the shipped payload has carried the Android-layer binaries without
+# the executable bit (tar preserves the CI checkout's modes) and the chroot
+# execs /system/bin/lite. Best-effort and silent.
+if [[ -d "$PREFIX/rootfs/system/bin" ]]; then
+  chmod +x "$PREFIX"/rootfs/system/bin/* 2>/dev/null || true
+fi
+
+# Identity of the payload just installed. The app compares this against the
+# payload bundled with it to answer "is the installed helper this build's
+# helper?" (wrapper-lite has no --version; /status reports only regions).
+#
+# Keep this definition in sync with `payload_manifest` in src/update.rs (a
+# linux unit test cross-checks the two on a fixture tree): the identity is the
+# SHA-256 of the manifest text "<sha256 of file>  <path>\n", one line per
+# payload file in plain bytewise path order. rootfs/data (Apple login state),
+# rootfs/dev and rootfs/proc (mount points) are not payload.
+payload_id() {
+  local dir="$1"
+  (
+    cd "$dir" || exit 1
+    { [ -f wrapper-lite ] && printf 'wrapper-lite\0'; find rootfs/system -type f -print0; } |
+      LC_ALL=C sort -z |
+      xargs -0 -r sha256sum |
+      sha256sum |
+      awk '{print $1}'
+  )
+}
+
+# The bundle may already carry the identity (release bundles do); compute it
+# otherwise so a hand-run install from an older/extracted tree still records
+# one.
+if [[ -s "$SRC/payload-version" ]]; then
+  install -m 0644 "$SRC/payload-version" "$PREFIX/payload-version"
+else
+  if id=$(payload_id "$SRC"); then
+    printf '%s\n' "$id" >"$PREFIX/payload-version"
+    chmod 0644 "$PREFIX/payload-version"
+  else
+    log "warning: could not compute the payload identity; the app will report it as unknown"
+    rm -f "$PREFIX/payload-version"
+  fi
+fi
+
 # Render the unit with the requested port.
 sed "s|--port 12340|--port ${PORT}|" "$UNIT_SRC" >"$SERVICE_FILE"
 chmod 0644 "$SERVICE_FILE"

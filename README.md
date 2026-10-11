@@ -575,3 +575,6 @@ view, wrapper auto-spawn from the app.
 ## License
 
 Apache License 2.0 — see [`LICENSE`](LICENSE).
+
+Mordent is an independent project. Apple, Apple Music and MusicKit are
+trademarks of Apple Inc. Not affiliated with or endorsed by Apple.
