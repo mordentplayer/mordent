@@ -259,6 +259,9 @@ gh secret set OPENCODE_CRED --repo mordentplayer/mordent < /tmp/opencode_cred
 shred -u /tmp/opencode_cred
 
 # Safety switches:
+#   TRIAGE_DISABLED is the kill switch; it is currently `false`.
+#   TRIAGE_ALLOWLIST is OPTIONAL and is currently UNSET (= every non-bot author
+#   is triaged, see §3). This line is the re-arm step, not the current state:
 gh variable set TRIAGE_ALLOWLIST --repo mordentplayer/mordent --body "sliced-paraiba"
 gh variable set TRIAGE_DISABLED  --repo mordentplayer/mordent --body "true"   # until ready
 ```
@@ -266,8 +269,12 @@ gh variable set TRIAGE_DISABLED  --repo mordentplayer/mordent --body "true"   # 
 The secret is **set**: `OPENCODE_CRED` was first populated on 2026-10-10 and
 replaced on 2026-10-11 with a **dedicated, budget-limited key** (separate and
 revocable rather than the operator's own login) — see *OpenCode key &
-rotation* below. Both variables exist; `TRIAGE_ALLOWLIST=sliced-paraiba`,
-`TRIAGE_DISABLED=false`.
+rotation* below.
+
+Of the two safety variables, only **`TRIAGE_DISABLED=false`** remains set.
+`TRIAGE_ALLOWLIST` was **deleted** to widen triage to every non-bot author
+(GitHub rejects an empty value, so deleting is how you express "no
+allowlist"); §3 has the re-arm one-liner.
 
 The `mordentplayer` org **disables write-by-default workflow permissions**, so
 the repository default is `read` and cannot be raised (the API answers
@@ -521,7 +528,8 @@ gateway token files, and a filesystem-wide `grep -rEo 'oc_…' /`.
 
 **(g) Hosted-run verification (GitHub-hosted runner, 2026-10-10).**
 
-Live-fire on the real repo, with `TRIAGE_ALLOWLIST=sliced-paraiba` and
+Live-fire on the real repo, with the allowlist then set to
+`TRIAGE_ALLOWLIST=sliced-paraiba` (it has since been deleted — see §3/§5) and
 `TRIAGE_DISABLED=false`:
 
 * Run 1 — https://github.com/mordentplayer/mordent/actions/runs/38081570781 —
