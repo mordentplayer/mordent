@@ -20,6 +20,9 @@ pub struct Config {
     /// oldest-last-played first. 0 disables the audio cache (the metadata
     /// cache is unaffected and TTL-cleaned on startup).
     pub cache_size_gb: u64,
+    /// Check GitHub Releases for a newer Mordent version. At most one
+    /// unauthenticated request per day; see `update.rs`.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -31,6 +34,7 @@ impl Default for Config {
             cache_dir: default_cache_dir(),
             report_plays: true,
             cache_size_gb: 10,
+            check_updates: true,
         }
     }
 }
@@ -236,7 +240,8 @@ fn default_toml(cfg: &Config) -> String {
          media_user_token = \"\"\n\
          cache_dir = \"{}\"\n\
          report_plays = true\n\
-         cache_size_gb = {}\n",
+         cache_size_gb = {}\n\
+         check_updates = true\n",
         cfg.storefront,
         cfg.wrapper_url,
         cfg.cache_dir.display(),
@@ -247,13 +252,14 @@ fn default_toml(cfg: &Config) -> String {
 /// Keys the wizard collects and (re)writes; every other key already present in
 /// the file is preserved verbatim, so a write never clobbers keys we did not
 /// collect (e.g. a hand-added comment-bearing option or a future key).
-const KNOWN_KEYS: [&str; 6] = [
+const KNOWN_KEYS: [&str; 7] = [
     "storefront",
     "wrapper_url",
     "media_user_token",
     "cache_dir",
     "report_plays",
     "cache_size_gb",
+    "check_updates",
 ];
 
 /// Render a full `config.toml` body from `cfg`, merging over `existing` (parsed
@@ -280,6 +286,7 @@ pub fn merge_config_toml(existing: Option<&str>, cfg: &Config) -> Result<String>
     );
     table.insert("report_plays".into(), cfg.report_plays.into());
     table.insert("cache_size_gb".into(), (cfg.cache_size_gb as i64).into());
+    table.insert("check_updates".into(), cfg.check_updates.into());
 
     let mut out = String::from(
         "# Mordent configuration — written by the setup wizard (`mordent setup`).\n\
@@ -413,6 +420,7 @@ mod wizard_write_tests {
             cache_dir: PathBuf::from("/tmp/mordent-cache"),
             report_plays: false,
             cache_size_gb: 7,
+            check_updates: false,
         }
     }
 
@@ -425,6 +433,7 @@ mod wizard_write_tests {
         assert!(text.contains("cache_dir = \"/tmp/mordent-cache\""));
         assert!(text.contains("report_plays = false"));
         assert!(text.contains("cache_size_gb = 7"));
+        assert!(text.contains("check_updates = false"));
         // round-trips through the real parser
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.storefront, "de");

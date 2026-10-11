@@ -29,6 +29,7 @@ use crate::mpris;
 use crate::prefetch::Prefetcher;
 use crate::supervisor::{self, Command, PbSnapshot};
 use crate::theme::Theme;
+use crate::update::{self, Check};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -69,6 +70,35 @@ enum Msg {
         song: String,
         result: Result<lyrics::Fetched, String>,
     },
+    /// Update check finished, with the newer release's parsed `SHA256SUMS`
+    /// (already fetched, so the self-updater needs no second API call).
+    Update(Box<Check>, Option<Vec<(String, String)>>),
+    /// One line of the running update download's log.
+    UpdateLog(String),
+    /// A self-update finished downloading + verifying + staging.
+    Staged(Result<Box<update::Pending>, String>),
+    /// A download for a platform that cannot swap its own files: `(tag, dir)`.
+    Downloaded(Result<Box<(String, std::path::PathBuf)>, String>),
+    /// Installed-vs-bundled helper payload comparison, tagged with the memo key
+    /// it describes.
+    HelperState(Box<update::HelperCheck>, String),
+    /// Progress from the pkexec helper reinstall.
+    Helper(update::HelperEvent),
+}
+
+/// A helper ("wrapper-lite" payload) reinstall driven from the ? panel: its
+/// log lines and, once the pkexec child exits, its result.
+struct HelperInstall {
+    log: Vec<String>,
+    done: Option<Result<(), String>>,
+}
+
+/// What the update panel last started: a staged self-update, or a verified
+/// download for a platform that installs by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateJob {
+    Stage,
+    Download,
 }
 
 /// Lyrics panel state for the current track (`/lyrics` is a wrapper endpoint,
@@ -255,6 +285,17 @@ struct UiState {
     repeat: Option<String>,
     /// Favorited track ids, sorted for a stable file (in memory it is a set).
     favorites: Option<Vec<String>>,
+    /// Unix seconds of the last update check (the 24 h gate, see `update.rs`).
+    last_update_check: Option<u64>,
+    /// Release tag the last check saw.
+    last_seen_tag: Option<String>,
+    /// Tag whose player-bar "newer version" hint the user dismissed (stored by
+    /// tag, so a *later* release shows the hint again).
+    update_notice_dismissed: Option<String>,
+    /// Memoised identity of this build's bundled helper payload, and what it
+    /// describes (`"<version>|<bundle dir>"`) — hashing the payload is not free.
+    payload_hash: Option<String>,
+    payload_hash_key: Option<String>,
 }
 
 fn state_path() -> std::path::PathBuf {
@@ -501,6 +542,42 @@ pub struct App {
     /// existed at launch. Never under MORDENT_SELFTEST; `MORDENT_DEMO_SETUP=<1..7>`
     /// lands directly on a step (headless screenshot hook).
     setup: Option<crate::setup::SetupState>,
+    /// egui context, kept only so off-frame update threads can request a frame
+    /// when their message lands (the loop parks when nothing is playing).
+    ctx: egui::Context,
+    // ---- updates (see update.rs) ----
+    /// Result of the last completed check; `None` until one finishes.
+    update_check: Option<Check>,
+    /// An update check/download is running (spinner, buttons disabled).
+    update_busy: bool,
+    /// Which job `update_busy` refers to (button label/status line).
+    update_job: Option<UpdateJob>,
+    /// Log lines of the running job (shown in the ? panel).
+    update_log: Vec<String>,
+    /// The newer release's parsed SHA256SUMS, kept so the panel's download
+    /// button needs no second API call.
+    update_sums: Option<Vec<(String, String)>>,
+    /// Update downloaded, verified and staged for the next launch.
+    update_pending: Option<update::Pending>,
+    /// Verified folder downloaded for a platform that installs by hand.
+    update_downloaded: Option<(String, std::path::PathBuf)>,
+    /// Tag this launch installed (`update::apply_pending`), toasted once.
+    update_applied: Option<String>,
+    /// Tag whose hint the user dismissed (mirrored from state.toml).
+    update_notice_dismissed: Option<String>,
+    /// Last check time / tag seen (mirrored from state.toml; the 24 h gate).
+    last_update_check: Option<u64>,
+    last_seen_tag: Option<String>,
+    /// Memoised bundled-payload identity + the key it is valid for.
+    payload_hash: Option<String>,
+    payload_hash_key: Option<String>,
+    /// Installed helper vs this build's payload; `None` until checked.
+    helper_state: Option<update::HelperState>,
+    helper_busy: bool,
+    /// The configured helper URL is not on this machine: nothing here to update.
+    helper_remote: bool,
+    /// A pkexec helper reinstall started from the panel.
+    helper_install: Option<HelperInstall>,
 }
 
 impl App {
@@ -595,7 +672,13 @@ impl App {
                 &cfg,
             ))
         } else if start_wizard {
-            Some(crate::setup::SetupState::new(&cfg))
+            let mut wizard = crate::setup::SetupState::new(&cfg);
+            wizard.seed_update_cache(state.last_update_check, state.last_seen_tag.clone());
+            // One automatic check, so the wizard's Preferences step can show the
+            // newest release without the user pressing anything. Never under
+            // the demo/screenshot hook (see `auto_check_updates`).
+            wizard.auto_check_updates();
+            Some(wizard)
         } else {
             None
         };
@@ -671,9 +754,45 @@ impl App {
             decode_logged: false,
             wrapper_cacheable,
             setup,
+            ctx: egui_ctx.clone(),
+            update_check: None,
+            update_busy: false,
+            update_job: None,
+            update_log: Vec::new(),
+            update_sums: None,
+            update_pending: update::read_pending(),
+            update_downloaded: None,
+            update_applied: None,
+            update_notice_dismissed: state.update_notice_dismissed.clone(),
+            last_update_check: state.last_update_check,
+            last_seen_tag: state.last_seen_tag.clone(),
+            payload_hash: state.payload_hash.clone(),
+            payload_hash_key: state.payload_hash_key.clone(),
+            helper_state: None,
+            helper_busy: false,
+            helper_remote: false,
+            helper_install: None,
         };
+        app.helper_remote = !is_loopback_url(&app.cfg.wrapper_url);
         // Startup wrapper reachability hint (once, off-thread — see the fn).
         app.spawn_wrapper_check();
+        // Updates: read what the previous launch installed (toast once), then
+        // check GitHub at most once a day and compare the installed helper
+        // payload. Both are off-thread; neither runs under MORDENT_SELFTEST
+        // (deterministic) or while the wizard owns the window (the wizard has
+        // its own check on its Preferences step).
+        if !selftest {
+            app.update_applied = update::take_applied();
+            if let Some(tag) = app.update_applied.clone() {
+                app.fail(format!(
+                    "Mordent {tag} was installed — restart to run the new version."
+                ));
+            }
+            if app.setup.is_none() {
+                app.check_updates_now(false);
+                app.start_helper_check();
+            }
+        }
         if selftest {
             std::thread::Builder::new()
                 .name("mordent-wrapper-probe".into())
@@ -1010,6 +1129,504 @@ impl App {
             .ok();
     }
 
+    // ---- updates (checker + self-updater; see update.rs) ----
+
+    /// Spawn one update-check thread. `force` is the user's "Check now": it
+    /// bypasses both the 24 h gate and the `check_updates` preference. The
+    /// automatic path is silent — a rate limit, an offline machine or a missing
+    /// release is logged, never toasted.
+    fn check_updates_now(&mut self, force: bool) {
+        if self.update_busy {
+            return;
+        }
+        let now = crate::config::unix_now();
+        let cached = update::Cached {
+            last_check: self.last_update_check,
+            last_seen_tag: self.last_seen_tag.clone(),
+        };
+        if !update::should_check(&cached, self.cfg.check_updates, now, force) {
+            eprintln!(
+                "[update] not checking ({}; {})",
+                if self.cfg.check_updates {
+                    "inside the 24 h window"
+                } else {
+                    "check_updates = false"
+                },
+                update::last_check_label(self.last_update_check, now)
+            );
+            return;
+        }
+        self.update_busy = true;
+        self.update_job = None;
+        let tx = self.tx.clone();
+        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        std::thread::Builder::new()
+            .name("mordent-update-check".into())
+            .spawn(move || {
+                let (check, sums) = update::check_with_sums(&update::api_agent());
+                match &check {
+                    Check::Newer { latest, .. } => {
+                        eprintln!("[update] {latest} is available (running {})", update::version().display())
+                    }
+                    Check::UpToDate { latest } => eprintln!("[update] up to date ({latest})"),
+                    Check::Uncomparable { latest } => {
+                        eprintln!("[update] newest release {latest}; this build has no comparable tag")
+                    }
+                    Check::Failed { reason } => eprintln!("[update] check failed: {reason}"),
+                }
+                if let Some(ctx) = &ctx {
+                    ctx.request_repaint();
+                }
+                let _ = tx.send(Msg::Update(Box::new(check), sums));
+            })
+            .ok();
+    }
+
+    /// Compare the installed helper payload with the one bundled next to this
+    /// binary (off-thread: it may hash ~100 MB of payload).
+    fn start_helper_check(&mut self) {
+        if self.helper_busy {
+            return;
+        }
+        let scripts = crate::setup::resolve_scripts_dir();
+        let bundle = scripts.as_deref().map(crate::setup::bundle_dir);
+        let key = match &bundle {
+            Some(b) => format!("{}|{}", update::version().display(), b.display()),
+            None => String::new(),
+        };
+        let memo = if self.payload_hash_key.as_deref() == Some(key.as_str()) {
+            self.payload_hash.clone()
+        } else {
+            None
+        };
+        let prefix = std::path::PathBuf::from(crate::setup::helper_prefix());
+        self.helper_busy = true;
+        let tx = self.tx.clone();
+        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        std::thread::Builder::new()
+            .name("mordent-helper-check".into())
+            .spawn(move || {
+                let report = update::helper_check(bundle.as_deref(), &prefix, memo.as_deref());
+                eprintln!(
+                    "[update] helper payload: {:?} (installed vs this build)",
+                    report.state
+                );
+                if let Some(ctx) = &ctx {
+                    ctx.request_repaint();
+                }
+                let _ = tx.send(Msg::HelperState(Box::new(report), key));
+            })
+            .ok();
+    }
+
+    /// Download + verify + stage the newer release. The swap itself happens at
+    /// the next launch (`update::apply_pending`, called by `main`), so an update
+    /// can never interrupt playback.
+    fn start_self_update(&mut self, latest: update::Tag, assets: Vec<update::Asset>, sums: Option<Vec<(String, String)>>) {
+        if self.update_busy {
+            return;
+        }
+        let kind = update::kind();
+        let plan = match update::plan(
+            kind,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            None,
+            latest,
+            &assets,
+            &sums.unwrap_or_default(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                self.fail(format!("Cannot update automatically: {e:#}"));
+                return;
+            }
+        };
+        self.start_update_job(plan, UpdateJob::Stage);
+    }
+
+    /// The manual path (Windows zip, unrecognised layout): download, verify and
+    /// unpack so the user can put the files in place themselves.
+    fn start_manual_download(&mut self, latest: update::Tag, assets: Vec<update::Asset>, sums: Option<Vec<(String, String)>>) {
+        if self.update_busy {
+            return;
+        }
+        let plan = match update::plan(
+            update::kind(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            None,
+            latest,
+            &assets,
+            &sums.unwrap_or_default(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                self.fail(format!("Cannot download the release: {e:#}"));
+                return;
+            }
+        };
+        self.start_update_job(plan, UpdateJob::Download);
+    }
+
+    fn start_update_job(&mut self, plan: update::Plan, job: UpdateJob) {
+        eprintln!(
+            "[update] {} {} ({} → {})",
+            match job {
+                UpdateJob::Stage => "staging",
+                UpdateJob::Download => "downloading",
+            },
+            plan.asset.name,
+            plan.asset.browser_download_url,
+            plan.target.display()
+        );
+        self.update_busy = true;
+        self.update_job = Some(job);
+        self.update_log.clear();
+        let tx = self.tx.clone();
+        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        std::thread::Builder::new()
+            .name("mordent-update-download".into())
+            .spawn(move || {
+                let mut sink = |line: String| {
+                    if line.starts_with("downloading") {
+                        eprintln!("[update] {line}");
+                    }
+                    if let Some(ctx) = &ctx {
+                        ctx.request_repaint();
+                    }
+                    let _ = tx.send(Msg::UpdateLog(line));
+                };
+                let msg = match job {
+                    UpdateJob::Stage => Msg::Staged(
+                        update::stage(&plan, &mut sink)
+                            .map(Box::new)
+                            .map_err(|e| format!("{e:#}")),
+                    ),
+                    UpdateJob::Download => {
+                        let tag = plan.tag.to_string();
+                        Msg::Downloaded(
+                            update::fetch_for_manual(&plan, &mut sink)
+                                .map(|dir| Box::new((tag, dir)))
+                                .map_err(|e| format!("{e:#}")),
+                        )
+                    }
+                };
+                if let Some(ctx) = &ctx {
+                    ctx.request_repaint();
+                }
+                let _ = tx.send(msg);
+            })
+            .ok();
+    }
+
+    /// Re-run the shipped installer (pkexec → the desktop's auth dialog) so
+    /// `/opt/mordent-wrapper` gets this build's payload. The script is
+    /// idempotent: it stops the service, replaces the payload, restarts it and
+    /// waits for `/status`.
+    fn start_helper_install(&mut self) {
+        if self.helper_install.as_ref().is_some_and(|h| h.done.is_none()) {
+            return;
+        }
+        let Some(scripts) = crate::setup::resolve_scripts_dir() else {
+            self.fail("The helper scripts are not next to this build — run `mordent setup`.".into());
+            return;
+        };
+        let port = helper_port(&self.cfg.wrapper_url);
+        let (htx, hrx) = channel();
+        let tx = self.tx.clone();
+        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        std::thread::Builder::new()
+            .name("mordent-helper-forward".into())
+            .spawn(move || {
+                for ev in hrx {
+                    if let Some(ctx) = &ctx {
+                        ctx.request_repaint();
+                    }
+                    let _ = tx.send(Msg::Helper(ev));
+                }
+            })
+            .ok();
+        match update::spawn_helper_install(&scripts, port, htx) {
+            Ok(()) => {
+                eprintln!(
+                    "[update] reinstalling the helper from {} (port {port})",
+                    scripts.display()
+                );
+                self.helper_install = Some(HelperInstall {
+                    log: vec![format!("running {}/install-wrapper.sh --port {port}", scripts.display())],
+                    done: None,
+                });
+            }
+            Err(e) => self.fail(format!("Could not start the helper update: {e}")),
+        }
+    }
+
+    /// The player-bar "a newer version exists" hint, unless the user dismissed
+    /// that tag. One short button, no modal, nothing that steals focus.
+    fn update_hint(&self) -> Option<String> {
+        match &self.update_check {
+            Some(Check::Newer { latest, .. }) => {
+                let tag = latest.to_string();
+                (self.update_notice_dismissed.as_deref() != Some(tag.as_str())).then_some(tag)
+            }
+            _ => None,
+        }
+    }
+
+    /// Persist the update bookkeeping into state.toml (debounced write).
+    fn note_update_state_dirty(&mut self) {
+        self.state_dirty = Some(std::time::Instant::now());
+    }
+
+    /// The "updates" section of the ? panel: this build's version, the newest
+    /// release, the 24 h-gated check, the self-update button for this install
+    /// and the installed-helper payload comparison.
+    fn updates_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let now = crate::config::unix_now();
+        let version = update::version();
+        let kind = update::kind();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Mordent {}", version.display())).strong());
+            ui.weak(format!("({})", kind.label()));
+        });
+        if let Some(tag) = &self.update_applied {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{tag} was installed at startup — restart Mordent to run it."
+                ))
+                .color(theme.lossless),
+            );
+        }
+        match &self.update_check {
+            Some(Check::Newer { latest, .. }) => {
+                ui.label(
+                    egui::RichText::new(format!("{latest} is available"))
+                        .strong()
+                        .color(theme.accent),
+                );
+            }
+            Some(Check::UpToDate { latest }) => {
+                ui.weak(format!("up to date — {latest} is the newest release"));
+            }
+            Some(Check::Uncomparable { latest }) => {
+                ui.weak(format!(
+                    "newest release: {latest} (this build carries no comparable version)"
+                ));
+            }
+            Some(Check::Failed { reason }) => {
+                ui.weak(format!("check failed: {reason}"));
+            }
+            None => {
+                ui.weak("not checked yet");
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.weak(update::last_check_label(self.last_update_check, now));
+            if self.update_busy {
+                ui.spinner();
+            } else {
+                if ui.small_button("Check now").clicked() {
+                    self.check_updates_now(true);
+                }
+                let mut on = self.cfg.check_updates;
+                if ui
+                    .checkbox(&mut on, "check daily")
+                    .on_hover_text(
+                        "One unauthenticated request to api.github.com per day; nothing is \
+                         sent about you or your library.",
+                    )
+                    .changed()
+                {
+                    self.cfg.check_updates = on;
+                    if let Err(e) = crate::config::write_config(&self.cfg) {
+                        self.fail(format!("Could not save the preference: {e:#}"));
+                    } else {
+                        eprintln!("[update] check_updates = {on}");
+                        if on {
+                            self.check_updates_now(false);
+                        }
+                    }
+                }
+            }
+        });
+
+        // ---- this install's update path ----
+        let newer = match &self.update_check {
+            Some(Check::Newer { latest, assets, .. }) => Some((*latest, assets.clone())),
+            _ => None,
+        };
+        if let Some(p) = self.update_pending.clone() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} is downloaded and verified — it will be installed the next time you start Mordent.",
+                    p.tag
+                ))
+                .color(theme.lossless),
+            );
+        } else if let Some((tag, dir)) = self.update_downloaded.clone() {
+            ui.label(
+                egui::RichText::new(format!("{tag} downloaded, checksum verified and unpacked."))
+                    .color(theme.lossless),
+            );
+            ui.weak(format!("in {}", dir.display()));
+            if ui.small_button("Open the folder").clicked()
+                && let Err(e) = update::reveal(&dir)
+            {
+                self.fail(format!("Could not open the folder: {e:#}"));
+            }
+            ui.weak("Close Mordent, then copy these files over your install folder.");
+        } else if let Some((latest, assets)) = newer {
+            // Nothing is downloaded without a published checksum for *this*
+            // asset — a release that predates SHA256SUMS gets no button, with
+            // the reason spelled out instead.
+            let asset = kind.asset_name(std::env::consts::OS, std::env::consts::ARCH, &latest.to_string());
+            let verified = asset.as_deref().is_some_and(|name| {
+                self.update_sums
+                    .as_ref()
+                    .is_some_and(|sums| update::sum_for(sums, name).is_some())
+            });
+            if asset.is_none() {
+                ui.weak(format!(
+                    "This install layout has no release asset — download {latest} from the release page."
+                ));
+            } else if !verified {
+                ui.weak(format!(
+                    "Release {latest} ships no SHA256SUMS for {} — Mordent never installs an \
+                     unverified download; grab it from the release page instead.",
+                    asset.unwrap_or_default()
+                ));
+            } else if kind.supports_self_update() {
+                if ui
+                    .add_enabled(!self.update_busy, egui::Button::new(format!("Download & install {latest}")))
+                    .on_hover_text(
+                        "Verified against the release's SHA256SUMS (integrity only — releases are \
+                         not signed), then swapped in when you next start Mordent.",
+                    )
+                    .clicked()
+                {
+                    let sums = self.update_sums.clone();
+                    self.start_self_update(latest, assets, sums);
+                }
+                ui.weak("Downloaded in the background; the swap happens at the next start, never mid-playback.");
+            } else {
+                let why = match kind {
+                    update::Kind::WindowsZip => {
+                        "Windows cannot replace a running mordent.exe — Mordent downloads and \
+                         verifies the update, and you copy it over the install folder."
+                    }
+                    _ => {
+                        "This copy of Mordent cannot update itself (unrecognised layout) — \
+                         Mordent can still download and verify the release for you."
+                    }
+                };
+                ui.weak(why);
+                if ui
+                    .add_enabled(!self.update_busy, egui::Button::new(format!("Download {latest}")))
+                    .clicked()
+                {
+                    let sums = self.update_sums.clone();
+                    self.start_manual_download(latest, assets, sums);
+                }
+            }
+        }
+        if let Some(job) = self.update_job {
+            ui.weak(match job {
+                UpdateJob::Stage => "downloading the update…",
+                UpdateJob::Download => "downloading the release…",
+            });
+        }
+        if !self.update_log.is_empty() {
+            let last = self.update_log.last().cloned().unwrap_or_default();
+            ui.weak(last);
+        }
+        let hint = self.update_hint();
+        if let Some(tag) = &hint
+            && ui
+                .small_button("Hide the update hint")
+                .on_hover_text("Hides the player-bar hint for this release; ? still shows it.")
+                .clicked()
+        {
+            self.update_notice_dismissed = Some(tag.clone());
+            self.note_update_state_dirty();
+        }
+        ui.weak(format!("Release page: {}", update::RELEASE_PAGE));
+
+        // ---- the installed helper ----
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(egui::RichText::new("helper (wrapper-lite)").strong());
+        if self.helper_remote {
+            ui.weak(
+                "This helper runs on another machine — update it there. Mordent cannot reach \
+                 into a remote helper, and wrapper-lite reports no version (only /status regions).",
+            );
+            return;
+        }
+        match &self.helper_state {
+            Some(update::HelperState::NotInstalled) => {
+                ui.weak("no local helper installed (previews only)");
+            }
+            Some(update::HelperState::Current) => {
+                ui.weak("the installed helper payload matches this build");
+            }
+            Some(update::HelperState::Unknown(why)) => {
+                ui.weak(format!("helper payload: unknown — {why}"));
+            }
+            Some(update::HelperState::Outdated { installed, bundled }) => {
+                ui.label(
+                    egui::RichText::new("Helper update available")
+                        .strong()
+                        .color(theme.accent),
+                );
+                ui.weak(format!(
+                    "installed {}…, this build ships {}…",
+                    &installed[..8.min(installed.len())],
+                    &bundled[..8.min(bundled.len())]
+                ));
+                let busy = self.helper_install.as_ref().is_some_and(|h| h.done.is_none());
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Update helper…"))
+                    .on_hover_text(
+                        "Re-runs the installer through pkexec (your desktop asks for the admin \
+                         password): the helper is stopped, its payload replaced and the service \
+                         restarted. Apple login state is preserved.",
+                    )
+                    .clicked()
+                {
+                    self.start_helper_install();
+                }
+            }
+            None => {
+                ui.weak("checking the installed helper…");
+            }
+        }
+        if let Some(h) = &self.helper_install {
+            for line in h.log.iter().rev().take(4).rev() {
+                ui.weak(egui::RichText::new(line).size(11.0).monospace());
+            }
+            match &h.done {
+                Some(Ok(())) => {
+                    ui.label(
+                        egui::RichText::new("Helper updated.").color(theme.lossless),
+                    );
+                }
+                Some(Err(e)) => {
+                    ui.label(
+                        egui::RichText::new(format!("Helper update failed: {e}"))
+                            .color(egui::Color32::from_rgb(0xff, 0x9a, 0xa0)),
+                    );
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("installing (the password prompt may be behind this window)");
+                    });
+                }
+            }
+        }
+    }
+
     /// Render the first-run wizard and act on its outcome. Called INSTEAD of
     /// the normal UI while `self.setup` is `Some` (see `update`).
     fn setup_screen(&mut self, ctx: &egui::Context) {
@@ -1039,7 +1656,26 @@ impl App {
                             new_cfg.storefront
                         );
                         self.cfg = new_cfg;
+                        // The wizard's Preferences step may have checked for
+                        // updates (and toggled `check_updates`); adopt what it
+                        // learned so the app does not repeat the request.
+                        let adoption = self.setup.as_ref().map(|s| s.update_adoption());
                         self.setup = None;
+                        if let Some(a) = adoption {
+                            if a.last_check.is_some() {
+                                self.last_update_check = a.last_check;
+                            }
+                            if a.seen_tag.is_some() {
+                                self.last_seen_tag = a.seen_tag;
+                            }
+                            if let Some(check) = a.check {
+                                self.update_check = Some(check);
+                            }
+                            self.note_update_state_dirty();
+                        }
+                        self.helper_remote = !is_loopback_url(&self.cfg.wrapper_url);
+                        self.check_updates_now(false);
+                        self.start_helper_check();
                     }
                     Err(e) => {
                         if let Some(s) = self.setup.as_mut() {
@@ -1458,6 +2094,11 @@ impl App {
                     .to_string(),
                 ),
                 favorites: Some(favs),
+                last_update_check: self.last_update_check,
+                last_seen_tag: self.last_seen_tag.clone(),
+                update_notice_dismissed: self.update_notice_dismissed.clone(),
+                payload_hash: self.payload_hash.clone(),
+                payload_hash_key: self.payload_hash_key.clone(),
             },
         );
         self.state_dirty = None;
@@ -1637,6 +2278,105 @@ impl App {
                 // a stale-cache hint: same toast slot, non-fatal (no state
                 // reset — the fetch it belongs to succeeded)
                 Msg::Notice(note) => self.fail(note),
+                Msg::Update(check, sums) => {
+                    self.update_busy = false;
+                    self.update_job = None;
+                    self.last_update_check = Some(crate::config::unix_now());
+                    match &*check {
+                        Check::Newer { latest, .. }
+                        | Check::UpToDate { latest }
+                        | Check::Uncomparable { latest } => {
+                            self.last_seen_tag = Some(latest.to_string());
+                        }
+                        // A failure is not a sighting of a release.
+                        Check::Failed { .. } => {}
+                    }
+                    self.update_sums = sums;
+                    self.update_check = Some(*check);
+                    self.note_update_state_dirty();
+                }
+                Msg::UpdateLog(line) => {
+                    self.update_log.push(line);
+                    if self.update_log.len() > 20 {
+                        let drop = self.update_log.len() - 20;
+                        self.update_log.drain(0..drop);
+                    }
+                }
+                Msg::Staged(Ok(pending)) => {
+                    self.update_busy = false;
+                    self.update_job = None;
+                    eprintln!("[update] staged {} for the next launch", pending.tag);
+                    self.fail(format!(
+                        "Mordent {} downloaded and verified — it will be installed the next \
+                         time you start Mordent.",
+                        pending.tag
+                    ));
+                    self.update_pending = Some(*pending);
+                    self.update_downloaded = None;
+                }
+                Msg::Staged(Err(e)) => {
+                    self.update_busy = false;
+                    self.update_job = None;
+                    self.fail(format!("Update download failed: {e}"));
+                }
+                Msg::Downloaded(Ok(pair)) => {
+                    self.update_busy = false;
+                    self.update_job = None;
+                    eprintln!("[update] {} downloaded and verified into {}", pair.0, pair.1.display());
+                    self.fail(format!(
+                        "Mordent {} downloaded and checksum-verified — open ? to install it.",
+                        pair.0
+                    ));
+                    self.update_downloaded = Some(*pair);
+                }
+                Msg::Downloaded(Err(e)) => {
+                    self.update_busy = false;
+                    self.update_job = None;
+                    self.fail(format!("Update download failed: {e}"));
+                }
+                Msg::HelperState(report, key) => {
+                    self.helper_busy = false;
+                    if !report.bundled.is_empty() {
+                        self.payload_hash = Some(report.bundled.clone());
+                        self.payload_hash_key = Some(key);
+                        self.note_update_state_dirty();
+                    }
+                    self.helper_state = Some(report.state.clone());
+                }
+                Msg::Helper(ev) => {
+                    let done = match ev {
+                        update::HelperEvent::Line(line) => {
+                            let h = self.helper_install.get_or_insert_with(|| HelperInstall {
+                                log: Vec::new(),
+                                done: None,
+                            });
+                            h.log.push(line);
+                            if h.log.len() > 200 {
+                                let drop = h.log.len() - 200;
+                                h.log.drain(0..drop);
+                            }
+                            None
+                        }
+                        update::HelperEvent::Done(res) => Some(res),
+                    };
+                    if let Some(res) = done {
+                        let h = self.helper_install.get_or_insert_with(|| HelperInstall {
+                            log: Vec::new(),
+                            done: None,
+                        });
+                        h.done = Some(res.clone());
+                        match res {
+                            Ok(()) => {
+                                // Re-compare: the payload on disk just changed.
+                                self.payload_hash_key = None;
+                                self.helper_state = None;
+                                self.fail("Helper updated to this build's payload.".into());
+                                self.start_helper_check();
+                            }
+                            Err(e) => self.fail(format!("Helper update failed: {e}")),
+                        }
+                    }
+                }
                 Msg::Lyrics { song, result } => {
                     // drop a late arrival for a track we already left
                     if self.lyrics_song.as_deref() == Some(song.as_str()) {
@@ -2123,6 +2863,15 @@ impl App {
         }
         ctx.request_repaint();
     }
+}
+
+/// What the first-run wizard's Preferences step learned about updates, adopted
+/// by the app when the wizard finishes (see `setup::SetupState`).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateAdoption {
+    pub last_check: Option<u64>,
+    pub seen_tag: Option<String>,
+    pub check: Option<Check>,
 }
 
 /// What a window-close request (✕ / WM close, e.g. niri's Win+Q) must do.
@@ -2905,6 +3654,20 @@ impl App {
                         egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false),
                     );
                     self.repeat_shuffle_buttons(ui, &pb, &mut act);
+                    // Subtle, one-line "a newer Mordent exists" hint: no modal,
+                    // no focus stealing, and it disappears once the user
+                    // dismisses it or updates (? panel → updates).
+                    if let Some(tag) = self.update_hint()
+                        && hand(ui.small_button(
+                            egui::RichText::new(format!("↓ {tag}"))
+                                .size(11.0)
+                                .color(self.theme.accent),
+                        ))
+                        .on_hover_text("A newer Mordent is available — details in ?")
+                        .clicked()
+                    {
+                        self.cheatsheet = true;
+                    }
                 });
                 ui.add_space(8.0);
             });
@@ -3568,6 +4331,7 @@ impl App {
     }
 
     fn cheatsheet_ui(&mut self, ctx: &egui::Context) {
+        let theme = self.theme;
         let resp = egui::Modal::new(egui::Id::new("cheatsheet"))
             .backdrop_color(egui::Color32::from_black_alpha(120))
             .show(ctx, |ui| {
@@ -3593,10 +4357,21 @@ impl App {
                             ("?", "this cheatsheet"),
                             ("click progress bar", "seek"),
                         ] {
-                            ui.monospace(egui::RichText::new(k).color(self.theme.accent));
+                            ui.monospace(egui::RichText::new(k).color(theme.accent));
                             ui.weak(v);
                             ui.end_row();
                         }
+                    });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.strong(egui::RichText::new("updates").size(15.0));
+                // Bounded height: the section grows with the update state and
+                // the window may be as short as 420 px.
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        self.updates_ui(ui, &theme);
                     });
             });
         if resp.should_close() {
@@ -3868,6 +4643,28 @@ pub(crate) fn is_loopback_url(url: &str) -> bool {
     host == "localhost" || host == "::1" || host == "127.0.0.1" || host.starts_with("127.")
 }
 
+/// The helper port named by `url` (its authority's `:port`), or the packaged
+/// default. Used when re-running the installer for a *local* helper, where the
+/// service must keep listening on the port the config points at.
+fn helper_port(url: &str) -> u16 {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    // An IPv6 authority without a port (`[::1]`) has no last-colon port; a
+    // trailing bracket means the colon inside it is not a separator.
+    if let Some(rest) = hostport.strip_prefix('[')
+        && let Some((_, after)) = rest.split_once(']')
+        && let Some(port) = after.strip_prefix(':')
+        && let Ok(port) = port.parse()
+    {
+        return port;
+    }
+    hostport
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(crate::setup::DEFAULT_PORT)
+}
+
 /// Click-to-seek progress bar; reports the clicked fraction (0..1) via `act`.
 fn seek_bar_ui(
     ui: &mut egui::Ui,
@@ -4067,7 +4864,25 @@ mod dnd_tests {
 
 #[cfg(test)]
 mod wrapper_hint_tests {
-    use super::{is_loopback_url, wrapper_down_hint};
+    use super::{helper_port, is_loopback_url, wrapper_down_hint};
+    use crate::setup::DEFAULT_PORT;
+
+    /// The helper reinstall must keep the port the config points at: the
+    /// service unit is rendered with it, so getting this wrong would move the
+    /// helper's port out from under the running app.
+    #[test]
+    fn helper_port_reads_the_configured_port() {
+        assert_eq!(helper_port("http://127.0.0.1:12340"), 12340);
+        assert_eq!(helper_port("http://127.0.0.1:12340/"), 12340);
+        assert_eq!(helper_port("https://music-box.local:8443"), 8443);
+        assert_eq!(helper_port("http://user@host:9999/base"), 9999);
+        assert_eq!(helper_port("http://[::1]:12000"), 12000);
+        // no port anywhere → the packaged default
+        assert_eq!(helper_port("http://localhost"), DEFAULT_PORT);
+        assert_eq!(helper_port("http://[::1]"), DEFAULT_PORT);
+        assert_eq!(helper_port("localhost"), DEFAULT_PORT);
+        assert_eq!(helper_port(""), DEFAULT_PORT);
+    }
 
     #[test]
     fn loopback_urls_get_the_local_start_hint() {

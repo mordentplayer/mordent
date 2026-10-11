@@ -116,7 +116,7 @@ jobs:
       # coverage while staying under that threshold. Linux/macOS run the whole
       # suite in one process as before.
       - name: Test (chunk 1/3)
-        run: "cargo test --locked -- acache:: api:: config:: fonts:: lyrics::"
+        run: "cargo test --locked -- acache:: api:: config:: fonts:: lyrics:: update::"
 
       - name: Test (chunk 2/3)
         run: "cargo test --locked -- prefetch:: queuemodel:: report:: setup::"

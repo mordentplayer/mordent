@@ -1,6 +1,6 @@
 # Mordent — Apple Music, native and fast
 
-[![CI](https://github.com/sliced-paraiba/mordent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sliced-paraiba/mordent/actions/workflows/ci.yml)
+[![CI](https://github.com/mordentplayer/mordent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mordentplayer/mordent/actions/workflows/ci.yml)
 
 A lightweight native Apple Music client for Linux (Rust + egui). Goals:
 instant startup, minimal resource use, and going from wanting to listen to music -> song playing as fast as possible.
@@ -41,7 +41,7 @@ terminal at any point. (The wizard is described under
 ### Linux — AppImage (any distro)
 
 1. Download `mordent-<version>-x86_64.AppImage` from the
-   [latest release](https://github.com/sliced-paraiba/mordent/releases/latest).
+   [latest release](https://github.com/mordentplayer/mordent/releases/latest).
 2. Once, in your file manager: **Properties → Permissions → “Allow executing
    file as program”** (downloads are not marked executable).
 3. Double-click the file. The app starts.
@@ -89,13 +89,13 @@ Installs under `~/.local` and adds a `Mordent` entry to your application menu �
 no package manager, no `sudo`:
 
 ```sh
-curl -fsSL https://github.com/sliced-paraiba/mordent/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/mordentplayer/mordent/releases/latest/download/install.sh | bash
 ```
 
 Prefer to read it before you run it? (Recommended for any `curl | bash`.)
 
 ```sh
-curl -fsSLO https://github.com/sliced-paraiba/mordent/releases/latest/download/install.sh
+curl -fsSLO https://github.com/mordentplayer/mordent/releases/latest/download/install.sh
 less install.sh
 bash install.sh
 ```

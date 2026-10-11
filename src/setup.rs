@@ -422,6 +422,8 @@ enum SetupMsg {
         ok: bool,
         detail: String,
     },
+    /// The Preferences step's own update check (see `crate::update`).
+    UpdateChecked(Box<crate::update::Check>),
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +587,13 @@ pub struct SetupState {
     media_token: String,
     report_plays: bool,
     cache_size_gb: u64,
+    check_updates: bool,
+    /// Update check state for the Preferences line (`None` = not checked).
+    update: Option<crate::update::Check>,
+    update_checking: bool,
+    /// Cached last check / tag seen (seeded by the app; adopted back at Finish).
+    last_update_check: Option<u64>,
+    last_seen_tag: Option<String>,
 
     // step 6
     audio_checked: bool,
@@ -662,6 +671,11 @@ impl SetupState {
             media_token: cfg.media_user_token.clone().unwrap_or_default(),
             report_plays: cfg.report_plays,
             cache_size_gb: cfg.cache_size_gb,
+            check_updates: cfg.check_updates,
+            update: None,
+            update_checking: false,
+            last_update_check: None,
+            last_seen_tag: None,
             audio_checked: false,
             audio: None,
             error: None,
@@ -794,7 +808,62 @@ impl SetupState {
         cfg.media_user_token = (!tok.is_empty()).then(|| tok.to_string());
         cfg.report_plays = self.report_plays;
         cfg.cache_size_gb = self.cache_size_gb;
+        cfg.check_updates = self.check_updates;
         cfg
+    }
+
+    /// Hand the wizard the app's cached check time, so the Preferences step can
+    /// show "checked N h ago" and the one automatic check honours the 24 h gate.
+    pub fn seed_update_cache(&mut self, last_check: Option<u64>, seen_tag: Option<String>) {
+        self.last_update_check = last_check;
+        self.last_seen_tag = seen_tag;
+    }
+
+    /// What the Preferences step learned about updates, for the app to adopt
+    /// when the wizard finishes (so the same request is not repeated).
+    pub fn update_adoption(&self) -> crate::ui::UpdateAdoption {
+        crate::ui::UpdateAdoption {
+            last_check: self.last_update_check,
+            seen_tag: self.last_seen_tag.clone(),
+            check: self.update.clone(),
+        }
+    }
+
+    /// Run the one automatic check the Preferences step shows. Called by the
+    /// app (never by step entry), so unit tests and demo/screenshot runs never
+    /// touch the network.
+    pub fn auto_check_updates(&mut self) {
+        if self.demo || self.update_checking {
+            return;
+        }
+        self.check_updates_now(false);
+    }
+
+    /// Spawn one check. `force` = the "Check now" button: it bypasses both the
+    /// 24 h gate and the preference, exactly like the app's own button.
+    fn check_updates_now(&mut self, force: bool) {
+        if self.update_checking {
+            return;
+        }
+        let now = crate::config::unix_now();
+        let cached = crate::update::Cached {
+            last_check: self.last_update_check,
+            last_seen_tag: self.last_seen_tag.clone(),
+        };
+        if !crate::update::should_check(&cached, self.check_updates, now, force) {
+            return;
+        }
+        self.update_checking = true;
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("mordent-setup-update".into())
+            .spawn(move || {
+                // The wizard only needs the comparison; the app fetches the
+                // checksums when it actually stages an update.
+                let (check, _sums) = crate::update::check_with_sums(&crate::update::api_agent());
+                let _ = tx.send(SetupMsg::UpdateChecked(Box::new(check)));
+            })
+            .ok();
     }
 
     pub fn set_error(&mut self, msg: String) {
@@ -1045,6 +1114,19 @@ impl SetupState {
                 }
                 SetupMsg::AudioDone { ok, detail } => {
                     self.audio = Some(if ok { Ok(()) } else { Err(detail) });
+                }
+                SetupMsg::UpdateChecked(check) => {
+                    self.update_checking = false;
+                    self.last_update_check = Some(crate::config::unix_now());
+                    match &*check {
+                        crate::update::Check::Newer { latest, .. }
+                        | crate::update::Check::UpToDate { latest }
+                        | crate::update::Check::Uncomparable { latest } => {
+                            self.last_seen_tag = Some(latest.to_string());
+                        }
+                        crate::update::Check::Failed { .. } => {}
+                    }
+                    self.update = Some(*check);
                 }
             }
         }
@@ -1613,6 +1695,61 @@ impl SetupState {
             ui.add(egui::DragValue::new(&mut self.cache_size_gb).range(0..=500));
             ui.label("GB   (0 disables the cache)");
         });
+        ui.add_space(10.0);
+        ui.checkbox(&mut self.check_updates, "Check for new Mordent versions");
+        hint(
+            ui,
+            theme,
+            "One anonymous request to api.github.com per day; nothing about you or your \
+             library is sent.",
+        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Mordent {}", crate::update::version().display()))
+                    .size(12.0)
+                    .strong(),
+            );
+            ui.separator();
+            match &self.update {
+                Some(crate::update::Check::Newer { latest, .. }) => {
+                    ui.label(
+                        egui::RichText::new(format!("{latest} is available"))
+                            .size(12.0)
+                            .color(theme.accent),
+                    );
+                }
+                Some(crate::update::Check::UpToDate { latest }) => {
+                    ui.weak(format!("up to date ({latest} is newest)"));
+                }
+                Some(crate::update::Check::Uncomparable { latest }) => {
+                    ui.weak(format!("newest release: {latest}"));
+                }
+                Some(crate::update::Check::Failed { reason }) => {
+                    ui.weak(format!("check failed: {reason}"));
+                }
+                None if self.update_checking => {}
+                None => {
+                    ui.weak("no check yet");
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if self.update_checking {
+                ui.spinner();
+                ui.label("checking…");
+            } else if ui.small_button("Check now").clicked() {
+                self.check_updates_now(true);
+            }
+            ui.weak(crate::update::last_check_label(
+                self.last_update_check,
+                crate::config::unix_now(),
+            ));
+        });
+        hint(
+            ui,
+            theme,
+            "Installing an update happens in the player (open the ? panel there).",
+        );
         self.nav_row(ui, "Next →");
     }
 

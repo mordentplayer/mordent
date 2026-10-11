@@ -15,6 +15,7 @@ mod fairplay;
 mod mpris;
 mod stream;
 mod theme;
+mod update;
 mod wrapper;
 
 // Tray (collapse-to-tray) is Linux-only: ksni speaks StatusNotifierItem over
@@ -107,6 +108,7 @@ fn run() -> Result<()> {
             decode_stats(path)?;
         }
         "ui" => {
+            apply_staged_update();
             // No config.toml at launch → run the guided setup first.
             if first_run {
                 ui::launch_setup(cfg)?;
@@ -115,6 +117,7 @@ fn run() -> Result<()> {
             }
         }
         "setup" => {
+            apply_staged_update();
             ui::launch_setup(cfg)?;
         }
         "play" => {
@@ -142,6 +145,42 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Finish an update the user staged in a previous session.
+///
+/// The swap happens HERE — at startup, before any window exists and while
+/// nothing is playing — never mid-session: an update cannot interrupt playback,
+/// and the files it replaces are not in use (a running Linux binary keeps its
+/// own inode; this process has not loaded the new files). A failure is logged
+/// and the launch continues on the current files: `update::apply_pending`
+/// renames the marker aside so a broken download cannot retry forever.
+///
+/// Skipped under `MORDENT_SELFTEST` (which must never rewrite the checkout it
+/// runs from).
+fn apply_staged_update() {
+    if std::env::var("MORDENT_SELFTEST").is_ok() {
+        if update::read_pending().is_some() {
+            eprintln!("[update] MORDENT_SELFTEST: leaving the staged update alone");
+        }
+        return;
+    }
+    let mut log = Vec::new();
+    match update::apply_pending(&mut log) {
+        Ok(None) => {}
+        Ok(Some(tag)) => {
+            for line in &log {
+                eprintln!("[update] {line}");
+            }
+            eprintln!("[update] {tag} installed; restart Mordent to run it");
+        }
+        Err(e) => {
+            for line in &log {
+                eprintln!("[update] {line}");
+            }
+            eprintln!("[update] could not install the staged update: {e:#}");
+        }
+    }
 }
 
 fn cmd_search(cfg: &config::Config, term: &str) -> Result<()> {
