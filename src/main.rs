@@ -70,14 +70,16 @@ fn run() -> Result<()> {
     // budget-managed per play attempt).
     api::clean_meta_cache(&cfg);
     let mut args = std::env::args().skip(1);
-    let Some(cmd) = args.next() else {
-        usage();
-        bail!("no command given");
-    };
+    // No subcommand → the GUI, routed into the `"ui"` arm below (staged-update
+    // finish, then the player — or the guided setup wizard on first run) rather
+    // than a copy of it. This is what every graphical launcher does without
+    // arguments: the installer's .desktop entry, a double-clicked `mordent.exe`,
+    // the macOS .app bundle, and a bare `mordent` typed in a terminal.
+    let cmd = args.next().unwrap_or_else(|| "ui".to_string());
     let rest: Vec<String> = args.collect();
 
     match cmd.as_str() {
-        "-h" | "--help" => {
+        "-h" | "--help" | "help" | "--version" => {
             usage();
             return Ok(());
         }
@@ -526,6 +528,7 @@ fn usage() {
     eprintln!(
         "Mordent — Apple Music client (dev CLI)\n\n\
          commands:\n\
+         \x20 (no command)     open the app (same as `ui`)\n\
          \x20 token             print the cached web bearer token\n\
          \x20 search <term>     search catalog\n\
          \x20 album <id|url>    list album tracks\n\
