@@ -6,12 +6,19 @@ on:
     # YYYY-MM-DD prefix plus any suffix, so each same-day release (.1, .2, …)
     # fires this workflow.
     tags: ['20[0-9][0-9]-*']
+  # Test builds from any branch: artifacts only, no GitHub release (the release
+  # step below is gated on `github.ref_type == 'tag'`). Runs are versioned
+  # "test" — see VERSION.
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  # Release/asset version. Tag runs use the tag (CalVer); manual runs have no
+  # tag, so every name that would carry it falls back to "test".
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'test' }}
   WRAPPER_REPO: https://github.com/WorldObservationLog/wrapper
   # Canonical NDK r23b URL: dl.google.com is blocked on some networks, the
   # gvt1 mirror is the documented alternative.
@@ -219,10 +226,10 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package tarball
+      - name: Package tarball + Mordent.app
         run: |
           set -euo pipefail
-          pkg="mordent-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
+          pkg="mordent-${VERSION}-macos-${{ matrix.arch }}"
           root="dist/${pkg}"
           mkdir -p "$root"
           cp "target/${{ matrix.target }}/release/mordent" "$root/mordent"
@@ -230,14 +237,27 @@ jobs:
           cat > "$root/WRAPPER-NOTICE.txt" <<'EOF'
           The FairPlay wrapper is Linux-only. On macOS/Windows, point Mordent at a remote wrapper (Setup → Wrapper → remote URL).
           EOF
+          # tarball first, so the bare-binary bundle for scripts/advanced users
+          # stays free of the .app below.
           tar -C dist -czf "${pkg}.tar.gz" "${pkg}"
-          echo "PKG=${pkg}" >> "$GITHUB_ENV"
 
-      - name: Upload macos bundle
+          # Double-clickable bundle: Mordent.app (icon + Info.plist) zipped with
+          # `ditto --keepParent`, which is what makes Finder unpack it back into
+          # a .app rather than a loose directory.
+          bash packaging/macos/build-app.sh \
+            "target/${{ matrix.target }}/release/mordent" "${VERSION}" "dist/${pkg}" \
+            "Mordent-${VERSION}-macos-${{ matrix.arch }}.zip"
+
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+          echo "APPZIP=Mordent-${VERSION}-macos-${{ matrix.arch }}.zip" >> "$GITHUB_ENV"
+
+      - name: Upload macos bundles
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.PKG }}
-          path: ${{ env.PKG }}.tar.gz
+          path: |
+            ${{ env.PKG }}.tar.gz
+            ${{ env.APPZIP }}
           if-no-files-found: error
 
   # ---- 5. the app: Windows ----------------------------------------------
@@ -259,7 +279,7 @@ jobs:
       - name: Package zip
         shell: pwsh
         run: |
-          $pkg = "mordent-$env:GITHUB_REF_NAME-windows-x86_64"
+          $pkg = "mordent-$env:VERSION-windows-x86_64"
           $root = "dist/$pkg"
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Copy-Item "target/release/mordent.exe" "$root/mordent.exe"
@@ -327,7 +347,7 @@ jobs:
       - name: Assemble bundle
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
+          tag="$VERSION"
           pkg="mordent-${tag}-linux-x86_64"
           root="dist/${pkg}"
           mkdir -p "$root/licenses"
@@ -338,6 +358,12 @@ jobs:
           # the third-party backend (binary + rootfs skeleton)
           install -m 0755 in/wrapper/wrapper-lite "$root/wrapper-lite"
           cp -a in/wrapper/rootfs "$root/rootfs"
+          # `actions/download-artifact` does not preserve the executable bit, so
+          # restore it on the chroot payload binaries (build-container stages the
+          # same rootfs and chmods its copy for exactly this reason). Without it
+          # the wizard's local install copies a non-executable `lite`.
+          chmod 0755 "$root/rootfs/system/bin/lite" "$root/rootfs/system/bin/linker64"
+          test -x "$root/rootfs/system/bin/lite"
           cp in/wrapper/WRAPPER_COMMIT "$root/WRAPPER_COMMIT"
 
           # setup scripts + systemd unit the wizard drives
@@ -382,11 +408,49 @@ jobs:
           path: ${{ env.PKG }}.tar.gz
           if-no-files-found: error
 
+      # Graphical install for Linux: the same payload as the tarball above,
+      # repackaged as an AppImage (see packaging/appimage/). Put *after* the
+      # tarball step so the tarball stays exactly as it was.
+      - name: Assemble AppImage
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          appimage="mordent-${VERSION}-x86_64.AppImage"
+          # --appimage-extract-and-run: no FUSE needed on the runner.
+          APPIMAGETOOL="$PWD/appimagetool" APPIMAGETOOL_ARGS=--appimage-extract-and-run \
+            bash packaging/appimage/build-appimage.sh "dist/${PKG}" "$appimage"
+
+          # Prove the artifact is a real, extractable AppImage with the payload
+          # the wizard needs at <exe_dir>/../scripts.
+          "./${appimage}" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/mordent
+          test -x squashfs-root/usr/wrapper-lite
+          test -f squashfs-root/usr/scripts/install-wrapper.sh
+          test -f squashfs-root/usr/rootfs/system/bin/lite
+          test -f squashfs-root/usr/share/icons/hicolor/256x256/apps/mordent.png
+          test -f squashfs-root/mordent.desktop
+          rm -rf squashfs-root
+          echo "APPIMAGE=${appimage}" >> "$GITHUB_ENV"
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APPIMAGE }}
+          path: ${{ env.APPIMAGE }}
+          if-no-files-found: error
+
+      # Tag runs only: a manual (workflow_dispatch) run builds artifacts for
+      # testing and stops here — no release is created, no assets are published.
       - name: Create GitHub Release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ env.PKG }}.tar.gz
+            ${{ env.APPIMAGE }}
             in/container/wrapper-lite-amd64.tar.gz
             docs/macos-container/compose.yaml
             in/release/*.tar.gz
