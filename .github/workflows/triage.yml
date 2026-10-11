@@ -471,8 +471,11 @@ jobs:
           set -euo pipefail
           title="$(cat "$RUNNER_TEMP/submission-title.txt")"
           type="$(cat "$RUNNER_TEMP/submission-type.txt")"
+          # Only an explicit [bug]/[feature] prefix counts as "already marked".
+          # A user title that merely starts with a bracket (e.g. "[Windows]
+          # app crashes on launch") must still get the type marker.
           case "$title" in
-            \[*) ;;  # already carries a [bug]/[feature] marker from the form
+            \[[Bb]ug\]*|\[[Ff]eature\]*) ;;
             *) case "$type" in
                  bug|feature) title="[$type] $title" ;;
                  *)           title="[web] $title" ;;
