@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Mordent
+GenericName=Music Player
+Comment=Apple Music, native and fast
+Exec=mordent
+Icon=mordent
+Categories=AudioVideo;Audio;Player;
+Terminal=false
+StartupWMClass=mordent

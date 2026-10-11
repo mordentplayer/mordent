@@ -1,0 +1,16 @@
+#!/bin/sh
+# AppImage entry point.
+#
+# `exec` target: the app binary lives at <AppDir>/usr/bin/mordent, with the
+# wizard's bundled payload (scripts/, wrapper-lite, rootfs/) alongside it at
+# <AppDir>/usr/ — that is what `find_scripts_dir_in` in src/setup.rs looks for
+# (<exe_dir>/../scripts).
+#
+# With no arguments we open the GUI: `mordent ui` runs the guided setup wizard
+# on first run (no ~/.config/mordent/config.toml) and the player afterwards.
+# Explicit arguments (setup, ui, search, …) are passed through untouched.
+HERE="$(dirname "$(readlink -f "$0")")"
+if [ "$#" -eq 0 ]; then
+  set -- ui
+fi
+exec "$HERE/usr/bin/mordent" "$@"
