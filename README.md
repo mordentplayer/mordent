@@ -1,3 +1,5 @@
+![Mordent — a native, fast Apple Music client](assets/brand/readme-banner.png)
+
 # Mordent — Apple Music, native and fast
 
 [![CI](https://github.com/mordentplayer/mordent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mordentplayer/mordent/actions/workflows/ci.yml)
