@@ -67,8 +67,8 @@ file manager's “Integrate” action) can add Mordent to your applications menu
    first time; approving once is remembered. (Signing with an Apple Developer
    ID and notarizing would remove this step — optional, not done yet.)
 
-The FairPlay helper is Linux-only, so there nothing is installed locally: the
-wizard's *Connect to a music helper* path points at a wrapper running
+The FairPlay helper is Linux-only, so nothing is installed locally on a Mac:
+the wizard's *Connect to a music helper* path points at a wrapper running
 elsewhere — in Docker on your Mac, or on an always-on Linux box. Step-by-step
 guide: [`docs/macos-container/README-friend.md`](docs/macos-container/README-friend.md).
 
@@ -79,8 +79,10 @@ guide: [`docs/macos-container/README-friend.md`](docs/macos-container/README-fri
    unsigned app — click **More info → Run anyway** (one click, remembered
    afterwards).
 
-The executable carries no icon resource (that would need a cross-compile
-resource step); the app window, tray and About box all use the Mordent icon.
+`mordent.exe` carries no icon resource: embedding one needs a cross-compile
+resource step, which is out of scope for now. The repository ships
+[`assets/icon/mordent.ico`](assets/icon/mordent.ico) if you want the icon on a
+desktop shortcut.
 
 ### Advanced — tarballs, scripts, source
 
