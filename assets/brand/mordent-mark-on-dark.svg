@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="Mordent">
+  <!--
+    Mordent brand asset — see assets/brand/brand.md for the full system.
+    Mark: a mordent ornament abstracted to a single stroke — 60° zigzag with a
+    75° descending tail, ribbon 0.56 (zigzag-run units), ends cut horizontally
+    on a common baseline, mitred joins.  One filled path: recolourable, and the
+    same geometry `src/brand.rs` rasterises for the tray / window icon.
+    Palette: accent #fa4d6a · panel #26262a→#161619 · ink #f5f5f7.
+
+    App-icon master (rounded-square panel).  assets/icon/** is generated from this
+    file by packaging/icons/make-icons.sh — edit here, then re-run that script.
+  -->
+  <title>Mordent</title>
+  <defs><radialGradient id="bg" cx="0.32" cy="0.24" r="0.95"><stop offset="0" stop-color="#26262a"/><stop offset="1" stop-color="#161619"/></radialGradient></defs>
+  <rect x="48" y="48" width="928" height="928" rx="212" ry="212" fill="url(#bg)"/>
+  <path d="M 282.7 665.7 L 392.3 475.8 L 554.4 756.5 L 700.9 502.6 L 752.1 693.8 L 846.1 693.8 L 731.9 267.5 L 554.4 575.0 L 392.3 294.3 L 177.9 665.7 Z" fill="#fa4d6a"/>
+</svg>
