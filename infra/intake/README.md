@@ -7,6 +7,12 @@ account. A valid submission becomes a GitHub issue on
 
 Everything is one dependency-free Worker script plus the static page it serves.
 
+The endpoint is deliberately **machine-friendly**: a plain `curl` (or any agent /
+script) POSTing JSON is a first-class client, exactly like the HTML form. There is
+no browser challenge, CAPTCHA or attestation widget by design. Abuse control is the
+rate limiting and body validation described below, plus the triage pipeline's own
+classification pass, which is the gate before anything becomes public.
+
 ---
 
 ## Deployed instance
@@ -18,11 +24,14 @@ Everything is one dependency-free Worker script plus the static page it serves.
 | Worker name | `mordent-intake` |
 | **Public URL** | **https://mordent-intake.outline2319.workers.dev** |
 | KV namespace | `INTAKE_KV` → id `64e15885c1594c368e8367e67a9ae6a7` |
-| Secrets configured | **none yet** — see [Enable issue filing](#3-create-the-fine-grained-pat-and-set-gh_token) |
+| Secrets configured | `GH_TOKEN` — fine-grained PAT (Issues: read and write), installed 2026-10-11; the value is never printed or committed |
+| Delivery channel | direct GitHub issue creation (`POST /repos/{repo}/issues`), labelled `from-web` — see [Delivery channel](#delivery-channel) |
 
-Until `GH_TOKEN` is set, `POST /` returns `503 {"ok":false,"error":"intake not configured yet"}`
-and `GET /` serves the form (which shows that error inline on submit). No issue is
-ever created in that state.
+If the `GH_TOKEN` secret is ever removed (rotation window), `POST /` degrades to
+`503 {"ok":false,"error":"intake not configured yet"}` and `GET /` still serves the
+form (which shows that error inline on submit). No issue is ever half-created in
+that state — that is the verified behaviour of the *unconfigured* worker, not its
+current state.
 
 ## Files
 
@@ -94,6 +103,11 @@ Only *validated* submissions consume quota, so malformed traffic and honeypot
 hits cost nothing. KV is eventually consistent, so a burst of concurrent
 requests from one client can overshoot a limit slightly; that is acceptable here.
 
+There is intentionally **no CAPTCHA or browser attestation** (see the intro): the
+endpoint must stay usable by `curl` and by agents, so the per-client and global
+budgets above bound the worst case, and the triage pipeline's classification is
+the final gate that decides what becomes a public issue — spam never surfaces.
+
 ## Configuration
 
 `wrangler.toml` `[vars]`:
@@ -108,16 +122,42 @@ Secret:
 
 | Secret | Meaning |
 | --- | --- |
-| `GH_TOKEN` | Fine-grained PAT with **Issues: read and write** on `sliced-paraiba/mordent`. |
+| `GH_TOKEN` | Fine-grained PAT with **Issues: read and write** on `sliced-paraiba/mordent`. `Contents: read and write` is additionally required *only* if the delivery channel is ever switched to `repository_dispatch` (see below) — it is not needed for the current channel. |
+
+### Delivery channel
+
+Currently the Worker calls the GitHub REST API directly and creates the issue
+itself (`POST /repos/{repo}/issues`), with the `from-web` label, and the
+`issues: opened` trigger of `.github/workflows/triage.yml` then picks it up.
+
+The planned replacement is a `repository_dispatch` event
+(`event_type: web-submission`, `client_payload: {type, title, body, contact}`), so
+the triage workflow owns issue creation and can classify a submission before
+anything public exists. That switch is **not enabled** because two prerequisites
+are missing:
+
+1. the PAT must also carry `Contents: read and write` — the dispatch endpoint
+   requires it (`x-accepted-github-permissions: contents=write`); the current
+   token's dispatch attempt returns `403 Resource not accessible by personal access token`;
+2. the workflow needs a matching `repository_dispatch` trigger — until then a
+   dispatch would be accepted and silently dropped, losing the report.
+
+Both must land together before the channel is switched.
 
 ### Label handling
 
 `from-web` is created lazily: if GitHub rejects the issue because the label does
 not exist (`422`), the Worker creates the label once
-(`POST /repos/{repo}/labels`, colour `1d76db`) and retries; if that still fails it
-retries the issue **without labels**, so a missing-label problem can never lose a
-report. Failures are logged. (Equivalent manual step:
+(`POST /repos/{repo}/labels`, colour `1d76db`, description "submitted anonymously
+via the web form") and retries; if that still fails it retries the issue
+**without labels**, so a missing-label problem can never lose a report. Failures
+are logged. (Equivalent manual step:
 `gh label create from-web --color 1d76db --description "Submitted via the anonymous web form"`.)
+
+The repository already carries a `from-web` label (colour `ededed`, no
+description), so the lazy-create branch has not needed to run in production so
+far; aligning that label with the colour/description above is cosmetic and has
+not been done automatically.
 
 ---
 
@@ -142,7 +182,14 @@ wrangler tail mordent-intake
 Local `wrangler dev` uses its own state directory (`.wrangler/state`, git-ignored)
 and never touches the production KV namespace.
 
-### 3. Create the fine-grained PAT and set `GH_TOKEN`
+### 3. The fine-grained PAT (`GH_TOKEN`)
+
+**Status: installed 2026-10-11** as the Worker secret `GH_TOKEN`, named
+`mordent-intake-worker`, scoped to the single repository `sliced-paraiba/mordent`
+with **Issues: read and write**. Verified: `GET /user` → `sliced-paraiba`,
+`GET /repos/sliced-paraiba/mordent` → `200`, and a deliberately invalid issue
+creation returning `422 Validation Failed` (not `403`), which proves Issues write
+without creating anything. The steps below are the record for rotation.
 
 > **Do not reuse the `gh` CLI OAuth token** (`gho_…`) as the long-lived secret.
 > It is an OAuth-app token with broad `repo` scope, belongs to the whole CLI
@@ -195,7 +242,17 @@ against the deployed Worker:
 - Control characters (`\u0007`, `\u0001`, `\u001b`) stripped from title/body before the issue payload is built.
 - Two different source IPs received independent per-IP budgets (same-IP keying confirmed).
 - `DRY_RUN=0` with no `GH_TOKEN` → `503 {"ok":false,"error":"intake not configured yet"}`; validation still runs first (`400` for bad input).
-- Live deploy: page `200`, valid POST `503` (unconfigured), bad type `400`, and a temporary `DRY_RUN=1` deploy proved the **remote** KV binding writes `rl:*` keys (test counters deleted afterwards; final deployed settings: `DRY_RUN=0`, no `GH_TOKEN`).
+- Live deploy: page `200`, valid POST `503` (unconfigured), bad type `400`, and a temporary `DRY_RUN=1` deploy proved the **remote** KV binding writes `rl:*` keys (test counters deleted afterwards).
 
-Not yet exercised (needs the real token): live GitHub issue creation and the
-label-create fallback path.
+With the PAT installed, end to end against the live Worker and the public repo:
+
+- `GET /user`/`GET /repos/sliced-paraiba/mordent` with the PAT → `200`; invalid issue creation → `422` (Issues write confirmed without side effects).
+- A synthetic JSON `curl` submission → `200 {"ok":true}` and issue [#3](https://github.com/sliced-paraiba/mordent/issues/3) created with title `[bug] [test] intake smoke: queue pane stays empty`, the exact body (`…` + `---` + intake line + `contact (unverified): …`) and the `from-web` label.
+- `.github/workflows/triage.yml` fired on that issue and **succeeded** (`Issue triage`, run `38110549687`), producing `triage-reports/issue-3.md` on the `triage-reports` branch — the pipeline classifies the report (class/confidence/labels/priority + code-level analysis) and treats the body strictly as data. The test issue was then closed.
+- Honeypot re-checked on the armed endpoint: `200 {ok:true}` and no issue created.
+- `POST /repos/sliced-paraiba/mordent/dispatches` → `403 Resource not accessible by personal access token` (`x-accepted-github-permissions: contents=write`) — the dispatch channel is therefore not enabled (see [Delivery channel](#delivery-channel)).
+- Confirmed the endpoint ships no attestation/CAPTCHA integration: the Cloudflare account's challenge-widget list is empty and there is no such verification code or secret in this directory — a browser challenge was considered and deliberately rejected to keep the endpoint scriptable.
+
+Still not exercised: the label-create fallback branch (the repository already has a
+`from-web` label) and the `repository_dispatch` channel (blocked on the two
+prerequisites above).
