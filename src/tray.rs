@@ -13,22 +13,24 @@
 //! track — the reported bug. The app is alive from launch; that is what the
 //! icon signals. Play/pause state lives in the tooltip and the menu label.
 //!
-//! Menu: Show/Hide (only where the platform can unmap the window — see
-//! below), Play/Pause (reflects state), Next, Previous, Quit. Activate (left
-//! click) toggles window visibility. Quit sends [`Command::Quit`] — the
-//! supervisor flushes the report segment and exits, exactly like Ctrl+Q /
-//! MPRIS Quit.
+//! Menu: Show/Hide, Play/Pause (reflects state), Next, Previous, Quit.
+//! Activate (left click) toggles window visibility. Quit sends
+//! [`Command::Quit`] — the supervisor flushes the report segment and exits,
+//! exactly like Ctrl+Q / MPRIS Quit.
 //!
-//! HIDE/SHOW SUPPORT (`crate::wm`): X11 can unmap/map the window, so Show/Hide
-//! works. On Wayland winit 0.30.13's `Window::set_visible` is a no-op, so the
-//! item is disabled and labelled "Hide unavailable on Wayland" instead of
-//! lying (niri implements no `xdg_toplevel.set_minimized` fallback either).
+//! SHOW/HIDE (`crate::session`, `crate::wm`): one call,
+//! [`Session::tray_toggle`], works on every backend. X11 unmaps/maps the live
+//! toplevel. Wayland cannot unmap at all (winit 0.30.13's `Window::set_visible`
+//! is a no-op), so there Hide means the same thing as ✕ — the app's close
+//! policy — and the window is instead destroyed and re-created around the
+//! parked main thread, with playback untouched. The item is therefore enabled
+//! everywhere.
 //!
 //! FALLBACKS (never panics the app — every failure path degrades silently):
 //! * no session bus / no StatusNotifierWatcher / no host → `spawn` returns
 //!   `Err`, logged once to stderr, no tray icon; the window-close policy in
-//!   `ui::update` still applies (quit when nothing has played; hide on X11
-//!   once a track has — restore via MPRIS Raise, `playerctl`, or a relaunch).
+//!   `ui::update` still applies (quit when nothing has played; hide once a
+//!   track has — restore via MPRIS Raise, `playerctl`, or a relaunch).
 //! * the watcher going away mid-run is ksni's `watcher_offline` — the
 //!   default keeps the service registered so it re-appears when the watcher
 //!   returns (e.g. waybar restart).
@@ -36,13 +38,12 @@
 //! Host support: waybar/Hyprland (niri, umbriel) speak SNI natively; KDE
 //! Plasma natively; GNOME needs an AppIndicator extension.
 
+use crate::session::Session;
 use crate::supervisor::{Command, PbSnapshot};
-use eframe::egui;
 use ksni::blocking::TrayMethods;
 use ksni::menu::MenuItem;
 use ksni::{Category, Icon, Status, ToolTip, Tray};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,38 +52,28 @@ use std::time::Duration;
 pub struct TrayItem {
     cmd: Sender<Command>,
     snap: Arc<Mutex<PbSnapshot>>,
-    /// Mirrored window visibility (✕/tray/MPRIS Raise all keep it in sync).
-    hidden: Arc<AtomicBool>,
-    ctx: egui::Context,
+    /// The live window session: mirrored visibility for the Show/Hide label,
+    /// and the one place a toggle (or a raise) can reach the CURRENT
+    /// `egui::Context` — never a cached one (see `crate::session`).
+    session: Session,
 }
 
 impl TrayItem {
-    /// Toggle the window. Where the platform cannot unmap the toplevel
-    /// (Wayland — see `wm`) this is honest about it instead of pretending.
+    /// Toggle the window (Show/Hide menu item and Activate/left click). X11
+    /// unmaps/maps the live window; Wayland cannot, so Hide runs the ✕ policy
+    /// and Show re-creates the window on the parked main thread — `session`
+    /// owns both halves.
     fn show_toggle(&mut self) {
-        if !crate::wm::hide_supported() {
-            // winit no-ops `set_visible` on Wayland and `Focus` is a no-op
-            // too, so there is nothing to hide/show; say so, best-effort
-            // raise, and leave the window alone.
-            eprintln!(
-                "[tray] show_toggle: hide/show unavailable on Wayland — the window \
-                 cannot be unmapped; leaving it as is"
-            );
-            self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            return;
-        }
-        let show = self.hidden.load(Ordering::Relaxed);
         eprintln!(
-            "[tray] show_toggle: {} window (hidden {show} → {})",
-            if show { "showing" } else { "hiding" },
-            !show
+            "[tray] show_toggle: {} window (mode {:?})",
+            if self.session.hidden() {
+                "showing"
+            } else {
+                "hiding"
+            },
+            self.session.mode()
         );
-        // Visible first: Focus alone does not un-hide the window.
-        self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(show));
-        if show {
-            self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
-        self.hidden.store(!show, Ordering::Relaxed);
+        self.session.tray_toggle();
     }
 
     fn playing(&self) -> bool {
@@ -137,7 +128,7 @@ impl Tray for TrayItem {
 
     fn tool_tip(&self) -> ToolTip {
         let pb = self.snap.lock();
-        let mut description = match &pb.track {
+        let description = match &pb.track {
             Some(t) if pb.has_track => {
                 let state = if pb.paused {
                     "paused".to_string()
@@ -148,11 +139,6 @@ impl Tray for TrayItem {
             }
             _ => "nothing playing".into(),
         };
-        if !crate::wm::hide_supported() {
-            // Don't lie: the toplevel cannot be unmapped on Wayland, so the
-            // tray cannot hide/show it (see `wm`).
-            description.push_str("\nWayland: window cannot be hidden — close quits");
-        }
         ToolTip {
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
@@ -166,36 +152,26 @@ impl Tray for TrayItem {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let hidden = self.hidden.load(Ordering::Relaxed);
+        let hidden = self.session.hidden();
         let (play_label, play_icon) = if self.playing() {
             ("Pause", "media-playback-pause")
         } else {
             ("Play", "media-playback-start")
         };
         use ksni::menu::StandardItem as StdItem;
-        // Hide/Show only where the platform can actually unmap the window
-        // (X11). On Wayland it is impossible (winit 0.30.13 no-ops
-        // `set_visible`; niri has no minimize either), so the item is
-        // disabled and says so rather than lying.
-        let visibility_item = if crate::wm::hide_supported() {
-            MenuItem::Standard(StdItem {
-                label: if hidden { "Show Mordent" } else { "Hide Mordent" }.into(),
-                icon_name: if hidden {
-                    "view-refresh".into()
-                } else {
-                    "window-close".into()
-                },
-                activate: Box::new(|t: &mut Self| t.show_toggle()),
-                ..Default::default()
-            })
-        } else {
-            MenuItem::Standard(StdItem {
-                label: "Hide unavailable on Wayland".into(),
-                icon_name: "window-close".into(),
-                enabled: false,
-                ..Default::default()
-            })
-        };
+        // Enabled everywhere: `Session::tray_toggle` knows how hide/show works
+        // on this backend (X11 unmap/map, Wayland session swap) — see
+        // `crate::session`.
+        let visibility_item = MenuItem::Standard(StdItem {
+            label: if hidden { "Show Mordent" } else { "Hide Mordent" }.into(),
+            icon_name: if hidden {
+                "view-refresh".into()
+            } else {
+                "window-close".into()
+            },
+            activate: Box::new(|t: &mut Self| t.show_toggle()),
+            ..Default::default()
+        });
         vec![
             visibility_item,
             MenuItem::Separator,
@@ -239,12 +215,7 @@ impl Tray for TrayItem {
 
 /// Spawn the tray thread. Best-effort by design: ANY failure (no session
 /// bus, no SNI watcher, no host) logs once and leaves the app unchanged.
-pub fn spawn(
-    snap: Arc<Mutex<PbSnapshot>>,
-    cmd: Sender<Command>,
-    hidden: Arc<AtomicBool>,
-    ctx: egui::Context,
-) {
+pub fn spawn(snap: Arc<Mutex<PbSnapshot>>, cmd: Sender<Command>, session: Session) {
     let spawned = std::thread::Builder::new()
         .name("mordent-tray".into())
         .spawn(move || {
@@ -252,8 +223,7 @@ pub fn spawn(
             let item = TrayItem {
                 cmd,
                 snap,
-                hidden,
-                ctx,
+                session,
             };
             let handle = match item.spawn() {
                 Ok(h) => h,

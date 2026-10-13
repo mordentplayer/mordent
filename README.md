@@ -360,8 +360,9 @@ streaming quality through the same handler the window's radio uses.
 (`ViewportCommand::Close` → the same path as `✕`/niri's `Win+Q`) so the close
 policy is testable headlessly: alone it fires after a short delay (idle
 session → the process exits); combined with `MORDENT_DEMO_PLAY` it waits until a
-track is current (played session → the window hides on X11, or the process
-exits on Wayland). `MORDENT_DEMO_TRAY_TOGGLE=<secs>` invokes the tray's Show/Hide
+track is current (played session → the window goes to the tray: unmapped on
+X11, destroyed and re-created on Wayland — the process stays alive either way).
+`MORDENT_DEMO_TRAY_TOGGLE=<secs>` invokes the tray's Show/Hide
 menu action after N seconds through the real `Handle::update` path (the
 pointer cannot click a tray icon headlessly).
 
@@ -458,35 +459,56 @@ appear until the first track.
 
 * **nothing has played yet → Mordent quits** — the same clean flush path as
   Ctrl+Q (the open play-report segment is closed, then the process exits);
-* **a track has played → close to the tray** — the close is cancelled and the
-  window is hidden; music keeps playing from the supervisor thread (this
-  branch needs the platform to be able to hide the window — see below).
+* **a track has played → the window goes to the tray** and the process stays
+  alive: music keeps playing from the supervisor thread, the icon and MPRIS
+  keep working, and **Show** (the tray item, left-click, or MPRIS Raise)
+  brings the window back — with everything it was showing still there.
 
 Real exit is always **Ctrl+Q**, the tray's **Quit**, or **MPRIS Quit** (each
-flushes the report segment first, then exits).
+flushes the report segment first, then exits) — including while the window is
+hidden.
 
-### Hide/Show support (platform matrix)
+### How hiding works (platform matrix)
 
-Hiding the window is a winit capability and it differs per backend
-(winit 0.30.13):
+Hiding a window is a winit capability and it differs per backend
+(winit 0.30.13), so Mordent picks a mechanism rather than a yes/no
+(`src/wm.rs` — `HideMode`):
 
-| Backend | Hide/Show (unmap/map) | `Focus`/raise | `Minimize` |
-|---|---|---|---|
-| X11 | ✅ `Window::set_visible` — `x11/window.rs:1123` | ✅ | ✅ |
-| Wayland | ❌ `Window::set_visible` is a **no-op** — `wayland/window/mod.rs:253` | ❌ `focus_window` is empty — `wayland/window/mod.rs:629` | ⚠️ `set_minimized(true)` only; un-minimizing is ignored — `wayland/window/mod.rs:436-445` |
+| Backend | Mechanism | What "hide" does |
+|---|---|---|
+| X11 | `Unmap` | `Window::set_visible(false)` — the toplevel is unmapped and the window, its `egui::Context` and the frame loop all stay alive — `x11/window.rs:1123` |
+| Wayland | `Recreate` | the toplevel cannot be unmapped (`wayland/window/mod.rs:253`: `set_visible` is a no-op; `focus_window` is empty at line 629; `set_minimized` only warns at 436-445, and niri implements no such fallback), so "hide" ends the eframe **window session** — the window is destroyed and `run_native` returns — while the process (audio, supervisor, tray, MPRIS) keeps running. "Show" runs `run_native` again. |
 
-On **X11** Show/Hide works fully: the tray's Hide/Show item, left-click
-(Activate), close-to-tray and MPRIS Raise all map/unmap the window. On
-**Wayland** a client cannot unmap its toplevel at all — winit no-ops it, and
-niri implements no `xdg_toplevel.set_minimized` fallback either — so Mordent does
-not pretend:
+The Wayland mechanism is legal because eframe 0.32.3 keeps a thread-local
+`EventLoop` and reuses it precisely to support closing and opening a window
+more than once (`eframe/src/native/run.rs:46`), and
+`EventLoopExtRunOnDemand::run_app_on_demand` clears the exit flag before each
+run — so a second `run_native` call on the same thread re-runs the loop
+cleanly. Two details make the swap work:
 
-* the tray's Hide/Show item is **disabled and labelled "Hide unavailable on
-  Wayland"** (the tooltip carries the same note), and
-* **window close quits** on Wayland as well, whether or not a track has
-  played: hiding is impossible and silently doing nothing is the bug this
-  replaces. The `ever_played` "close to tray" branch therefore only applies
-  where hiding actually works.
+* **The window really goes away.** Dropping a Wayland window only raises a flag
+  in winit (`wayland/window/mod.rs:718-724`) — the surface is destroyed on the
+  *next* event-loop iteration
+  (`wayland/event_loop/mod.rs:470-481`), while eframe drops the window as the
+  loop is already exiting (`eframe/src/native/run.rs:221-226`). So the hide
+  spends one extra, deliberately windowless event-loop iteration afterwards;
+  otherwise the old toplevel would stay on screen for as long as the process is
+  parked (and a parked process never runs another iteration on its own).
+* **The app object survives.** egui hands out a *new* `Context` per session, so
+  the same app (search results, view state, settings window state, in-flight
+  requests, and the supervisor/tray/MPRIS handles underneath) is carried across
+  the gap and re-bound to the new context (`src/ui.rs` — `SessionKeeper`,
+  `App::session_init`).
+* **Nobody caches a `Context`.** The tray, the supervisor, the wake thread and
+  the update threads read the *current* session context from a shared handle
+  (`src/session.rs`), because a stale `Context::request_repaint()` silently
+  does nothing — that would freeze the progress bar and make tray/MPRIS
+  actions look dead.
+
+So Show/Hide works the same way everywhere from the user's point of view: the
+tray's **Show/Hide** item is enabled on every backend, left-click (Activate)
+toggles, and during the hidden period the tray and MPRIS still serve Play/Pause,
+Next/Previous and the now-playing metadata.
 
 Host support: waybar/Hyprland/niri/umbriel, KDE Plasma — SNI natively; GNOME
 needs an AppIndicator extension. No StatusNotifier host (bare X11, VPS)? The

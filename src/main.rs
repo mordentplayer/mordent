@@ -8,6 +8,7 @@ mod player;
 mod prefetch;
 mod queuemodel;
 mod report;
+mod session;
 mod setup;
 mod supervisor;
 mod ui;
@@ -31,18 +32,16 @@ mod tray;
 /// (quit when nothing has played; hide once a track has).
 #[cfg(not(target_os = "linux"))]
 pub mod tray {
+    use crate::session::Session;
     use crate::supervisor::Command;
-    use eframe::egui;
     use parking_lot::Mutex;
-    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::Sender;
     use std::sync::Arc;
 
     pub fn spawn(
         _snap: Arc<Mutex<crate::supervisor::PbSnapshot>>,
         _cmd: Sender<Command>,
-        _hidden: Arc<AtomicBool>,
-        _ctx: egui::Context,
+        _session: Session,
     ) {
         eprintln!("[tray] not supported on this platform — running without a tray icon; window close quits when nothing has played, and hides the window once a track has (restore with MPRIS Raise or a relaunch)");
     }

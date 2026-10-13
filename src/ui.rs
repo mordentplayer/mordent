@@ -27,6 +27,7 @@ use crate::fonts::FontChoice;
 use crate::lyrics::{self, LyricTimeline};
 use crate::mpris;
 use crate::prefetch::Prefetcher;
+use crate::session::Session;
 use crate::supervisor::{self, Command, PbSnapshot};
 use crate::theme::Theme;
 use crate::update::{self, Check};
@@ -387,11 +388,14 @@ fn wake_thread_sleep(ms: u64) -> Option<std::time::Duration> {
 /// for an unfocused window (niri-family compositors stop delivering them)
 /// would silence the frame loop, and with it the driver that could revive it
 /// — auto-advance then waits for focus. This thread re-issues the wake from
-/// off-frame every cycle via `Context::request_repaint`, which eframe wires
+/// off-frame every cycle via `Session::request_repaint`, which eframe wires
 /// through its `EventLoopProxy` (an event-loop user event, not a compositor
 /// frame callback), so playback keeps advancing while the window is
-/// unfocused. Lives until process exit, like the mpris/prefetch threads.
-fn spawn_wake_thread(ctx: egui::Context, wake_ms: Arc<AtomicU64>) {
+/// unfocused. It reads the CURRENT session's context on every wake — after a
+/// Wayland hide→show the old `egui::Context` is dead and would swallow the
+/// wake (see `crate::session`). Lives until process exit, like the
+/// mpris/prefetch threads.
+fn spawn_wake_thread(session: Session, wake_ms: Arc<AtomicU64>) {
     std::thread::Builder::new()
         .name("mordent-wake".into())
         .spawn(move || loop {
@@ -401,7 +405,7 @@ fn spawn_wake_thread(ctx: egui::Context, wake_ms: Arc<AtomicU64>) {
                     // Sleep exactly as long as the in-frame driver intended:
                     // never more often than the driver requests.
                     std::thread::sleep(d);
-                    ctx.request_repaint();
+                    session.request_repaint();
                 }
             }
         })
@@ -523,9 +527,11 @@ pub struct App {
     /// driver + wake thread + supervisor wakes) so `update` effectively stops
     /// being scheduled — the decoupling proof that playback still advances.
     no_repaint: bool,
-    /// Mirrored window visibility, kept in sync by the ✕ handler (hide),
-    /// the tray's Show/Hide + Activate, and MPRIS Raise (show).
-    hidden: Arc<std::sync::atomic::AtomicBool>,
+    /// The live window session: the CURRENT `egui::Context` (a Wayland
+    /// hide→show hands out a new one), the mirrored window visibility the ✕
+    /// handler / tray / MPRIS Raise keep in sync, and the parked-thread wake
+    /// used to re-create the window. See `crate::session`.
+    session: Session,
     /// Last volume/repeat values seen in the snapshot: external changes
     /// (MPRIS / tray) are adopted into the local mirrors + state.toml.
     vol_seen: f32,
@@ -548,9 +554,6 @@ pub struct App {
     /// existed at launch. Never under MORDENT_SELFTEST; `MORDENT_DEMO_SETUP=<1..7>`
     /// lands directly on a step (headless screenshot hook).
     setup: Option<crate::setup::SetupState>,
-    /// egui context, kept only so off-frame update threads can request a frame
-    /// when their message lands (the loop parks when nothing is playing).
-    ctx: egui::Context,
     // ---- updates (see update.rs) ----
     /// Result of the last completed check; `None` until one finishes.
     update_check: Option<Check>,
@@ -587,7 +590,13 @@ pub struct App {
 }
 
 impl App {
-    fn new(cfg: Config, egui_ctx: egui::Context, start_wizard: bool) -> Self {
+    /// Build the app for the FIRST window session. Everything process-lifetime
+    /// lives here (supervisor, MPRIS, tray, wake thread, the demo/headless
+    /// hooks): a Wayland hide→show only swaps the window, and the app itself is
+    /// carried across sessions by `SessionKeeper`, so this runs exactly once.
+    /// Per-session, context-bound setup is `session_init`, which runs on every
+    /// session start (including this one).
+    fn new(cfg: Config, session: Session, start_wizard: bool) -> Self {
         let state = load_state();
         let (theme, theme_warns) = Theme::load();
         for w in &theme_warns {
@@ -621,8 +630,6 @@ impl App {
         let (tx, rx) = channel();
         let prefetch = Prefetcher::new(&cfg);
         let queue = Arc::new(parking_lot::Mutex::new(Queue::default()));
-        // Mirrored window visibility (✕/tray/MPRIS Raise keep it in sync).
-        let hidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // MORDENT_SELFTEST wrapper probe result (filled on a background thread —
         // blocking HTTP must never run on the UI thread).
         let wrapper_cacheable = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -651,21 +658,15 @@ impl App {
             queue.clone(),
             if selftest { Repeat::Off } else { repeat },
             volume,
-            egui_ctx.clone(),
+            session.clone(),
             no_repaint,
             mpris_rx,
             prefetch.clone(),
-            hidden.clone(),
         );
         // Tray (StatusNotifierItem; stubbed no-op off Linux — see main.rs).
         // Best-effort by design: any D-Bus/watcher failure degrades to no
         // icon, and ✕ still hides the window either way.
-        crate::tray::spawn(
-            pb.clone(),
-            cmd.clone(),
-            hidden.clone(),
-            egui_ctx.clone(),
-        );
+        crate::tray::spawn(pb.clone(), cmd.clone(), session.clone());
         // Parked sentinel until the first frame publishes a real delay.
         let wake_ms = Arc::new(AtomicU64::new(WAKE_PARKED));
         // First-run wizard. MORDENT_SELFTEST never enters it; MORDENT_DEMO_SETUP=<1..7>
@@ -754,7 +755,7 @@ impl App {
             sup_rx,
             wake_ms: wake_ms.clone(),
             no_repaint,
-            hidden,
+            session,
             vol_seen: volume,
             repeat_seen: repeat,
             shuffle: false,
@@ -762,7 +763,6 @@ impl App {
             decode_logged: false,
             wrapper_cacheable,
             setup,
-            ctx: egui_ctx.clone(),
             update_check: None,
             update_busy: false,
             update_job: None,
@@ -814,7 +814,7 @@ impl App {
                 .ok();
         }
         if !no_repaint {
-            spawn_wake_thread(egui_ctx.clone(), wake_ms);
+            spawn_wake_thread(app.session.clone(), wake_ms);
         }
         match state.last_view.as_deref() {
             // older builds had Albums as a main tab; map it to the Search
@@ -910,7 +910,7 @@ impl App {
         // playback would race the close and the idle branch would win; alone it
         // fires after a short delay that lets the window map.
         if std::env::var("MORDENT_DEMO_CLOSE").is_ok() {
-            let ctx = egui_ctx.clone();
+            let session = app.session.clone();
             let pb = app.pb.clone();
             let wait_for_play = std::env::var("MORDENT_DEMO_PLAY").is_ok();
             std::thread::Builder::new()
@@ -934,7 +934,7 @@ impl App {
                          ever_played={})",
                         pb.lock().ever_played
                     );
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    session.send(egui::ViewportCommand::Close);
                 })
                 .expect("spawn mordent-demo-close thread");
         }
@@ -1182,7 +1182,7 @@ impl App {
         self.update_busy = true;
         self.update_job = None;
         let tx = self.tx.clone();
-        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        let session = (!self.no_repaint).then(|| self.session.clone());
         std::thread::Builder::new()
             .name("mordent-update-check".into())
             .spawn(move || {
@@ -1197,8 +1197,8 @@ impl App {
                     }
                     Check::Failed { reason } => eprintln!("[update] check failed: {reason}"),
                 }
-                if let Some(ctx) = &ctx {
-                    ctx.request_repaint();
+                if let Some(session) = &session {
+                    session.request_repaint();
                 }
                 let _ = tx.send(Msg::Update(Box::new(check), sums));
             })
@@ -1225,7 +1225,7 @@ impl App {
         let prefix = std::path::PathBuf::from(crate::setup::helper_prefix());
         self.helper_busy = true;
         let tx = self.tx.clone();
-        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        let session = (!self.no_repaint).then(|| self.session.clone());
         std::thread::Builder::new()
             .name("mordent-helper-check".into())
             .spawn(move || {
@@ -1234,8 +1234,8 @@ impl App {
                     "[update] helper payload: {:?} (installed vs this build)",
                     report.state
                 );
-                if let Some(ctx) = &ctx {
-                    ctx.request_repaint();
+                if let Some(session) = &session {
+                    session.request_repaint();
                 }
                 let _ = tx.send(Msg::HelperState(Box::new(report), key));
             })
@@ -1307,7 +1307,7 @@ impl App {
         self.update_job = Some(job);
         self.update_log.clear();
         let tx = self.tx.clone();
-        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        let session = (!self.no_repaint).then(|| self.session.clone());
         std::thread::Builder::new()
             .name("mordent-update-download".into())
             .spawn(move || {
@@ -1315,8 +1315,8 @@ impl App {
                     if line.starts_with("downloading") {
                         eprintln!("[update] {line}");
                     }
-                    if let Some(ctx) = &ctx {
-                        ctx.request_repaint();
+                    if let Some(session) = &session {
+                        session.request_repaint();
                     }
                     let _ = tx.send(Msg::UpdateLog(line));
                 };
@@ -1335,8 +1335,8 @@ impl App {
                         )
                     }
                 };
-                if let Some(ctx) = &ctx {
-                    ctx.request_repaint();
+                if let Some(session) = &session {
+                    session.request_repaint();
                 }
                 let _ = tx.send(msg);
             })
@@ -1358,13 +1358,13 @@ impl App {
         let port = helper_port(&self.cfg.wrapper_url);
         let (htx, hrx) = channel();
         let tx = self.tx.clone();
-        let ctx = (!self.no_repaint).then(|| self.ctx.clone());
+        let session = (!self.no_repaint).then(|| self.session.clone());
         std::thread::Builder::new()
             .name("mordent-helper-forward".into())
             .spawn(move || {
                 for ev in hrx {
-                    if let Some(ctx) = &ctx {
-                        ctx.request_repaint();
+                    if let Some(session) = &session {
+                        session.request_repaint();
                     }
                     let _ = tx.send(Msg::Helper(ev));
                 }
@@ -3103,6 +3103,28 @@ impl App {
         self.apply_theme(ctx);
     }
 
+    /// Idempotent per-SESSION init, run by [`SessionKeeper`] on every session
+    /// start (including the first). eframe hands the app a **new**
+    /// `egui::Context` for every session (see `crate::session`), so anything
+    /// context-bound that the previous session installed is gone: re-install
+    /// the theme and the bundled fonts, and force the first-frame poll to
+    /// re-apply to THIS context. Everything else the app owns (results, view
+    /// state, settings state, channels, the supervisor/tray/MPRIS threads) is
+    /// plain data on `self` and survives untouched.
+    fn session_init(&mut self, ctx: &egui::Context) {
+        // `theme_poll = None` = "treat the next frame as the first": re-read
+        // theme.toml (external edits included) and apply it to this context.
+        self.theme_poll = None;
+        // Force the font chain: the choice is usually unchanged, so
+        // `apply_theme`'s diff would skip a context that has none at all.
+        crate::fonts::apply(ctx, self.theme.font);
+        self.font = self.theme.font;
+        self.theme.apply(ctx);
+        // The window is new: its title starts at eframe's app name, so the
+        // next frame must send ours again.
+        self.last_title = String::new();
+    }
+
     /// Push `self.theme` into egui's visuals, and the bundled fonts when the
     /// `font` choice changed. ONE apply path, shared by the ~1 s file
     /// hot-reload poll and the Appearance section's live edits.
@@ -3135,18 +3157,20 @@ enum CloseAction {
     /// Real exit: flush the report segment and terminate (the supervisor's
     /// `Command::Quit` path — the same single exit authority as Ctrl+Q).
     Quit,
-    /// Close to tray: veto the close and hide the window.
+    /// Close to tray, keeping the process alive in both backends: X11 unmaps
+    /// the live window; Wayland ends the session (destroys the window) and
+    /// parks the main thread until Show. Which of the two is a `HideMode`
+    /// detail (see `crate::session`).
     Hide,
 }
 
-/// The user's policy: a session that has not played anything yet exits on
-/// close; once a track has played, close goes to the tray — but only where the
-/// platform can actually hide the window (X11). On Wayland hiding is
-/// impossible (see `wm`), and silently doing nothing is the exact bug this
-/// replaces, so the played branch quits there too (cleanly, like the idle
-/// branch). Pure so it is unit tested.
-fn close_action(ever_played: bool, hide_supported: bool) -> CloseAction {
-    if ever_played && hide_supported {
+/// The user's policy, unchanged: a session that has not played anything yet
+/// exits on close; once a track has played, close goes to the tray. Pure so it
+/// is unit tested — the platform only decides HOW `Hide` is carried out, never
+/// whether it is allowed (Wayland cannot unmap, but it can destroy and
+/// re-create the window; see `wm::HideMode`).
+fn close_action(ever_played: bool) -> CloseAction {
+    if ever_played {
         CloseAction::Hide
     } else {
         CloseAction::Quit
@@ -3159,21 +3183,15 @@ mod close_policy_tests {
 
     #[test]
     fn idle_session_quits_on_close() {
-        // Nothing played yet → real exit, whatever the platform.
-        assert_eq!(close_action(false, true), CloseAction::Quit);
-        assert_eq!(close_action(false, false), CloseAction::Quit);
+        // Nothing played yet → real exit, whatever the backend.
+        assert_eq!(close_action(false), CloseAction::Quit);
     }
 
     #[test]
-    fn played_session_hides_where_supported() {
-        assert_eq!(close_action(true, true), CloseAction::Hide);
-    }
-
-    #[test]
-    fn played_session_quits_on_wayland() {
-        // Hiding is impossible on Wayland; doing nothing is the bug we are
-        // fixing, so the played branch quits cleanly there too.
-        assert_eq!(close_action(true, false), CloseAction::Quit);
+    fn played_session_closes_to_tray() {
+        // Once a track has played, close-to-tray is the policy on every
+        // backend: X11 unmaps, Wayland recreates (see `wm::HideMode`).
+        assert_eq!(close_action(true), CloseAction::Hide);
     }
 }
 
@@ -3186,33 +3204,62 @@ impl eframe::App for App {
 
         // Window close (✕ / WM close — niri's Win+Q arrives here too).
         // Policy (see [`close_action`]): no track played yet → quit for real;
-        // a track HAS played → close to tray where the platform can hide the
-        // window (X11), else quit as well (Wayland cannot unmap — `wm`).
+        // a track HAS played → close to tray. HOW that hide happens is
+        // `session.mode()` (see `wm::HideMode` and `crate::session`):
         //
-        // CancelClose is sent on BOTH branches in THIS pass: eframe vetoes the
-        // close (see its `close_requested` handling), which keeps the event
-        // loop alive so the supervisor's flush-then-`process::exit` stays the
-        // single exit authority (letting eframe close would race `main`
-        // returning against the report flush).
+        // * `Unmap` (X11): CancelClose vetoes the close in THIS pass (eframe
+        //   otherwise ends the session — see its `close_requested` handling)
+        //   and the live window is unmapped. The event loop stays alive so the
+        //   supervisor's flush-then-`process::exit` remains the single exit
+        //   authority.
+        // * `Recreate` (Wayland): the toplevel cannot be unmapped, so the
+        //   session IS ended — CancelClose is deliberately NOT sent, eframe
+        //   then exits the loop (`epi_integration.rs:286`) and `run_native`
+        //   returns to `launch_with`, which parks until Show (after
+        //   `reap_hidden_window` destroys the dropped window's surface).
+        //   `begin_recreate_hide` marks the teardown as a hide so the keeper
+        //   does not flush and the main loop re-opens instead of exiting.
+        //
+        // The first-run wizard (`setup.is_some()`) is the one place that does
+        // NOT get the new Wayland hide: it has no hide-to-tray semantics (a
+        // close there always quit on Wayland — see `setup.rs`, which owns no
+        // close handling), so that one combination keeps quitting on Wayland,
+        // exactly as before.
         if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            match close_action(pb.ever_played, crate::wm::hide_supported()) {
+            let action = if self.setup.is_some()
+                && self.session.mode() == crate::wm::HideMode::Recreate
+            {
+                CloseAction::Quit
+            } else {
+                close_action(pb.ever_played)
+            };
+            match action {
                 CloseAction::Quit => {
+                    // Same on both branches: veto the close so the supervisor
+                    // stays the single exit authority (letting eframe close
+                    // would race `main` returning against the report flush).
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     if pb.ever_played {
-                        eprintln!(
-                            "[wm] close requested: a track has played but Wayland \
-                             cannot hide the window → quitting (same flush path as Ctrl+Q)"
-                        );
+                        eprintln!("[wm] close requested: quitting (same flush path as Ctrl+Q)");
                     } else {
                         eprintln!("[wm] close requested: nothing played yet → quitting");
                     }
                     self.exit_flush();
                 }
-                CloseAction::Hide => {
-                    eprintln!("[wm] close requested: closing to tray");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    self.hidden.store(true, Ordering::Relaxed);
-                }
+                CloseAction::Hide => match self.session.mode() {
+                    crate::wm::HideMode::Unmap => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        eprintln!("[wm] close requested: closing to tray (unmap)");
+                        self.session.hide_unmap();
+                    }
+                    crate::wm::HideMode::Recreate => {
+                        eprintln!(
+                            "[wm] close requested: closing to tray (end session; \
+                             the window is destroyed, the process keeps playing)"
+                        );
+                        self.session.begin_recreate_hide();
+                    }
+                },
             }
         }
 
@@ -4995,20 +5042,157 @@ pub fn launch_setup(cfg: Config) -> anyhow::Result<()> {
     launch_with(cfg, true)
 }
 
+/// The app value, alive across window sessions: the main loop and
+/// [`SessionKeeper`] hand the same box back and forth (see the keeper docs).
+/// `Rc<RefCell<_>>`, not `Arc<Mutex<_>>`: neither the boxed app nor this slot
+/// ever leaves the UI thread — it is touched only by the `AppCreator` and by
+/// the keeper's `Drop`, both inside the event loop.
+type AppSlot = std::rc::Rc<std::cell::RefCell<Option<Box<dyn MordentApp>>>>;
+
+/// What the keeper needs from the app: eframe's [`eframe::App`] plus the
+/// per-session init hook. Boxed as `dyn MordentApp` — NOT `dyn eframe::App` —
+/// so the same value can be re-bound to a new `egui::Context`.
+trait MordentApp: eframe::App {
+    /// See `App::session_init`.
+    fn session_init(&mut self, ctx: &egui::Context);
+}
+
+impl MordentApp for App {
+    fn session_init(&mut self, ctx: &egui::Context) {
+        App::session_init(self, ctx)
+    }
+}
+
+/// Keeps the live app alive ACROSS window sessions.
+///
+/// eframe 0.32.3 drops the app when a session ends — and on Wayland a hide IS
+/// a session end (the window is destroyed; see `wm::HideMode`). Dropping the
+/// app would take the supervisor/tray/MPRIS handles, the queue, the search
+/// results and every in-flight channel with it, so [`Drop`] hands the box back
+/// to the shared slot instead; the next session's `AppCreator` takes it out
+/// again and [`MordentApp::session_init`] re-binds the context-bound pieces to
+/// the new `egui::Context`.
+struct SessionKeeper {
+    app: Option<Box<dyn MordentApp>>,
+    slot: AppSlot,
+    session: Session,
+}
+
+impl Drop for SessionKeeper {
+    fn drop(&mut self) {
+        *self.slot.borrow_mut() = self.app.take();
+    }
+}
+
+impl eframe::App for SessionKeeper {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(app) = self.app.as_mut() {
+            app.update(ctx, frame);
+        }
+    }
+
+    /// eframe calls this whenever a session ends (`run.rs`'s LoopExiting →
+    /// `save_and_destroy`), INCLUDING a Wayland hide. The app's flush is the
+    /// real-quit path only: while hidden the supervisor must keep playing and
+    /// the report segment must stay open — `session.hide_pending` is exactly
+    /// that distinction.
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if self.session.hide_pending() {
+            return;
+        }
+        if let Some(app) = self.app.as_mut() {
+            app.on_exit(gl);
+        }
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        match self.app.as_ref() {
+            Some(app) => app.clear_color(visuals),
+            None => [0.0; 4],
+        }
+    }
+}
+
 fn launch_with(cfg: Config, start_wizard: bool) -> anyhow::Result<()> {
-    // Transparent viewport: the window background comes from the theme's
-    // `bg` color at `opacity` (see `App::clear_color` / theme.rs).
-    //
-    // Caveat: see-through only works when a compositor is running (X11
-    // compositing manager / Wayland). On a bare X server (or a headless Xvfb
-    // like the selftest uses) there is nothing to blend against, so the window
-    // just renders solid at full alpha. That is a silent degradation — no
-    // error, no panic, and playback/UI behave identically either way.
-    //
-    // Window icon: the app mark, rasterised by `brand` — the taskbar/dock shows
-    // the logo instead of winit's default. Wayland has no protocol for this,
-    // so the compositor there uses the .desktop entry's icon instead.
-    let native = eframe::NativeOptions {
+    // One session handle for the whole process: it owns the current window's
+    // `egui::Context`, the mirrored visibility the tray reads, and the
+    // parked-thread wake used to re-create the window (see `crate::session`).
+    let session = Session::new(crate::wm::hide_mode());
+    let slot: AppSlot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    loop {
+        // Transparent viewport: the window background comes from the theme's
+        // `bg` color at `opacity` (see `App::clear_color` / theme.rs).
+        //
+        // Caveat: see-through only works when a compositor is running (X11
+        // compositing manager / Wayland). On a bare X server (or a headless
+        // Xvfb like the selftest uses) there is nothing to blend against, so
+        // the window just renders solid at full alpha. That is a silent
+        // degradation — no error, no panic, and playback/UI behave identically
+        // either way.
+        //
+        // Window icon: the app mark, rasterised by `brand` — the taskbar/dock
+        // shows the logo instead of winit's default. Wayland has no protocol
+        // for this, so the compositor there uses the .desktop entry's icon
+        // instead.
+        let native = native_options();
+        let creator_cfg = cfg.clone();
+        let creator_session = session.clone();
+        let creator_slot = slot.clone();
+        let res = eframe::run_native(
+            "mordent",
+            native,
+            // Fonts are bundled (`src/fonts.rs`, `include_bytes!`) and installed
+            // by `session_init`: nothing is read from the filesystem, so the UI
+            // renders identically on a bare system.
+            Box::new(move |cc| {
+                let ctx = cc.egui_ctx.clone();
+                creator_session.set_ctx(ctx.clone());
+                let mut app = match creator_slot.borrow_mut().take() {
+                    // Re-opened after a hide: the SAME app, on a new context.
+                    Some(app) => app,
+                    // First window of this process.
+                    None => Box::new(App::new(
+                        creator_cfg,
+                        creator_session.clone(),
+                        start_wizard,
+                    )),
+                };
+                app.session_init(&ctx);
+                Ok(Box::new(SessionKeeper {
+                    app: Some(app),
+                    slot: creator_slot.clone(),
+                    session: creator_session.clone(),
+                }))
+            }),
+        )
+        .map_err(|e| anyhow::anyhow!("eframe: {e}"));
+        // The window is gone, and with it its `egui::Context`: drop the handle
+        // so a wake from a still-running thread becomes a cheap no-op.
+        session.clear_ctx();
+        if !session.hide_pending() {
+            // A real exit (or an eframe failure): nothing parks.
+            return res;
+        }
+        // Wayland hide, step 2: make the dropped window actually leave the
+        // compositor. See `reap_hidden_window` — one extra event-loop
+        // iteration, deliberately without a window of its own.
+        reap_hidden_window();
+        // The process stays up (audio, tray, MPRIS all keep running). Park
+        // until Show — tray Activate/Show or MPRIS Raise — then run
+        // `run_native` again. This is legal because eframe reuses its
+        // thread-local event loop, which winit's `run_app_on_demand` re-runs
+        // (see `wm`'s module docs for the citations).
+        eprintln!("[wm] window hidden — waiting for Show (tray Activate / MPRIS Raise)");
+        session.wait_until_shown();
+        session.clear_hide_pending();
+        eprintln!("[wm] Show requested — reopening the window");
+    }
+}
+
+/// The viewport every session uses (transparent, app-icon, 1100x720). Built
+/// per session: `NativeOptions` is not `Clone`.
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([760.0, 420.0])
@@ -5019,16 +5203,57 @@ fn launch_with(cfg: Config, start_wizard: bool) -> anyhow::Result<()> {
             })
             .with_transparent(true),
         ..Default::default()
-    };
-    eframe::run_native(
+    }
+}
+
+/// Marks the [`reap_hidden_window`] session's deliberate AppCreator failure.
+#[derive(Debug)]
+struct ReapingSession;
+
+impl std::fmt::Display for ReapingSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reaping session — no window, no app (see reap_hidden_window)")
+    }
+}
+
+impl std::error::Error for ReapingSession {}
+
+/// Give winit the one event-loop iteration it needs to finish tearing down the
+/// window the previous session dropped.
+///
+/// **Why this is needed** (all winit 0.30.13): dropping a Wayland `Window`
+/// does NOT destroy its surface — it only raises a flag and pings the loop
+/// (`wayland/window/mod.rs:718-724`); the surface (and with it the toplevel
+/// the compositor shows) is destroyed on the *next* loop iteration, in
+/// `WinitState::single_iteration` (`wayland/event_loop/mod.rs:470-481`).
+/// eframe drops the window while the loop is already exiting
+/// (`LoopExiting` → `save_and_destroy`: `native/run.rs:221-226`,
+/// `native/glow_integration.rs:383-394`), i.e. after its last iteration, so
+/// without one more iteration the old window stays mapped — and a parked
+/// process (which is the whole point of hide-to-tray) would never run one.
+/// Verified against headless sway: without this call the "hidden" window keeps
+/// taking part in the layout (`swaymsg -t get_tree` still lists it).
+///
+/// **How**: `run_native` runs the loop once more (eframe's reused event loop;
+/// `run_app_on_demand` clears the exit flag, `native/run.rs:317-326`). The
+/// session must not leave a window of its own behind, so its AppCreator
+/// declines to build an app: eframe creates the window *before* calling the
+/// creator (`glow_integration.rs:277-305`) and drops it on the error path —
+/// still inside that same iteration, so the iteration's reap loop destroys
+/// both it and the hidden window, and no new toplevel is ever painted (a never
+/// painted Wayland surface is never mapped).
+fn reap_hidden_window() {
+    let res = eframe::run_native(
         "mordent",
-        native,
-        // Fonts are bundled (`src/fonts.rs`, `include_bytes!`) and installed
-        // by the first `App::poll_theme`: nothing is read from the filesystem,
-        // so the UI renders identically on a bare system.
-        Box::new(move |cc| Ok(Box::new(App::new(cfg, cc.egui_ctx.clone(), start_wizard)))),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe: {e}"))
+        native_options(),
+        Box::new(|_cc| Err(Box::new(ReapingSession))),
+    );
+    match res {
+        // The expected outcome: the reap session ends itself this way.
+        Err(eframe::Error::AppCreation(e)) if e.is::<ReapingSession>() => {}
+        Err(e) => eprintln!("[wm] hide: the window-teardown session failed: {e}"),
+        Ok(()) => {}
+    }
 }
 
 #[cfg(test)]

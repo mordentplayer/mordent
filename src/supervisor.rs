@@ -51,7 +51,6 @@ use crate::prefetch::Prefetcher;
 use crate::queuemodel::{Advance, Queue, Repeat};
 use crate::report::PlayReporter;
 use crate::stream;
-use eframe::egui;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
@@ -999,15 +998,16 @@ struct RealFx {
     cfg: Config,
     tx: Sender<Command>,
     ui_tx: Sender<String>,
-    ctx: egui::Context,
+    /// The live window session. It owns the CURRENT `egui::Context` (a
+    /// re-created session hands out a new one) and the mirrored visibility, so
+    /// Raise and the wakes address whatever window exists right now — see
+    /// `crate::session`.
+    session: crate::session::Session,
     /// `MORDENT_NO_REPAINT=1` debug hook: suppress ALL repaint requests so the
     /// frame loop stays parked on an unfocused window — the decoupling proof
     /// that playback still advances with the UI effectively stopped.
     /// Playback/advance/reporting here do not depend on it at all.
     no_repaint: bool,
-    /// Mirrored window visibility; Raise clears it so the tray's Show/Hide
-    /// label stays truthful.
-    hidden: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Effects for RealFx {
@@ -1041,7 +1041,7 @@ impl Effects for RealFx {
 
     fn wake_ui(&mut self) {
         if !self.no_repaint {
-            self.ctx.request_repaint();
+            self.session.request_repaint();
         }
     }
 
@@ -1052,17 +1052,16 @@ impl Effects for RealFx {
     }
 
     fn show_window(&mut self) {
-        // Visible first: Focus alone does not un-hide a tray-hidden window.
-        self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        self.hidden
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Un-hides, raises, or re-creates the window — whichever this backend
+        // needs (see `crate::session`); also clears the mirrored visibility so
+        // the tray's Show/Hide label stays truthful.
+        self.session.show();
     }
 
     fn error(&mut self, msg: String) {
         let _ = self.ui_tx.send(msg);
         if !self.no_repaint {
-            self.ctx.request_repaint();
+            self.session.request_repaint();
         }
     }
 }
@@ -1078,11 +1077,10 @@ pub fn spawn(
     queue: Arc<Mutex<Queue>>,
     repeat: Repeat,
     volume: f32,
-    ctx: egui::Context,
+    session: crate::session::Session,
     no_repaint: bool,
     mpris_rx: Option<Receiver<mpris::Command>>,
     prefetch: Prefetcher,
-    hidden: Arc<std::sync::atomic::AtomicBool>,
 ) -> (Sender<Command>, Arc<Mutex<PbSnapshot>>, Receiver<String>) {
     let (tx, rx) = channel();
     let snap = Arc::new(Mutex::new(PbSnapshot {
@@ -1098,8 +1096,8 @@ pub fn spawn(
         .name("mordent-supervisor".into())
         .spawn(move || {
             run_thread(
-                cfg, queue, snap_thread, repeat, volume, ctx, no_repaint, mpris_rx, prefetch,
-                hidden, tx_thread, rx, ui_tx,
+                cfg, queue, snap_thread, repeat, volume, session, no_repaint, mpris_rx, prefetch,
+                tx_thread, rx, ui_tx,
             );
         });
     if let Err(e) = spawned {
@@ -1116,11 +1114,10 @@ fn run_thread(
     snap: Arc<Mutex<PbSnapshot>>,
     repeat: Repeat,
     volume: f32,
-    ctx: egui::Context,
+    session: crate::session::Session,
     no_repaint: bool,
     mpris_rx: Option<Receiver<mpris::Command>>,
     prefetch: Prefetcher,
-    hidden: Arc<std::sync::atomic::AtomicBool>,
     tx: Sender<Command>,
     rx: Receiver<Command>,
     ui_tx: Sender<String>,
@@ -1160,9 +1157,8 @@ fn run_thread(
         cfg,
         tx,
         ui_tx,
-        ctx,
+        session,
         no_repaint,
-        hidden,
     };
     loop {
         sup.drain_mpris(&mut fx);
