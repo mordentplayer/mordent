@@ -49,6 +49,11 @@ struct Inner {
     /// `run_native` as a real exit. Sticky until the main loop clears it: a
     /// Show racing the teardown must still reopen the window.
     hide_pending: AtomicBool,
+    /// Set when the TRAYS's Hide asked for a hide explicitly. The close
+    /// handler honours it over the ✕ policy (`ever_played`): the tray is the
+    /// way back, so an explicit "Hide Mordent" must never quit the app the way
+    /// an unplayed ✕ does. Taken by the first close it causes.
+    explicit_hide: AtomicBool,
 }
 
 impl Session {
@@ -59,6 +64,7 @@ impl Session {
             shown: Mutex::new(true),
             shown_cv: Condvar::new(),
             hide_pending: AtomicBool::new(false),
+            explicit_hide: AtomicBool::new(false),
         }))
     }
 
@@ -140,6 +146,18 @@ impl Session {
         self.0.hide_pending.store(false, Ordering::SeqCst);
     }
 
+    /// The tray's Hide: an explicit request that always hides, whatever the ✕
+    /// policy would do (see [`Session::take_explicit_hide`]).
+    pub fn request_explicit_hide(&self) {
+        self.0.explicit_hide.store(true, Ordering::SeqCst);
+    }
+
+    /// Did the tray ask for an explicit hide? Taken by the close handler that
+    /// acts on it, so it can never leak onto a later ✕.
+    pub fn take_explicit_hide(&self) -> bool {
+        self.0.explicit_hide.swap(false, Ordering::SeqCst)
+    }
+
     /// Bring the window up: unmap-hide → map it here; recreate-hide → wake the
     /// parked main loop, which runs `run_native` again. Also raises an
     /// already-visible window (MPRIS Raise), and is what the tray's
@@ -165,6 +183,9 @@ impl Session {
             match self.0.mode {
                 HideMode::Unmap => self.hide_unmap(),
                 HideMode::Recreate => {
+                    // Hide whatever the ✕ policy would say: the tray's Hide is
+                    // explicit, and the ✕ handler honours this marker.
+                    self.request_explicit_hide();
                     self.send(egui::ViewportCommand::Close);
                     // The Close only surfaces as `close_requested()` on the
                     // next frame, so a parked loop must be woken.

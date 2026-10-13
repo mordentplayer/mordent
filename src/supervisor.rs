@@ -180,6 +180,61 @@ impl Default for PbSnapshot {
     }
 }
 
+impl PbSnapshot {
+    /// The desktop-media-controls view of this publication. Lives here, next to
+    /// the fields it reads, so the ONE publisher ([`Sup::publish`]) and the
+    /// wire format cannot drift apart.
+    fn mpris_snapshot(&self) -> mpris::Snapshot {
+        let (title, artist, album, art_url, track_id, length) = match &self.track {
+            Some(t) => (
+                t.name.clone(),
+                t.artist.clone(),
+                t.album.clone(),
+                t.artwork_url(616, 616),
+                t.id.clone(),
+                Duration::from_millis(t.duration_ms),
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+                String::new(),
+                Duration::ZERO,
+            ),
+        };
+        mpris::Snapshot {
+            status: if !self.has_track {
+                mpris::PlaybackStatus::Stopped
+            } else if self.paused {
+                mpris::PlaybackStatus::Paused
+            } else {
+                mpris::PlaybackStatus::Playing
+            },
+            title,
+            artist,
+            album,
+            art_url,
+            track_id,
+            length,
+            position: self.position,
+            volume: self.volume,
+            shuffle: self.shuffle,
+            loop_status: match self.repeat {
+                Repeat::Off => mpris::LoopStatus::None,
+                Repeat::One => mpris::LoopStatus::Track,
+                Repeat::All => mpris::LoopStatus::Playlist,
+            },
+            has_track: self.has_track,
+            // pure pointer bounds — repeat-all doesn't fake a next entry and
+            // the >3 s restart isn't a "go previous"
+            can_next: self.can_next,
+            can_prev: self.can_prev,
+            seek_epoch: self.seek_epoch,
+        }
+    }
+}
+
 /// UI → supervisor commands (plus the internal play-worker arrivals, which
 /// ride the same channel so the loop blocks on exactly one receiver).
 pub enum Command {
@@ -318,6 +373,9 @@ struct Sup {
     // ---- neighbours ----
     prefetch: Prefetcher,
     mpris_rx: Option<Receiver<mpris::Command>>,
+    /// The desktop-media-controls handle: `publish` (the single publisher, see
+    /// [`Sup::publish`]) is the only thing the supervisor does with it.
+    mpris: Option<mpris::Mpris>,
 }
 
 impl Sup {
@@ -333,6 +391,7 @@ impl Sup {
         reporter: Option<PlayReporter>,
         prefetch: Prefetcher,
         mpris_rx: Option<Receiver<mpris::Command>>,
+        mpris: Option<mpris::Mpris>,
     ) -> Self {
         let decode_only = sink.is_none();
         Self {
@@ -363,6 +422,7 @@ impl Sup {
             album_ids: HashMap::new(),
             prefetch,
             mpris_rx,
+            mpris,
         }
     }
 
@@ -977,6 +1037,15 @@ impl Sup {
                 can_prev: q.peek_prev().is_some(),
             }
         };
+        // Single publisher for desktop media controls: the UI can be hidden
+        // (destroyed window), frozen or never scheduled again, and MPRIS must
+        // still follow playback — so the thread that owns the state machine
+        // publishes, not the frame loop. `publish_mpris` used to run from
+        // `App::update`; that froze Position/metadata on the D-Bus side for as
+        // long as the window was hidden.
+        if let Some(m) = &self.mpris {
+            m.publish(snap.mpris_snapshot());
+        }
         *self.snap.lock() = snap;
     }
 
@@ -1070,7 +1139,8 @@ impl Effects for RealFx {
 /// thread (it is `!Send`); everything the UI needs back is returned: the
 /// command sender, the shared snapshot, and the supervisor→UI error receiver.
 /// `mpris_rx` (when MPRIS started) is drained by the supervisor so media
-/// keys work while the UI is hidden or frozen.
+/// keys work while the UI is hidden or frozen, and the same thread PUBLISHES
+/// the MPRIS state (see [`Sup::publish`]) — the frame loop may be gone.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     cfg: Config,
@@ -1080,6 +1150,7 @@ pub fn spawn(
     session: crate::session::Session,
     no_repaint: bool,
     mpris_rx: Option<Receiver<mpris::Command>>,
+    mpris: Option<mpris::Mpris>,
     prefetch: Prefetcher,
 ) -> (Sender<Command>, Arc<Mutex<PbSnapshot>>, Receiver<String>) {
     let (tx, rx) = channel();
@@ -1096,8 +1167,8 @@ pub fn spawn(
         .name("mordent-supervisor".into())
         .spawn(move || {
             run_thread(
-                cfg, queue, snap_thread, repeat, volume, session, no_repaint, mpris_rx, prefetch,
-                tx_thread, rx, ui_tx,
+                cfg, queue, snap_thread, repeat, volume, session, no_repaint, mpris_rx, mpris,
+                prefetch, tx_thread, rx, ui_tx,
             );
         });
     if let Err(e) = spawned {
@@ -1117,6 +1188,7 @@ fn run_thread(
     session: crate::session::Session,
     no_repaint: bool,
     mpris_rx: Option<Receiver<mpris::Command>>,
+    mpris: Option<mpris::Mpris>,
     prefetch: Prefetcher,
     tx: Sender<Command>,
     rx: Receiver<Command>,
@@ -1152,6 +1224,7 @@ fn run_thread(
         reporter,
         prefetch,
         mpris_rx,
+        mpris,
     );
     let mut fx = RealFx {
         cfg,
@@ -1276,6 +1349,7 @@ mod tests {
             0.8,
             None, // reporter off: decode-only never reports
             Prefetcher::new(&cfg),
+            None,
             None,
         );
         (sup, clock)

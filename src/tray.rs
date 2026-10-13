@@ -220,6 +220,7 @@ pub fn spawn(snap: Arc<Mutex<PbSnapshot>>, cmd: Sender<Command>, session: Sessio
         .name("mordent-tray".into())
         .spawn(move || {
             let snap_poll = snap.clone();
+            let session_poll = session.clone();
             let item = TrayItem {
                 cmd,
                 snap,
@@ -251,7 +252,14 @@ pub fn spawn(snap: Arc<Mutex<PbSnapshot>>, cmd: Sender<Command>, session: Sessio
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok());
             let started = std::time::Instant::now();
-            let mut last = String::new();
+            // Everything the item's *menu and labels* depend on: the track line
+            // (title/tooltip), the play/pause label, and the window visibility
+            // behind Show/Hide. ksni serves `GetLayout` from a cache that is
+            // only rebuilt by `Handle::update`, so the trigger must cover all
+            // three — a track-name-only trigger left the Show/Hide label
+            // saying "Hide Mordent" (and Play/Pause stale) after a ✕ or an
+            // external pause.
+            let mut last: Option<(bool, bool, String)> = None;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 if handle.is_closed() {
@@ -269,9 +277,14 @@ pub fn spawn(snap: Arc<Mutex<PbSnapshot>>, cmd: Sender<Command>, session: Sessio
                     Some(t) if pb.has_track => format!("{} — {}", t.name, t.artist),
                     _ => String::new(),
                 };
-                if line != last {
-                    last = line;
-                    // re-read all properties + emit changed signals
+                let sig = (
+                    session_poll.hidden(),
+                    pb.has_track && !pb.paused,
+                    line,
+                );
+                if last.as_ref() != Some(&sig) {
+                    last = Some(sig);
+                    // re-read all properties + menu + emit changed signals
                     let _ = handle.update(|_| {});
                 }
             }

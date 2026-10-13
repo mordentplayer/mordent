@@ -466,7 +466,9 @@ appear until the first track.
 
 Real exit is always **Ctrl+Q**, the tray's **Quit**, or **MPRIS Quit** (each
 flushes the report segment first, then exits) — including while the window is
-hidden.
+hidden. The tray's own **Hide** is explicit and always hides (even in a session
+that has not played anything yet): that rule above is about the window-manager
+close, where an unplayed ✕ means "nothing to keep running, exit".
 
 ### How hiding works (platform matrix)
 
@@ -521,8 +523,9 @@ macOS/Windows builds compile a no-tray stub with the same close policy.
 
 Playback lives on a **supervisor thread** (`src/supervisor.rs`), not in the
 UI frame loop: it owns the audio output (rodio), the play/pause/seek/advance
-state machine, natural-end queue advance, play reporting, and the MPRIS
-command drain. The UI is a renderer + command sender over a small command
+state machine, natural-end queue advance, play reporting, and both sides of
+MPRIS (remote commands in, the published state out — so a hidden window cannot
+freeze the media bar). The UI is a renderer + command sender over a small command
 channel; both sides share the queue (behind a mutex) and one published
 playback snapshot. Hiding the window, an unfocused/compositor-throttled
 window, or a frozen frame loop can therefore never stop or stall playback.

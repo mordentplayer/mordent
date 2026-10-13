@@ -504,9 +504,6 @@ pub struct App {
     /// Error toast (full text + expiry state); auto-dismisses after TOAST_TTL.
     error: Option<ErrorToast>,
     last_title: String,
-    /// Desktop media controls (MPRIS); `None` if D-Bus is unusable. The UI
-    /// only PUBLISHES here; commands are drained by the supervisor thread.
-    mpris: Option<mpris::Mpris>,
     /// Background sequential prefetch of the up-next queue (inert when the
     /// audio cache is disabled). Re-scanned by the UI after its own queue
     /// mutations; the supervisor scans after its own pointer moves.
@@ -622,7 +619,9 @@ impl App {
         }
         // MPRIS: spawn() only starts a thread (the connection is established
         // there), so this is as safe as the old first-frame lazy start. The
-        // UI keeps the publish handle; the SUPERVISOR drains the commands.
+        // SUPERVISOR both drains the commands and publishes the state (it owns
+        // the state machine, and it keeps running while the window is hidden —
+        // see `supervisor::Sup::publish`).
         let (mpris, mpris_rx) = match mpris::Mpris::spawn() {
             Some((m, rx)) => (Some(m), Some(rx)),
             None => (None, None),
@@ -661,6 +660,7 @@ impl App {
             session.clone(),
             no_repaint,
             mpris_rx,
+            mpris.clone(),
             prefetch.clone(),
         );
         // Tray (StatusNotifierItem; stubbed no-op off Linux — see main.rs).
@@ -746,7 +746,6 @@ impl App {
             // invalid theme keys are surfaced once through the toast
             error: theme_warns.first().map(|w| ErrorToast::new(w.clone())),
             last_title: "Mordent".into(),
-            mpris,
             prefetch,
             rx,
             tx,
@@ -2249,61 +2248,6 @@ impl App {
         self.send(Command::StopAll);
     }
 
-    /// Publish the supervisor's snapshot to the MPRIS thread (per frame; the
-    /// D-Bus side diffs and emits only on change).
-    fn publish_mpris(&self, pb: &PbSnapshot) {
-        let Some(m) = self.mpris.as_ref() else {
-            return;
-        };
-        let (title, artist, album, art_url, track_id, length) = match &pb.track {
-            Some(t) => (
-                t.name.clone(),
-                t.artist.clone(),
-                t.album.clone(),
-                t.artwork_url(616, 616),
-                t.id.clone(),
-                std::time::Duration::from_millis(t.duration_ms),
-            ),
-            None => (
-                String::new(),
-                String::new(),
-                String::new(),
-                None,
-                String::new(),
-                std::time::Duration::ZERO,
-            ),
-        };
-        m.publish(mpris::Snapshot {
-            status: if !pb.has_track {
-                mpris::PlaybackStatus::Stopped
-            } else if pb.paused {
-                mpris::PlaybackStatus::Paused
-            } else {
-                mpris::PlaybackStatus::Playing
-            },
-            title,
-            artist,
-            album,
-            art_url,
-            track_id,
-            length,
-            position: pb.position,
-            volume: pb.volume,
-            shuffle: pb.shuffle,
-            loop_status: match pb.repeat {
-                Repeat::Off => mpris::LoopStatus::None,
-                Repeat::One => mpris::LoopStatus::Track,
-                Repeat::All => mpris::LoopStatus::Playlist,
-            },
-            has_track: pb.has_track,
-            // pure pointer bounds — repeat-all doesn't fake a next entry and
-            // the >3 s restart isn't a "go previous"
-            can_next: pb.can_next,
-            can_prev: pb.can_prev,
-            seek_epoch: pb.seek_epoch,
-        });
-    }
-
     /// Write the whole UI state (favorites included). Also cancels any pending
     /// debounced write.
     fn save_ui_state(&mut self) {
@@ -3225,9 +3169,16 @@ impl eframe::App for App {
         // close there always quit on Wayland — see `setup.rs`, which owns no
         // close handling), so that one combination keeps quitting on Wayland,
         // exactly as before.
+        //
+        // An explicit tray Hide outranks the ✕ policy: "Hide Mordent" from the
+        // menu must hide even before anything has played (the tray item is the
+        // way back; the unplayed ✕ rule exists so a stray close on a window
+        // that never did anything exits).
         if ctx.input(|i| i.viewport().close_requested()) {
-            let action = if self.setup.is_some()
-                && self.session.mode() == crate::wm::HideMode::Recreate
+            let explicit_hide = self.session.take_explicit_hide();
+            let action = if explicit_hide {
+                CloseAction::Hide
+            } else if self.setup.is_some() && self.session.mode() == crate::wm::HideMode::Recreate
             {
                 CloseAction::Quit
             } else {
@@ -3458,8 +3409,6 @@ impl eframe::App for App {
             self.settings_ui(ctx);
         }
         self.toast_ui(ctx);
-
-        self.publish_mpris(&pb);
 
         // Single repaint driver: one bounded wakeup covers every state where
         // `update` may still have work (progress ticking, toasts), so the

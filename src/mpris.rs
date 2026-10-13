@@ -1,13 +1,15 @@
 //! MPRIS2 (`org.mpris.MediaPlayer2.mordent`): desktop media controls — GNOME/KDE
 //! media bar, lock screen, `playerctl`, media keys.
 //!
-//! Shape: the UI thread publishes a small [`Snapshot`] of playback state into
-//! a shared `parking_lot::Mutex` once per frame (a lock + struct move —
-//! nothing else on the hot path). A dedicated thread owns the D-Bus
-//! connection (zbus blocking API): it serves the root + player interfaces,
-//! diffs each poll and emits `PropertiesChanged`/`Seeked` only on change,
-//! and forwards remote commands over a `std::sync::mpsc` channel that
-//! `App::update` drains into the same code paths as clicks/shortcuts.
+//! Shape: the PLAYBACK SUPERVISOR thread publishes a small [`Snapshot`] of
+//! playback state into a shared `parking_lot::Mutex` on every tick (it owns the
+//! state machine, and it is the only thread that keeps running when the window
+//! is hidden — publishing from the frame loop used to freeze Position and
+//! metadata for as long as the window was away). A dedicated thread owns the
+//! D-Bus connection (zbus blocking API): it serves the root + player
+//! interfaces, diffs each poll and emits `PropertiesChanged`/`Seeked` only on
+//! change, and forwards remote commands over a `std::sync::mpsc` channel that
+//! the supervisor drains into the same code paths as clicks/shortcuts.
 //!
 //! No session bus (bare Xvfb, VPS)? The thread logs once to stderr and
 //! exits; the app runs exactly as before.
@@ -131,7 +133,9 @@ struct Shared {
     state: Mutex<Snapshot>,
 }
 
-/// Handle held by the UI thread.
+/// Handle held by the publisher (the supervisor's thread — the frame loop may
+/// be gone while the window is hidden). Cloning shares the same state.
+#[derive(Clone)]
 pub struct Mpris {
     shared: Arc<Shared>,
 }
