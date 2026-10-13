@@ -433,7 +433,10 @@ X server it simply renders solid — neither case errors.
 `mordent ui` registers `org.mpris.MediaPlayer2.mordent` on the session bus: it shows
 up in the GNOME/KDE media bar and lock screen with cover, title/artist and
 working controls (play/pause, next/prev, seek, stop, shuffle, repeat,
-volume). No session bus → MPRIS silently stays off; the app is unchanged.
+volume). The playback **supervisor** is what publishes it (not the frame loop),
+so the media bar keeps following position, metadata and natural advance while
+the window is hidden — see [Tray](#tray). No session bus → MPRIS silently
+stays off; the app is unchanged.
 
 ```sh
 playerctl --player=mordent status
@@ -510,7 +513,10 @@ cleanly. Two details make the swap work:
 So Show/Hide works the same way everywhere from the user's point of view: the
 tray's **Show/Hide** item is enabled on every backend, left-click (Activate)
 toggles, and during the hidden period the tray and MPRIS still serve Play/Pause,
-Next/Previous and the now-playing metadata.
+Next/Previous and the now-playing metadata (the supervisor keeps publishing it).
+One deliberate difference from the ✕ rule above: the tray's own **Hide** is
+explicit and hides even before anything has played — the tray item is the way
+back, so it must never be the thing that quits.
 
 Host support: waybar/Hyprland/niri/umbriel, KDE Plasma — SNI natively; GNOME
 needs an AppIndicator extension. No StatusNotifier host (bare X11, VPS)? The

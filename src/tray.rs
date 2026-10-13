@@ -2,11 +2,19 @@
 //! GTK mainloop, no extra runtime (ksni 0.3 serves everything from its own
 //! thread; zbus 5 is already in the tree via eframe/accesskit).
 //!
-//! Shape: one thread owns the tray service. The item's properties (title,
-//! tooltip, menu, icon) read the SHARED [`PbSnapshot`] at call time, so the
-//! menu Play/Pause label is always fresh when a host fetches the layout; a
-//! 1 Hz poll refreshes title/tooltip signals while music runs (via
-//! `Handle::update`, which diffs and only emits on change).
+//! Shape: one thread owns the tray service. Two things are easy to get wrong:
+//!
+//! * ksni serves `GetLayout` (and the property values) from a cache that is
+//!   only rebuilt by `Handle::update` — the item's getters reading the SHARED
+//!   [`PbSnapshot`]/[`Session`] at call time does NOT make a host see a
+//!   changed menu. So a 1 Hz poll calls `Handle::update` whenever the
+//!   menu-relevant signature changes: window visibility (the Show/Hide label),
+//!   play/pause (the Play/Pause label) and the track line (title/tooltip).
+//!   `update` diffs and only emits the changed signals. A track-name-only
+//!   trigger left Show/Hide saying "Hide Mordent" after the window was hidden
+//!   and Play/Pause stale after an external pause.
+//! * the publish side of MPRIS is the supervisor's (it keeps ticking while the
+//!   window is hidden), NOT the tray's — the tray only reads the snapshot.
 //!
 //! Status is **always `Active`**: hosts (waybar included) hide `Passive`
 //! items, so an idle `Passive` item meant no icon at all until the first
@@ -21,16 +29,18 @@
 //! SHOW/HIDE (`crate::session`, `crate::wm`): one call,
 //! [`Session::tray_toggle`], works on every backend. X11 unmaps/maps the live
 //! toplevel. Wayland cannot unmap at all (winit 0.30.13's `Window::set_visible`
-//! is a no-op), so there Hide means the same thing as ✕ — the app's close
-//! policy — and the window is instead destroyed and re-created around the
-//! parked main thread, with playback untouched. The item is therefore enabled
-//! everywhere.
+//! is a no-op), so the window is instead destroyed and re-created around the
+//! parked main thread, with playback untouched. Either way the tray's Hide is
+//! an **explicit** hide that outranks the ✕ policy — it hides even before
+//! anything has played (the tray item is the way back), where an unplayed ✕
+//! quits. The item is therefore enabled everywhere.
 //!
 //! FALLBACKS (never panics the app — every failure path degrades silently):
 //! * no session bus / no StatusNotifierWatcher / no host → `spawn` returns
-//!   `Err`, logged once to stderr, no tray icon; the window-close policy in
-//!   `ui::update` still applies (quit when nothing has played; hide once a
-//!   track has — restore via MPRIS Raise, `playerctl`, or a relaunch).
+//!   `Err`, logged once to stderr, no tray icon; with no tray, window close
+//!   falls back to `ui::update`'s policy alone (quit when nothing has played;
+//!   hide once a track has — restore via MPRIS Raise, `playerctl`, or a
+//!   relaunch).
 //! * the watcher going away mid-run is ksni's `watcher_offline` — the
 //!   default keeps the service registered so it re-appears when the watcher
 //!   returns (e.g. waybar restart).
@@ -60,9 +70,10 @@ pub struct TrayItem {
 
 impl TrayItem {
     /// Toggle the window (Show/Hide menu item and Activate/left click). X11
-    /// unmaps/maps the live window; Wayland cannot, so Hide runs the ✕ policy
-    /// and Show re-creates the window on the parked main thread — `session`
-    /// owns both halves.
+    /// unmaps/maps the live window; Wayland cannot, so Hide goes through the
+    /// close path as an explicit hide (it outranks the ✕ policy — see
+    /// [`Session::tray_toggle`]) and Show re-creates the window on the parked
+    /// main thread.
     fn show_toggle(&mut self) {
         eprintln!(
             "[tray] show_toggle: {} window (mode {:?})",

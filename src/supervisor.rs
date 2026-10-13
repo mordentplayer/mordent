@@ -40,8 +40,9 @@
 //! unit-tested in this file. Decode-only mode (no audio device) runs the same
 //! state machine on a fake clock — that is the MORDENT_SELFTEST path.
 //!
-//! The supervisor also drains the MPRIS command receiver, so media keys work
-//! while the window is hidden or the frame loop is parked.
+//! The supervisor also drains the MPRIS command receiver AND publishes the
+//! MPRIS state (see `Sup::publish`), so media keys work and the media bar keeps
+//! following playback while the window is hidden or the frame loop is parked.
 
 use crate::api::{PlayEvent, Track};
 use crate::config::Config;

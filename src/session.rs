@@ -49,7 +49,7 @@ struct Inner {
     /// `run_native` as a real exit. Sticky until the main loop clears it: a
     /// Show racing the teardown must still reopen the window.
     hide_pending: AtomicBool,
-    /// Set when the TRAYS's Hide asked for a hide explicitly. The close
+    /// Set when the TRAY's Hide asked for a hide explicitly. The close
     /// handler honours it over the ✕ policy (`ever_played`): the tray is the
     /// way back, so an explicit "Hide Mordent" must never quit the app the way
     /// an unplayed ✕ does. Taken by the first close it causes.
@@ -173,9 +173,13 @@ impl Session {
     }
 
     /// The tray's Show/Hide item and Activate (left click). On X11 this is an
-    /// unmap/map toggle; on Wayland "hide" is the ✕ policy exactly (the app's
-    /// close handler decides between hiding and quitting — see `ui::update`),
-    /// because the toplevel cannot be unmapped.
+    /// unmap/map toggle. On Wayland the toplevel cannot be unmapped, so Hide
+    /// goes through the close path as an **explicit** hide: it marks the
+    /// session ([`Session::request_explicit_hide`]) so the close handler hides
+    /// whatever the ✕ policy would do — the tray item is the way back, so
+    /// "Hide Mordent" must never quit the app the way an unplayed ✕ does
+    /// (see `ui::update`). Show then re-creates the window on the parked main
+    /// thread.
     pub fn tray_toggle(&self) {
         if self.hidden() {
             self.show();
