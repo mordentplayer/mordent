@@ -39,8 +39,8 @@
 //! * no session bus / no StatusNotifierWatcher / no host → `spawn` returns
 //!   `Err`, logged once to stderr, no tray icon; with no tray, window close
 //!   falls back to `ui::update`'s policy alone (quit when nothing has played;
-//!   hide once a track has — restore via MPRIS Raise, `playerctl`, or a
-//!   relaunch).
+//!   hide once a track has — restore via `org.mpris.MediaPlayer2.Raise`, the
+//!   command the README documents).
 //! * the watcher going away mid-run is ksni's `watcher_offline` — the
 //!   default keeps the service registered so it re-appears when the watcher
 //!   returns (e.g. waybar restart).
@@ -242,9 +242,9 @@ pub fn spawn(snap: Arc<Mutex<PbSnapshot>>, cmd: Sender<Command>, session: Sessio
                 Err(e) => {
                     eprintln!(
                         "[tray] unavailable ({e}) — running without a tray icon; \
-                         window close quits when nothing has played, and on X11 \
-                         hides the window once a track has played (restore with \
-                         MPRIS Raise or a relaunch)"
+                         window close quits when nothing has played, and hides the \
+                         window once a track has played (restore with MPRIS Raise: \
+                         org.mpris.MediaPlayer2.Raise)"
                     );
                     return;
                 }

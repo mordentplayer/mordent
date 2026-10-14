@@ -23,7 +23,7 @@ mod wrapper;
 // Tray (collapse-to-tray) is Linux-only: ksni speaks StatusNotifierItem over
 // D-Bus. On macOS/Windows the stub below keeps the callsites compiling — the
 // window-close policy in `ui::update` still applies there (quit when nothing
-// has played; hide the window once a track has — restore via MPRIS Raise).
+// has played; hide the window once a track has).
 #[cfg(target_os = "linux")]
 mod tray;
 
@@ -43,7 +43,7 @@ pub mod tray {
         _cmd: Sender<Command>,
         _session: Session,
     ) {
-        eprintln!("[tray] not supported on this platform — running without a tray icon; window close quits when nothing has played, and hides the window once a track has (restore with MPRIS Raise or a relaunch)");
+        eprintln!("[tray] not supported on this platform — running without a tray icon; window close quits when nothing has played, and hides the window once a track has (the window is unmapped, not closed)");
     }
 }
 

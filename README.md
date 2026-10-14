@@ -521,8 +521,19 @@ back, so it must never be the thing that quits.
 Host support: waybar/Hyprland/niri/umbriel, KDE Plasma — SNI natively; GNOME
 needs an AppIndicator extension. No StatusNotifier host (bare X11, VPS)? The
 tray degrades silently — logged once, no icon — and the close policy above
-still applies; restore a hidden window with MPRIS Raise (`playerctl
---player=mordent open`/`play` on some setups), `wmctrl -a mordent`, or a relaunch.
+still applies; with no tray item, bring a hidden window back with **MPRIS
+Raise** — the app's `org.mpris.MediaPlayer2.Raise`, which works the same on
+both backends (on X11 it maps the unmapped window back, on Wayland it runs the
+session swap):
+
+```sh
+busctl --user call org.mpris.MediaPlayer2.mordent /org/mpris/MediaPlayer2 \
+    org.mpris.MediaPlayer2 Raise
+```
+
+(`playerctl` has no verb for it: `raise` is unknown to it and `open` wants a
+URI; a relaunch starts a *second* instance rather than restoring the hidden
+window.)
 macOS/Windows builds compile a no-tray stub with the same close policy.
 
 ## Playback is UI-independent
