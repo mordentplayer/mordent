@@ -5082,7 +5082,8 @@ fn launch_with(cfg: Config, start_wizard: bool) -> anyhow::Result<()> {
         // Window icon: the app mark, rasterised by `brand` — the taskbar/dock
         // shows the logo instead of winit's default. Wayland has no protocol
         // for this, so the compositor there uses the .desktop entry's icon
-        // instead.
+        // instead — reachable because the session sets the matching
+        // `app_id` (see `native_options`).
         let native = native_options();
         let creator_cfg = cfg.clone();
         let creator_session = session.clone();
@@ -5139,10 +5140,14 @@ fn launch_with(cfg: Config, start_wizard: bool) -> anyhow::Result<()> {
 }
 
 /// The viewport every session uses (transparent, app-icon, 1100x720). Built
-/// per session: `NativeOptions` is not `Clone`.
+/// per session: `NativeOptions` is not `Clone`. `with_app_id` is what binds the
+/// Wayland toplevel to our installed `mordent.desktop` (by file name) — the
+/// generic icon, taskbar grouping/pinning and `app_id=mordent` window rules all
+/// key off it (the same id the entry's `StartupWMClass` uses on X11).
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("mordent")
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([760.0, 420.0])
             .with_icon(egui::IconData {
